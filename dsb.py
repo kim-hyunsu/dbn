@@ -26,94 +26,138 @@ import defaults_dsb as defaults
 from tabulate import tabulate
 import sys
 from giung2.data.build import build_dataloaders, _build_dataloader
-from models.ddpm import ddpm_schedules, MLP
+from models.ddpm import dsb_schedules, MLP
 from collections import OrderedDict
 from PIL import Image
 from tqdm import tqdm
-from utils import model_list, normalize, unnormalize, pixelize
+from utils import model_list, normalize, unnormalize, pixelize, normalize_logits, unnormalize_logits
 
 
 def build_featureloaders(config):
-    n_samples_each_mode = 2
-    n_modes = 2
-    train_logits_list = []
-    train_images_list = []
-    valid_logits_list = []
-    valid_images_list = []
-    test_logits_list = []
-    test_images_list = []
-    for mode_idx in range(n_modes):
-        for i in tqdm(range(n_samples_each_mode)):
-            with open(f"features/train_features_M{mode_idx}S{i}.npy", "rb") as f:
-                train_logits = np.load(f)
-            with open(f"features/train_images_M{mode_idx}S{i}.npy", "rb") as f:
-                train_images = np.load(f)
-            with open(f"features/valid_features_M{mode_idx}S{i}.npy", "rb") as f:
-                valid_logits = np.load(f)
-            with open(f"features/valid_images_M{mode_idx}S{i}.npy", "rb") as f:
-                valid_images = np.load(f)
-            with open(f"features/test_features_M{mode_idx}S{i}.npy", "rb") as f:
-                test_logits = np.load(f)
-            with open(f"features/test_images_M{mode_idx}S{i}.npy", "rb") as f:
-                test_images = np.load(f)
-            train_logits_list.append(train_logits)
-            train_images_list.append(train_images)
-            valid_logits_list.append(valid_logits)
-            valid_images_list.append(valid_images)
-            test_logits_list.append(test_logits)
-            test_images_list.append(test_images)
+    # B: current mode, A: other modes
+    n_Amodes = 1
+    n_samples_each_mode = 1
+    n_samples_each_Bmode = n_Amodes*n_samples_each_mode
+    n_samples_each_Amode = n_samples_each_mode
+    train_Alogits_list = []
+    train_Blogits_list = []
+    valid_Alogits_list = []
+    valid_Blogits_list = []
+    test_Alogits_list = []
+    test_Blogits_list = []
+    for mode_idx in range(1+n_Amodes):  # total 1+n_Amodes
+        if mode_idx == 0:  # p_B
+            for i in tqdm(range(n_samples_each_Bmode)):
+                with open(f"features/train_features_M{mode_idx}S{i}.npy", "rb") as f:
+                    train_logits = np.load(f)
+                with open(f"features/valid_features_M{mode_idx}S{i}.npy", "rb") as f:
+                    valid_logits = np.load(f)
+                with open(f"features/test_features_M{mode_idx}S{i}.npy", "rb") as f:
+                    test_logits = np.load(f)
+                train_Blogits_list.append(train_logits)
+                valid_Blogits_list.append(valid_logits)
+                test_Blogits_list.append(test_logits)
+        else:  # p_A (mixture of modes)
+            for i in tqdm(range(n_samples_each_Amode)):
+                with open(f"features/train_features_M{mode_idx}S{i}.npy", "rb") as f:
+                    train_logits = np.load(f)
+                with open(f"features/valid_features_M{mode_idx}S{i}.npy", "rb") as f:
+                    valid_logits = np.load(f)
+                with open(f"features/test_features_M{mode_idx}S{i}.npy", "rb") as f:
+                    test_logits = np.load(f)
+                train_Alogits_list.append(train_logits)
+                valid_Alogits_list.append(valid_logits)
+                test_Alogits_list.append(test_logits)
 
-    train_logits = np.concatenate(train_logits_list, axis=0)
-    train_logits = jnp.array(train_logits)
-    del train_logits_list
-    train_images = np.concatenate(train_images_list, axis=0)
-    train_images = jnp.array(train_images)
-    del train_images_list
-    valid_logits = np.concatenate(valid_logits_list, axis=0)
-    valid_logits = jnp.array(valid_logits)
-    del valid_logits_list
-    valid_images = np.concatenate(valid_images_list, axis=0)
-    valid_images = jnp.array(valid_images)
-    del valid_images_list
-    test_logits = np.concatenate(test_logits_list, axis=0)
-    test_logits = jnp.array(test_logits)
-    del test_logits_list
-    test_images = np.concatenate(test_images_list, axis=0)
-    test_images = jnp.array(test_images)
-    del test_images_list
+    train_logitsA = np.concatenate(train_Alogits_list, axis=0)
+    train_logitsA = jnp.array(train_logitsA)
+    del train_Alogits_list
+
+    train_logitsB = np.concatenate(train_Blogits_list, axis=0)
+    train_logitsB = jnp.array(train_logitsB)
+    del train_Blogits_list
+
+    valid_logitsA = np.concatenate(valid_Alogits_list, axis=0)
+    valid_logitsA = jnp.array(valid_logitsA)
+    del valid_Alogits_list
+
+    valid_logitsB = np.concatenate(valid_Blogits_list, axis=0)
+    valid_logitsB = jnp.array(valid_logitsB)
+    del valid_Blogits_list
+
+    test_logitsA = np.concatenate(test_Alogits_list, axis=0)
+    test_logitsA = jnp.array(test_logitsA)
+    del test_Alogits_list
+
+    test_logitsB = np.concatenate(test_Blogits_list, axis=0)
+    test_logitsB = jnp.array(test_logitsB)
+    del test_Blogits_list
 
     dataloaders = dict(
         num_classes=10,
         image_shape=(1, 32, 32, 3),
-        trn_steps_per_epoch=math.ceil(len(train_logits)/config.optim_bs),
-        val_steps_per_epoch=math.ceil(len(valid_logits)/config.optim_bs),
-        tst_steps_per_epoch=math.ceil(len(test_logits)/config.optim_bs)
+        trn_steps_per_epoch=math.ceil(len(train_logitsA)/config.optim_bs),
+        val_steps_per_epoch=math.ceil(len(valid_logitsA)/config.optim_bs),
+        tst_steps_per_epoch=math.ceil(len(test_logitsA)/config.optim_bs)
     )
-
-    dataloaders["trn_featureloader"] = partial(
+    dataloaders["featureloader"] = partial(
         _build_dataloader,
-        images=train_images,
-        labels=train_logits,
+        images=train_logitsB,
+        labels=train_logitsA,
         batch_size=config.optim_bs,
         shuffle=True,
         transform=None
     )
+
+    dataloaders["trn_featureloader"] = partial(
+        _build_dataloader,
+        images=train_logitsB,
+        labels=train_logitsA,
+        batch_size=config.optim_bs,
+        shuffle=False,
+        transform=None
+    )
     dataloaders["val_featureloader"] = partial(
         _build_dataloader,
-        images=valid_images,
-        labels=valid_logits,
+        images=valid_logitsB,
+        labels=valid_logitsA,
         batch_size=config.optim_bs,
         shuffle=False,
         transform=None
     )
     dataloaders["tst_featureloader"] = partial(
         _build_dataloader,
-        images=test_images,
-        labels=test_logits,
+        images=test_logitsB,
+        labels=test_logitsA,
         batch_size=config.optim_bs,
         shuffle=False,
         transform=None
     )
+    # count = 0
+    # sum = 0
+    # for batch in dataloaders["trn_featureloader"](rng=None):
+    #     logitsB = batch["images"]
+    #     logitsA = batch["labels"]
+    #     logitsB = jnp.where(
+    #         batch["marker"][..., None], logitsB, jnp.zeros_like(logitsB))
+    #     logitsA = jnp.where(
+    #         batch["marker"][..., None], logitsA, jnp.zeros_like(logitsA))
+    #     sum += jnp.sum(logitsB, [0, 1])+jnp.sum(logitsA, [0, 1])
+    #     count += 2*batch["marker"].sum()
+    # mean = sum/count
+    # sum = 0
+    # for batch in dataloaders["trn_featureloader"](rng=None):
+    #     logitsB = jnp.where(
+    #         batch["marker"][..., None], logitsB, jnp.zeros_like(logitsB))
+    #     logitsA = jnp.where(
+    #         batch["marker"][..., None], logitsA, jnp.zeros_like(logitsA))
+    #     sum += jnp.sum((logitsB-mean)**2, axis=[0, 1])
+    #     sum += jnp.sum((logitsA-mean)**2, axis=[0, 1])
+    # var = sum/count
+    # std = jnp.sqrt(var)
+    # print("mean", mean)
+    # print("std", std)
+
     return dataloaders
 
 
@@ -124,7 +168,7 @@ class TrainState(train_state.TrainState):
 
     betas: Tuple
     n_T: int
-    drop_prob: float
+
     alpha_t: Any
     oneover_sqrta: Any
     sqrt_beta_t: Any
@@ -132,68 +176,63 @@ class TrainState(train_state.TrainState):
     sqrtab: Any
     sqrtmab: Any
     mab_over_sqrtmab: Any
+    sigma_weight_t: Any
+    sigma_t: Any
+    sigmabar_t: Any
+    bigsigma_t: Any
 
-    def forward(self, x, training=True, **kwargs):
-        c = kwargs["conditional"]  # (B,H,W,3)
+    # equation (11) in I2SB
+    def forward(self, x0, x1, training=True, **kwargs):
+        # rng
         rng = kwargs["rng"]
-        t_rng, n_rng, c_rng = jax.random.split(rng, 3)
-        _ts = jax.random.randint(t_rng, (x.shape[0],), 1, self.n_T)  # (B,)
-        noise = jax.random.normal(n_rng, x.shape)  # (B, d)
+        t_rng, n_rng = jax.random.split(rng, 2)
 
-        x_t = (
-            self.sqrtab[_ts, None] * x
-            + self.sqrtmab[_ts, None] * noise
-        )  # (B, d)
-        context_mask = jax.random.bernoulli(
-            c_rng, self.drop_prob, (c.shape[0],))  # (B,)
-        kwargs["c"] = c
+        _ts = jax.random.randint(t_rng, (x0.shape[0],), 1, self.n_T)  # (B,)
+        sigma_weight_t = self.sigma_weight_t[_ts][:, None]  # (B, 1)
+        sigma_t = self.sigma_t[_ts]
+        mu_t = (sigma_weight_t*x0+(1-sigma_weight_t)*x1)
+        bigsigma_t = self.bigsigma_t[_ts][:, None]  # (B, 1)
+
+        # q(X_t|X_0,X_1) = N(X_t;mu_t,bigsigma_t)
+        noise = jax.random.normal(n_rng, mu_t.shape)  # (B, d)
+        x_t = mu_t + bigsigma_t*noise
+
         kwargs["t"] = _ts/self.n_T  # (B,)
-        kwargs["context_mask"] = context_mask
         kwargs["training"] = training
-        return noise, x_t, kwargs
+        return x_t, sigma_t, kwargs
 
-    def sample(self, rng, apply, size, x, stats, guide_w=0.,):
-        n_samples = x.shape[0]  # B
-        new_size = (n_samples, *size)  # (B, 10)
-        _rng, rng = jax.random.split(rng)
-        z_i = jax.random.normal(_rng, new_size)  # (B,10)
-        x_i = x  # (n_samples, H, W, 3)
+    def sample(self, rng, apply, size, x0, stats, guide_w=0.,):
+        n_samples = x0.shape[0]  # B
+        new_size = (n_samples, *size)  # (B, d)
+        x_n = x0  # (B, d)
 
-        context_mask = jnp.zeros((n_samples,))  # (B,)
-
-        x_i = jnp.tile(x_i, [2, 1, 1, 1])  # (2*B, H, W, 3)
-        context_mask = jnp.tile(context_mask, 2)  # (2*B,)
-        context_mask = context_mask.at[n_samples:].set(1.)  # (2*B,)
-
-        def body_fn(i, val):
-            rng, z_i = val
-            idx = self.n_T - i
+        def body_fn(n, val):
+            rng, x_n = val
+            idx = self.n_T - n
             _rng, rng = jax.random.split(rng)
-            t_is = jnp.array([idx/self.n_T])  # (1,)
-            # t_is = jnp.tile(t_is, [n_samples, 1, 1, 1])  # (B,1,1,1)
-            t_is = jnp.tile(t_is, [n_samples])  # (B,)
+            t_n = jnp.array([idx/self.n_T])  # (1,)
+            t_n = jnp.tile(t_n, [n_samples])  # (B,)
 
-            z_i = jnp.tile(z_i, [2, 1])  # (2*B, 10)
-            # t_is = jnp.tile(t_is, [2, 1, 1, 1])  # (2*B,1,1,1)
-            t_is = jnp.tile(t_is, [2])  # (2*B,)
+            x_n = jnp.tile(x_n, [2, 1])  # (2*B, d)
+            t_n = jnp.tile(t_n, [2])  # (2*B,)
 
             h = jnp.where(idx > 1, jax.random.normal(
-                _rng, new_size), jnp.zeros(new_size))  # (B,10)
-            eps = apply(z_i, x_i, t_is, context_mask)  # (2*B,10)
-            eps1 = eps[:n_samples]  # (B,10)
-            eps2 = eps[n_samples:]  # (B,10)
-            eps = (1-guide_w)*eps1 - guide_w*eps2  # (B,10)
-            z_i = z_i[:n_samples]  # (B,10)
-            z_i = (
+                _rng, new_size), jnp.zeros(new_size))  # (B, d)
+            eps = apply(x_n, t_n)  # (2*B, d)
+            eps1 = eps[:n_samples]  # (B, d)
+            eps2 = eps[n_samples:]  # (B, d)
+            eps = (1-guide_w)*eps1 - guide_w*eps2  # (B, d)
+            x_n = x_n[:n_samples]  # (B, d)
+            x_n = (
                 stats["oneover_sqrta"][idx] *
-                (z_i-eps*stats["mab_over_sqrtmab"][idx])
+                (x_n-eps*stats["mab_over_sqrtmab"][idx])
                 + stats["sqrt_beta_t"][idx]*h
-            )  # (B,10)
-            return rng, z_i
+            )  # (B, d)
+            return rng, x_n
 
-        _, z_i = jax.lax.fori_loop(0, self.n_T, body_fn, (rng, z_i))
+        _, x_n = jax.lax.fori_loop(0, self.n_T, body_fn, (rng, x_n))
 
-        return z_i
+        return x_n
 
 
 def launch(config, print_fn):
@@ -207,18 +246,19 @@ def launch(config, print_fn):
         )[0].platform == 'tpu' else jnp.float16
 
     # build dataloaders
-    # dataloaders = build_dataloaders(config)
     dataloaders = build_featureloaders(config)
     config.n_classes = dataloaders["num_classes"]
     config.ws_test = [0.0, 0.5, 2.0]
 
     beta1 = 1e-4
     beta2 = 0.02
-    ddpm_stats = ddpm_schedules(beta1, beta2, config.T)
+    dsb_stats = dsb_schedules(beta1, beta2, config.T)
 
     score_func = MLP(
-        out_ch=config.n_classes,
-        hidden_ch=config.n_feat
+        x_dim=10,
+        pos_dim=16,
+        encoder_layers=[16],
+        decoder_layers=[128, 128]
     )
 
     # initialize model
@@ -227,10 +267,8 @@ def launch(config, print_fn):
         def init(*args, **kwargs):
             return model.init(*args, **kwargs)
         return init({'params': key},
-                    jnp.ones((1, config.n_classes), model_dtype),
-                    c=jnp.ones(dataloaders["image_shape"], model_dtype),
-                    t=jnp.ones((1,)),
-                    context_mask=jnp.ones((1,)))
+                    x=jnp.ones((1, config.n_classes), model_dtype),
+                    t=jnp.ones((1,)))
     variables = initialize_model(init_rng, score_func)
 
     dynamic_scale = None
@@ -243,6 +281,7 @@ def launch(config, print_fn):
         decay_steps=config.optim_ne * dataloaders["trn_steps_per_epoch"])
     optimizer = optax.adam(learning_rate=scheduler)
 
+    # Train state of diffusion bridge
     state = TrainState.create(
         apply_fn=score_func.apply,
         params=variables["params"],
@@ -252,25 +291,28 @@ def launch(config, print_fn):
         dynamic_scale=dynamic_scale,
         betas=(beta1, beta2),
         n_T=config.T,
-        drop_prob=0.1,
-        **ddpm_stats)
+        **dsb_stats)
 
+    # objective
     def mse_loss(noise, output):
         assert len(output.shape) == 2
         loss = jnp.sum((noise-output)**2, axis=1)
         return loss
 
+    # training
     def step_train(state, batch, config):
-        x = batch["images"]
-        logits = batch["labels"]
-        x = normalize(x)
+        logitsB = batch["images"]  # mixture of other modes
+        logitsA = batch["labels"]  # the current mode
+        logitsB = normalize_logits(logitsB)
+        logitsA = normalize_logits(logitsA)
 
         def loss_fn(params):
-            noise, x_t, kwargs = state.forward(
-                logits, training=True, conditional=x, rng=state.rng)
-            output, new_model_state = state.apply_fn(
-                {"params": params, "batch_stats": state.batch_stats}, x_t, mutable="batch_stats", **kwargs)
-            loss = mse_loss(noise, output)
+            logits_t, sigma_t, kwargs = state.forward(
+                logitsA, logitsB, training=True, rng=state.rng)
+            epsilon, new_model_state = state.apply_fn(
+                {"params": params, "batch_stats": state.batch_stats}, logits_t, mutable="batch_stats", **kwargs)
+            diff = (logits_t - logitsA) / sigma_t[:, None]
+            loss = mse_loss(epsilon, diff)
             loss = jnp.where(batch["marker"], loss, jnp.zeros_like(loss))
             count = jnp.sum(batch["marker"])
             loss = jnp.sum(loss) / count
@@ -307,15 +349,16 @@ def launch(config, print_fn):
         return new_state, metrics
 
     def step_valid(state, batch):
-        x = batch["images"]
-        logits = batch["labels"]
-        x = normalize(x)
-        noise, x_t, kwargs = state.forward(
-            logits, training=False, conditional=x, rng=state.rng)
+        logitsB = batch["images"]
+        logitsA = batch["labels"]
+        logitsB = normalize_logits(logitsB)
+        logitsA = normalize_logits(logitsA)
+        logits_t, sigma_t, kwargs = state.forward(
+            logitsA, logitsB, training=False, rng=state.rng)
         output = state.apply_fn(
-            {"params": state.params, "batch_stats": state.batch_stats}, x_t, **kwargs)
-        loss = mse_loss(noise, output)
-        assert len(loss.shape) == 1
+            {"params": state.params, "batch_stats": state.batch_stats}, logits_t, **kwargs)
+        diff = (logits_t - logitsA) / sigma_t[:, None]
+        loss = mse_loss(output, diff)
         loss = jnp.sum(jnp.where(batch["marker"], loss, jnp.zeros_like(
             loss)))/jnp.sum(batch["marker"])
         count = jnp.sum(batch["marker"])
@@ -326,23 +369,27 @@ def launch(config, print_fn):
         return metrics
 
     def step_sample(state, batch, config):
-        def apply(z_i, x_i, t_is, context_mask):
-            output = state.apply_fn({"params": state.params, "batch_stats": state.batch_stats}, z_i,
-                                    c=x_i, t=t_is, context_mask=context_mask, training=False)
+        def apply(x_n, t_n):
+            output = state.apply_fn(
+                {"params": state.params, "batch_stats": state.batch_stats},
+                x=x_n, t=t_n, training=False)
             return output
-        x = batch["images"]
-        logits = batch["labels"]
-        x = normalize(x)
-        z_list = []
+        logitsB = batch["images"]  # current mode
+        logitsA = batch["labels"]  # other modes
+        logitsB = normalize_logits(logitsB)
+        logitsA = normalize_logits(logitsA)
+        f_list = []
         for w_i, w in enumerate(config.ws_test):
-            z_gen = state.sample(
-                state.rng, apply, (config.n_classes,), x, ddpm_stats, guide_w=w)
-            z_real = logits
+            f_gen = state.sample(
+                state.rng, apply, (config.n_classes,), logitsB, dsb_stats, guide_w=w)
+            f_gen = unnormalize_logits(f_gen)
+            f_real = unnormalize_logits(logitsA)
+            f_init = unnormalize_logits(logitsB)
 
-            z_all = jnp.stack([z_gen, z_real], axis=-1)
-            z_list.append(z_all)
+            f_all = jnp.stack([f_init, f_gen, f_real], axis=-1)
+            f_list.append(f_all)
 
-        return z_list
+        return f_list
 
     cross_replica_mean = jax.pmap(lambda x: jax.lax.pmean(x, 'x'), 'x')
     p_step_train = jax.pmap(
@@ -358,7 +405,7 @@ def launch(config, print_fn):
         data_rng, rng = jax.random.split(rng)
 
         train_metrics = []
-        train_loader = dataloaders["trn_featureloader"](rng=data_rng)
+        train_loader = dataloaders["featureloader"](rng=data_rng)
         train_loader = jax_utils.prefetch_to_device(train_loader, size=2)
         for batch_idx, batch in enumerate(train_loader, start=1):
             # TODO arange feature and input seperately
@@ -387,11 +434,12 @@ def launch(config, print_fn):
             if batch_idx == 1:
                 z_list = p_step_sample(state, batch)
                 for i, z_all in enumerate(z_list):
-                    image_array = jax.nn.sigmoid(z_all[0][0])
+                    image_array = z_all[0][0]
+                    image_array = jax.nn.sigmoid(image_array)
                     image_array = np.array(image_array)
                     image_array = pixelize(image_array)
                     image = Image.fromarray(image_array)
-                    image.save(f"test_w{config.ws_test[i]}.png")
+                    image.save(f"dsb_w{config.ws_test[i]}.png")
         valid_metrics = common_utils.get_metrics(valid_metrics)
         val_summarized = {f'val/{k}': v for k,
                           v in jax.tree_util.tree_map(lambda e: e.sum(), valid_metrics).items()}

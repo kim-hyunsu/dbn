@@ -30,6 +30,8 @@ from models.ddpm import ContextUnet, ddpm_schedules
 from collections import OrderedDict
 from PIL import Image
 
+from utils import pixelize, normalize, unnormalize
+
 
 class TrainState(train_state.TrainState):
     batch_stats: Any
@@ -69,7 +71,8 @@ class TrainState(train_state.TrainState):
     def sample(self, rng, apply, n_samples, size, stats, guide_w=0.,):
         new_size = (n_samples, *size)  # (n_samples,H,W,3)
         _rng, rng = jax.random.split(rng)
-        x_i = jax.random.normal(_rng, new_size)  # (n_samples,H,W,3)
+        x_init = jax.random.normal(_rng, new_size)  # (n_samples,H,W,3)
+        x_i = x_init
         c_i = jnp.arange(0, 10)
         multiples = n_samples//c_i.shape[0]
         c_i = jnp.tile(c_i, multiples)  # (n_samples,)
@@ -87,13 +90,12 @@ class TrainState(train_state.TrainState):
             idx = self.n_T - i
             _rng, rng = jax.random.split(rng)
             t_is = jnp.array([idx/self.n_T])  # (1,)
-            t_is = jnp.tile(t_is, [n_samples, 1, 1, 1])  # (n_samples,1,1,1)
+            t_is = jnp.tile(t_is, [n_samples])  # (n_samples,)
 
             x_i = jnp.tile(x_i, [2, 1, 1, 1])  # (2*n_samples,H,W,3)
-            t_is = jnp.tile(t_is, [2, 1, 1, 1])  # (2*n_samples,1,1,1)
+            t_is = jnp.tile(t_is, [2])  # (2*n_samples,)
 
             # (n_samples, H,W,3)
-            # z = jax.random.normal(_rng, new_size) if i > 1 else 0
             z = jnp.where(idx > 1, jax.random.normal(
                 _rng, new_size), jnp.zeros(new_size))
             eps = apply(x_i, c_i, t_is, context_mask)  # (2*n_samples,H,W,3)
@@ -106,11 +108,16 @@ class TrainState(train_state.TrainState):
                 (x_i-eps*stats["mab_over_sqrtmab"][idx])
                 + stats["sqrt_beta_t"][idx]*z
             )  # (n_samples,H,W,3)
+            x_i = unnormalize(x_i)
+            x_i = x_i*255
+            x_i = jnp.clip(x_i,0,255)
+            x_i = x_i/255
+            x_i = normalize(x_i)
             return rng, x_i
 
         _, x_i = jax.lax.fori_loop(0, self.n_T, body_fn, (rng, x_i))
 
-        return x_i
+        return x_i, x_init
 
 
 def get_ckpt_temp(ckpt_dir):
@@ -338,7 +345,7 @@ def launch(config, print_fn):
         n_sample = 4*config.n_classes
         x_list = []
         for w_i, w in enumerate(config.ws_test):
-            x_gen = state.sample(
+            x_gen, x_init = state.sample(
                 state.rng, apply, n_sample, (32, 32, 3), ddpm_stats, guide_w=w)
             x_real = jnp.empty(x_gen.shape, dtype=model_dtype)
             for k in range(config.n_classes):
@@ -349,7 +356,7 @@ def launch(config, print_fn):
                         idx = 0
                     x_real = x_real.at[k+(j*config.n_classes)].set(x[idx])
 
-            x_all = jnp.concatenate([x_gen, x_real], axis=2)
+            x_all = jnp.concatenate([x_init, x_gen, x_real], axis=2)
             x_list.append(x_all)
 
         return x_list
@@ -406,7 +413,7 @@ def launch(config, print_fn):
                     x_all = x_all.reshape(p_bs*bs*H, W, P)
                     image_array = np.array(x_all)
                     image = Image.fromarray(pixelize(image_array), "RGB")
-                    image.save(f"sample_w{config.ws_test[i]}.png")
+                    image.save(f"nostd_sample_w{config.ws_test[i]}.png")
         valid_metrics = common_utils.get_metrics(valid_metrics)
         val_summarized = {f'val/{k}': v for k,
                           v in jax.tree_util.tree_map(lambda e: e.sum(), valid_metrics).items()}

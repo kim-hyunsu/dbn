@@ -22,11 +22,13 @@ logits_std = jnp.array(
 
 
 def normalize(x):
-    return (x-pixel_mean)/pixel_std
+    # return (x-pixel_mean)/pixel_std
+    return (x-pixel_mean)
 
 
 def unnormalize(x):
-    return pixel_std*x+pixel_mean
+    # return pixel_std*x+pixel_mean
+    return x+pixel_mean
 
 
 def normalize_logits(x):

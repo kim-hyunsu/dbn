@@ -110,7 +110,7 @@ class TrainState(train_state.TrainState):
             )  # (n_samples,H,W,3)
             x_i = unnormalize(x_i)
             x_i = x_i*255
-            x_i = jnp.clip(x_i,0,255)
+            x_i = jnp.clip(x_i, 0, 255)
             x_i = x_i/255
             x_i = normalize(x_i)
             return rng, x_i
@@ -299,6 +299,12 @@ def launch(config, print_fn):
         metrics, new_model_state = aux
         grads = jax.tree_util.tree_map(
             lambda g, p: g + config.optim_weight_decay * p, grads, state.params)
+        #### gradient clipping #######
+        # norm = jax.experimental.optimizers.l2_norm(grads)
+        # eps = 1e-9
+        # def clip_normalize(g): return jnp.where(norm < 1, g, g*1 / (norm+eps))
+        # grads = jax.tree_util.tree_map(clip_normalize, grads)
+        ##############################
         new_state = state.apply_gradients(
             grads=grads, batch_stats=new_model_state['batch_stats'])
         metrics = jax.lax.pmean(metrics, axis_name="batch")
@@ -413,7 +419,7 @@ def launch(config, print_fn):
                     x_all = x_all.reshape(p_bs*bs*H, W, P)
                     image_array = np.array(x_all)
                     image = Image.fromarray(pixelize(image_array), "RGB")
-                    image.save(f"nostd_sample_w{config.ws_test[i]}.png")
+                    image.save(f"sample_w{config.ws_test[i]}.png")
         valid_metrics = common_utils.get_metrics(valid_metrics)
         val_summarized = {f'val/{k}': v for k,
                           v in jax.tree_util.tree_map(lambda e: e.sum(), valid_metrics).items()}

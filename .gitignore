@@ -20,6 +20,5 @@ flower102/
 /flower102
 flower102
 wandb
-*.png
 *.pdf
 .venv

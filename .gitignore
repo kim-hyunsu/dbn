@@ -20,6 +20,9 @@ flower102/
 /flower102
 flower102
 wandb
+.venv
+
+/assets
+
 *.png
 *.pdf
-.venv

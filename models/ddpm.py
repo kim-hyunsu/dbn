@@ -189,10 +189,10 @@ class ContextUnet(nn.Module):
         hiddenvec = self.gelu(hiddenvec)
 
         c = nn.activation.one_hot(c, num_classes=self.n_classes)  # (B,10)
-        context_mask = context_mask[:, None]  # (B,1)
-        context_mask = jnp.tile(context_mask, [1, self.n_classes])  # (B,10)
-        context_mask = -1*(1-context_mask)
-        c = c*context_mask  # (B,10)
+        # context_mask = context_mask[:, None]  # (B,1)
+        # context_mask = jnp.tile(context_mask, [1, self.n_classes])  # (B,10)
+        # context_mask = -1*(1-context_mask)
+        # c = c*context_mask  # (B,10)
 
         cemb1 = self.contextembed1(
             self.n_classes, 2*self.n_feat
@@ -331,12 +331,13 @@ class CondMLP(nn.Module):
         hiddenvec = self.avgpool2d(down2)  # (B,1,1,hidden_ch)
         hiddenvec = self.gelu(hiddenvec)
 
-        context_mask = context_mask[:, None, None, None]  # (B,1,1,1)
-        context_mask = jnp.tile(
-            context_mask, [1, 1, 1, self.hidden_ch])  # (B,1,1,hidden_ch)
-        context_mask = -1*(1-context_mask)
-        x_embed = hiddenvec*context_mask  # (B,1,1,hidden_ch)
-        x_embed = x_embed.reshape(-1, self.hidden_ch)  # (B,hidden_ch)
+        # context_mask = context_mask[:, None, None, None]  # (B,1,1,1)
+        # context_mask = jnp.tile(
+        #     context_mask, [1, 1, 1, self.hidden_ch])  # (B,1,1,hidden_ch)
+        # context_mask = -1*(1-context_mask)
+        # x_embed = hiddenvec*context_mask  # (B,1,1,hidden_ch)
+        # x_embed = x_embed.reshape(-1, self.hidden_ch)  # (B,hidden_ch)
+        x_embed = hiddenvec.reshape(-1, self.hidden_ch)
 
         t = self.embed_dense1(self.hidden_ch)(t[:, None])
         t = self.gelu(t)

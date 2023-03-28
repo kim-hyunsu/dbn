@@ -221,7 +221,7 @@ class TrainState(train_state.TrainState):
             eps = apply(x_n, t_n)  # (2*B, d)
             eps1 = eps[:n_samples]  # (B, d)
             eps2 = eps[n_samples:]  # (B, d)
-            eps = (1-guide_w)*eps1 - guide_w*eps2  # (B, d)
+            eps = (1+guide_w)*eps1 - guide_w*eps2  # (B, d)
             x_n = x_n[:n_samples]  # (B, d)
             x_n = (
                 stats["oneover_sqrta"][idx] *

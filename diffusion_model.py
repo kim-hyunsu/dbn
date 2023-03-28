@@ -60,8 +60,7 @@ class TrainState(train_state.TrainState):
             self.sqrtab[_ts, None, None, None] * x
             + self.sqrtmab[_ts, None, None, None] * noise
         )  # (B, H, W, 3)
-        context_mask = jax.random.bernoulli(
-            c_rng, self.drop_prob, c.shape)  # (B,)
+        context_mask = jnp.zeros((x_t.shape[0],))  # (n_samples,)
         kwargs["c"] = c
         kwargs["t"] = _ts/self.n_T  # (B,)
         kwargs["context_mask"] = context_mask
@@ -79,30 +78,18 @@ class TrainState(train_state.TrainState):
 
         context_mask = jnp.zeros(c_i.shape)  # (n_samples,)
 
-        c_i = jnp.tile(c_i, 2)  # (2*n_samples,)
-        context_mask = jnp.tile(context_mask, 2)  # (2*n_samples.)
-        context_mask = context_mask.at[n_samples:].set(1.)  # (2*n_samples,)
-
-        x_i_store = []
-
         def body_fn(i, val):
             rng, x_i = val
-            idx = self.n_T - i
+            idx = self.n_T - i  # T -> 1: last to second
             _rng, rng = jax.random.split(rng)
             t_is = jnp.array([idx/self.n_T])  # (1,)
             t_is = jnp.tile(t_is, [n_samples])  # (n_samples,)
-
-            x_i = jnp.tile(x_i, [2, 1, 1, 1])  # (2*n_samples,H,W,3)
-            t_is = jnp.tile(t_is, [2])  # (2*n_samples,)
 
             # (n_samples, H,W,3)
             z = jnp.where(idx > 1, jax.random.normal(
                 _rng, new_size), jnp.zeros(new_size))
             eps = apply(x_i, c_i, t_is, context_mask)  # (2*n_samples,H,W,3)
-            eps1 = eps[:n_samples]  # (n_samples,H,W,3)
-            eps2 = eps[n_samples:]  # (n_samples,H,W,3)
-            eps = (1-guide_w)*eps1 - guide_w*eps2  # (n_samples,H,W,3)
-            x_i = x_i[:n_samples]  # (n_samples,H,W,3)
+            # stats["oneover_sqrta"] (T+1,)
             x_i = (
                 stats["oneover_sqrta"][idx] *
                 (x_i-eps*stats["mab_over_sqrtmab"][idx])
@@ -476,11 +463,10 @@ def main():
 
     parser.add_argument('--optim_ne', default=200, type=int,
                         help='the number of training epochs (default: 200)')
-    parser.add_argument('--optim_lr', default=1e-4, type=float,
+    parser.add_argument('--optim_lr', default=2e-4, type=float,
                         help='base learning rate (default: 1e-4)')
     parser.add_argument('--optim_weight_decay', default=0., type=float,
                         help='weight decay coefficient (default: 0.)')
-
     parser.add_argument('--save', default=None, type=str,
                         help='save the *.log and *.ckpt files if specified (default: False)')
     parser.add_argument('--seed', default=None, type=int,

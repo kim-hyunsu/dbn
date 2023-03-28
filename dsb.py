@@ -250,8 +250,8 @@ def launch(config, print_fn):
     config.n_classes = dataloaders["num_classes"]
     config.ws_test = [0.0, 0.5, 2.0]
 
-    beta1 = 1e-4
-    beta2 = 0.02
+    beta1 = config.beta1
+    beta2 = config.beta2
     dsb_stats = dsb_schedules(beta1, beta2, config.T)
 
     score_func = MLP(
@@ -500,6 +500,8 @@ def main():
                         choices=['fp16', 'fp32'])
     parser.add_argument("--T", default=400, type=int)
     parser.add_argument("--n_feat", default=64, type=int)
+    parser.add_argument("--beta1", default=1e-4, type=float)
+    parser.add_argument("--beta2", default=0.02, type=float)
 
     args = parser.parse_args()
 

@@ -201,9 +201,9 @@ class TrainState(train_state.TrainState):
         kwargs["training"] = training
         return x_t, sigma_t, kwargs
 
-    def sample(self, rng, apply, size, x0, stats, guide_w=0.,):
-        n_samples = x0.shape[0]  # B
-        new_size = (n_samples, *size)  # (B, d)
+    def sample(self, rng, apply, x0, stats):
+        shape = x0.shape
+        batch_size = shape[0]
         x_n = x0  # (B, d)
 
         def body_fn(n, val):
@@ -211,18 +211,11 @@ class TrainState(train_state.TrainState):
             idx = self.n_T - n
             _rng, rng = jax.random.split(rng)
             t_n = jnp.array([idx/self.n_T])  # (1,)
-            t_n = jnp.tile(t_n, [n_samples])  # (B,)
-
-            x_n = jnp.tile(x_n, [2, 1])  # (2*B, d)
-            t_n = jnp.tile(t_n, [2])  # (2*B,)
+            t_n = jnp.tile(t_n, [batch_size])  # (B,)
 
             h = jnp.where(idx > 1, jax.random.normal(
-                _rng, new_size), jnp.zeros(new_size))  # (B, d)
+                _rng, shape), jnp.zeros(shape))  # (B, d)
             eps = apply(x_n, t_n)  # (2*B, d)
-            eps1 = eps[:n_samples]  # (B, d)
-            eps2 = eps[n_samples:]  # (B, d)
-            eps = (1+guide_w)*eps1 - guide_w*eps2  # (B, d)
-            x_n = x_n[:n_samples]  # (B, d)
             x_n = (
                 stats["oneover_sqrta"][idx] *
                 (x_n-eps*stats["mab_over_sqrtmab"][idx])
@@ -248,7 +241,6 @@ def launch(config, print_fn):
     # build dataloaders
     dataloaders = build_featureloaders(config)
     config.n_classes = dataloaders["num_classes"]
-    config.ws_test = [0.0, 0.5, 2.0]
 
     beta1 = config.beta1
     beta2 = config.beta2
@@ -378,18 +370,15 @@ def launch(config, print_fn):
         logitsA = batch["labels"]  # other modes
         logitsB = normalize_logits(logitsB)
         logitsA = normalize_logits(logitsA)
-        f_list = []
-        for w_i, w in enumerate(config.ws_test):
-            f_gen = state.sample(
-                state.rng, apply, (config.n_classes,), logitsB, dsb_stats, guide_w=w)
-            f_gen = unnormalize_logits(f_gen)
-            f_real = unnormalize_logits(logitsA)
-            f_init = unnormalize_logits(logitsB)
+        f_gen = state.sample(
+            state.rng, apply, logitsB, dsb_stats)
+        f_gen = unnormalize_logits(f_gen)
+        f_real = unnormalize_logits(logitsA)
+        f_init = unnormalize_logits(logitsB)
 
-            f_all = jnp.stack([f_init, f_gen, f_real], axis=-1)
-            f_list.append(f_all)
+        f_all = jnp.stack([f_init, f_gen, f_real], axis=-1)
 
-        return f_list
+        return f_all
 
     cross_replica_mean = jax.pmap(lambda x: jax.lax.pmean(x, 'x'), 'x')
     p_step_train = jax.pmap(
@@ -408,7 +397,6 @@ def launch(config, print_fn):
         train_loader = dataloaders["featureloader"](rng=data_rng)
         train_loader = jax_utils.prefetch_to_device(train_loader, size=2)
         for batch_idx, batch in enumerate(train_loader, start=1):
-            # TODO arange feature and input seperately
             loss_rng, rng = jax.random.split(rng)
             state.replace(rng=loss_rng)
             state, metrics = p_step_train(state, batch)
@@ -425,21 +413,19 @@ def launch(config, print_fn):
         valid_loader = dataloaders["val_featureloader"](rng=None)
         valid_loader = jax_utils.prefetch_to_device(valid_loader, size=2)
         for batch_idx, batch in enumerate(valid_loader, start=1):
-            # TODO arange feature and input seperately
             loss_rng, rng = jax.random.split(rng)
             state.replace(rng=loss_rng)
             metrics = p_step_valid(state, batch)
             valid_metrics.append(metrics)
 
             if batch_idx == 1:
-                z_list = p_step_sample(state, batch)
-                for i, z_all in enumerate(z_list):
-                    image_array = z_all[0][0]
-                    image_array = jax.nn.sigmoid(image_array)
-                    image_array = np.array(image_array)
-                    image_array = pixelize(image_array)
-                    image = Image.fromarray(image_array)
-                    image.save(f"dsb_w{config.ws_test[i]}.png")
+                z_all = p_step_sample(state, batch)
+                image_array = z_all[0][0]
+                image_array = jax.nn.sigmoid(image_array)
+                image_array = np.array(image_array)
+                image_array = pixelize(image_array)
+                image = Image.fromarray(image_array)
+                image.save(f"dsb.png")
         valid_metrics = common_utils.get_metrics(valid_metrics)
         val_summarized = {f'val/{k}': v for k,
                           v in jax.tree_util.tree_map(lambda e: e.sum(), valid_metrics).items()}

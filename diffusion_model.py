@@ -67,7 +67,7 @@ class TrainState(train_state.TrainState):
         kwargs["training"] = training
         return noise, x_t, kwargs
 
-    def sample(self, rng, apply, n_samples, size, stats, guide_w=0.,):
+    def sample(self, rng, apply, n_samples, size, stats):
         new_size = (n_samples, *size)  # (n_samples,H,W,3)
         _rng, rng = jax.random.split(rng)
         x_init = jax.random.normal(_rng, new_size)  # (n_samples,H,W,3)
@@ -88,7 +88,7 @@ class TrainState(train_state.TrainState):
             # (n_samples, H,W,3)
             z = jnp.where(idx > 1, jax.random.normal(
                 _rng, new_size), jnp.zeros(new_size))
-            eps = apply(x_i, c_i, t_is, context_mask)  # (2*n_samples,H,W,3)
+            eps = apply(x_i, c_i, t_is, context_mask)  # (n_samples,H,W,3)
             # stats["oneover_sqrta"] (T+1,)
             x_i = (
                 stats["oneover_sqrta"][idx] *
@@ -172,7 +172,6 @@ def load_classifer_state(idx, template):
 def launch(config, print_fn):
     rng = jax.random.PRNGKey(config.seed)
     init_rng, rng = jax.random.split(rng)
-    # TODO: change hyperparameters
 
     # specify precision
     model_dtype = jnp.float32
@@ -183,21 +182,10 @@ def launch(config, print_fn):
     # build dataloaders
     dataloaders = build_dataloaders(config)
     config.n_classes = dataloaders["num_classes"]
-    config.ws_test = [0.0, 0.5, 2.0]
 
     beta1 = 1e-4
     beta2 = 0.02
     ddpm_stats = ddpm_schedules(beta1, beta2, config.T)
-    # ddpm = DDPM(
-    #     nn_model=ContextUnet(
-    #         in_channels=3,
-    #         n_feat=config.n_feat,
-    #         n_classes=config.n_classes),
-    #     betas=(beta1, beta2),
-    #     n_T=config.T,
-    #     drop_prob=0.1,
-    #     dtype=model_dtype,
-    #     **ddpm_stats)
     score_func = ContextUnet(
         in_channels=3,
         n_feat=config.n_feat,
@@ -336,23 +324,20 @@ def launch(config, print_fn):
         y = batch["labels"]
         x = normalize(x)
         n_sample = 4*config.n_classes
-        x_list = []
-        for w_i, w in enumerate(config.ws_test):
-            x_gen, x_init = state.sample(
-                state.rng, apply, n_sample, (32, 32, 3), ddpm_stats, guide_w=w)
-            x_real = jnp.empty(x_gen.shape, dtype=model_dtype)
-            for k in range(config.n_classes):
-                for j in range(n_sample//config.n_classes):
-                    try:
-                        idx = jnp.squeeze((y == k).nonzero())[j]
-                    except:
-                        idx = 0
-                    x_real = x_real.at[k+(j*config.n_classes)].set(x[idx])
+        x_gen, x_init = state.sample(
+            state.rng, apply, n_sample, (32, 32, 3), ddpm_stats)
+        x_real = jnp.empty(x_gen.shape, dtype=model_dtype)
+        for k in range(config.n_classes):
+            for j in range(n_sample//config.n_classes):
+                try:
+                    idx = jnp.squeeze((y == k).nonzero())[j]
+                except:
+                    idx = 0
+                x_real = x_real.at[k+(j*config.n_classes)].set(x[idx])
 
-            x_all = jnp.concatenate([x_init, x_gen, x_real], axis=2)
-            x_list.append(x_all)
+        x_all = jnp.concatenate([x_init, x_gen, x_real], axis=2)
 
-        return x_list
+        return x_all
 
     cross_replica_mean = jax.pmap(lambda x: jax.lax.pmean(x, 'x'), 'x')
     p_step_train = jax.pmap(
@@ -371,7 +356,6 @@ def launch(config, print_fn):
         train_loader = dataloaders["dataloader"](rng=data_rng)
         train_loader = jax_utils.prefetch_to_device(train_loader, size=2)
         for batch_idx, batch in enumerate(train_loader, start=1):
-            # TODO arange feature and input seperately
             loss_rng, rng = jax.random.split(rng)
             state.replace(rng=loss_rng)
             state, metrics = p_step_train(state, batch)
@@ -388,25 +372,22 @@ def launch(config, print_fn):
         valid_loader = dataloaders["val_loader"](rng=None)
         valid_loader = jax_utils.prefetch_to_device(valid_loader, size=2)
         for batch_idx, batch in enumerate(valid_loader, start=1):
-            # TODO arange feature and input seperately
             loss_rng, rng = jax.random.split(rng)
             state.replace(rng=loss_rng)
             metrics = p_step_valid(state, batch)
             valid_metrics.append(metrics)
 
             if batch_idx == 1:
-                oimage_array = np.array(batch["images"][0][0])
-                oimage = Image.fromarray(pixelize(oimage_array), "RGB")
-                oimage.save("test_original.png")
-
-                x_list = p_step_sample(state, batch)
-                for i, x_all in enumerate(x_list):
-                    x_all = unnormalize(x_all)
-                    p_bs, bs, H, W, P = x_all.shape
-                    x_all = x_all.reshape(p_bs*bs*H, W, P)
-                    image_array = np.array(x_all)
-                    image = Image.fromarray(pixelize(image_array), "RGB")
-                    image.save(f"sample_w{config.ws_test[i]}.png")
+                # oimage_array = np.array(batch["images"][0][0])
+                # oimage = Image.fromarray(pixelize(oimage_array), "RGB")
+                # oimage.save("test_original.png")
+                x_all = p_step_sample(state, batch)
+                x_all = unnormalize(x_all)
+                p_bs, bs, H, W, P = x_all.shape
+                x_all = x_all.reshape(p_bs*bs*H, W, P)
+                image_array = np.array(x_all)
+                image = Image.fromarray(pixelize(image_array), "RGB")
+                image.save(f"image_sample.png")
         valid_metrics = common_utils.get_metrics(valid_metrics)
         val_summarized = {f'val/{k}': v for k,
                           v in jax.tree_util.tree_map(lambda e: e.sum(), valid_metrics).items()}

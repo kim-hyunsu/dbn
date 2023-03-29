@@ -82,12 +82,16 @@ def load_classifer_state(mode_idx, sample_idx, template):
 
 
 if __name__ == "__main__":
+    """
+    'logits' and 'features' are used compatibly as terms of any features of a given data
+    """
     config, ckpt = get_ckpt_temp(model_list[0])
     n_samples_each_mode = 30
     n_modes = len(model_list)
     dataloaders = build_dataloaders(config)
+    dir = "features_last"
 
-    def get_logits(state, batch):
+    def get_logits(state, batch, feature_name="feature.vector"):
         x = batch["images"]
         x = normalize(x)
         marker = batch["marker"]
@@ -95,14 +99,25 @@ if __name__ == "__main__":
             "params": state.params,
             "image_stats": state.image_stats
         }, x, rngs=None, mutable="intermediates")
-        logits = new_model_state["intermediates"]["cls.logit"][0]
+        logits = new_model_state["intermediates"][feature_name][0]
         logits = jnp.where(marker[..., None], logits, jnp.zeros_like(logits))
         return logits
 
-    p_get_logits = jax.pmap(get_logits, axis_name="batch")
+    if dir == "features":
+        p_get_logits = jax.pmap(
+            partial(get_logits, feature_name="cls.logit"), axis_name="batch")
+    elif dir == "features_last":
+        p_get_logits = jax.pmap(get_logits, axis_name="batch")
+    else:
+        raise Exception("Invalid directory for saving features")
 
     for mode_idx in range(n_modes):
         for i in tqdm(range(n_samples_each_mode)):
+            feature_path = f"{dir}/train_features_M{mode_idx}S{i}.npy"
+            image_path = f"{dir}/train_images_M{mode_idx}S{i}.npy"
+            if os.path.exists(feature_path):
+                continue
+
             classifier_state, _ = load_classifer_state(mode_idx, i+1, ckpt)
             classifier_state = jax_utils.replicate(classifier_state)
             # train set
@@ -123,10 +138,10 @@ if __name__ == "__main__":
                 images_list.append(images)
             logits = jnp.concatenate(logits_list, axis=0)
             images = jnp.concatenate(images_list, axis=0)
-            with open(f"train_features_M{mode_idx}S{i}.npy", "wb") as f:
+            with open(feature_path, "wb") as f:
                 logits = np.array(logits)
                 np.save(f, logits)
-            with open(f"train_images_M{mode_idx}S{i}.npy", "wb") as f:
+            with open(image_path, "wb") as f:
                 images = np.array(images)
                 np.save(f, images)
             del logits_list
@@ -150,10 +165,10 @@ if __name__ == "__main__":
                 images_list.append(images)
             logits = jnp.concatenate(logits_list, axis=0)
             images = jnp.concatenate(images_list, axis=0)
-            with open(f"valid_features_M{mode_idx}S{i}.npy", "wb") as f:
+            with open(f"{dir}/valid_features_M{mode_idx}S{i}.npy", "wb") as f:
                 logits = np.array(logits)
                 np.save(f, logits)
-            with open(f"valid_images_M{mode_idx}S{i}.npy", "wb") as f:
+            with open(f"{dir}/valid_images_M{mode_idx}S{i}.npy", "wb") as f:
                 images = np.array(images)
                 np.save(f, images)
             del logits_list
@@ -176,25 +191,11 @@ if __name__ == "__main__":
                 images_list.append(images)
             logits = jnp.concatenate(logits_list, axis=0)
             images = jnp.concatenate(images_list, axis=0)
-            with open(f"test_features_M{mode_idx}S{i}.npy", "wb") as f:
+            with open(f"{dir}/test_features_M{mode_idx}S{i}.npy", "wb") as f:
                 logits = np.array(logits)
                 np.save(f, logits)
-            with open(f"test_images_M{mode_idx}S{i}.npy", "wb") as f:
+            with open(f"{dir}/test_images_M{mode_idx}S{i}.npy", "wb") as f:
                 images = np.array(images)
                 np.save(f, images)
             del logits_list
             del images_list
-
-    # train_logits = jnp.concatenate(train_logits_list, aixs=0)
-    # train_images = jnp.concatenate(train_images_list, aixs=0)
-    # valid_logits = jnp.concatenate(valid_logits_list, aixs=0)
-    # valid_images = jnp.concatenate(valid_images_list, aixs=0)
-    # test_logits = jnp.concatenate(test_logits_list, aixs=0)
-    # test_images = jnp.concatenate(test_images_list, aixs=0)
-    # with open("features.npy", "wb") as f:
-    #     np.save(f, np.array(train_logits))
-    #     np.save(f, np.array(train_images))
-    #     np.save(f, np.array(valid_logits))
-    #     np.save(f, np.array(valid_images))
-    #     np.save(f, np.array(test_logits))
-    #     np.save(f, np.array(test_images))

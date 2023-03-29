@@ -34,6 +34,7 @@ from utils import pixelize, normalize_logits, unnormalize_logits, jprint
 
 
 def build_featureloaders(config):
+    dir = config.features_dir
     # B: current mode, A: other modes
     n_Amodes = 1
     n_samples_each_mode = 1
@@ -48,22 +49,22 @@ def build_featureloaders(config):
     for mode_idx in range(1+n_Amodes):  # total 1+n_Amodes
         if mode_idx == 0:  # p_B
             for i in tqdm(range(n_samples_each_Bmode)):
-                with open(f"features/train_features_M{mode_idx}S{i}.npy", "rb") as f:
+                with open(f"{dir}/train_features_M{mode_idx}S{i}.npy", "rb") as f:
                     train_logits = np.load(f)
-                with open(f"features/valid_features_M{mode_idx}S{i}.npy", "rb") as f:
+                with open(f"{dir}/valid_features_M{mode_idx}S{i}.npy", "rb") as f:
                     valid_logits = np.load(f)
-                with open(f"features/test_features_M{mode_idx}S{i}.npy", "rb") as f:
+                with open(f"{dir}/test_features_M{mode_idx}S{i}.npy", "rb") as f:
                     test_logits = np.load(f)
                 train_Blogits_list.append(train_logits)
                 valid_Blogits_list.append(valid_logits)
                 test_Blogits_list.append(test_logits)
         else:  # p_A (mixture of modes)
             for i in tqdm(range(n_samples_each_Amode)):
-                with open(f"features/train_features_M{mode_idx}S{i}.npy", "rb") as f:
+                with open(f"{dir}/train_features_M{mode_idx}S{i}.npy", "rb") as f:
                     train_logits = np.load(f)
-                with open(f"features/valid_features_M{mode_idx}S{i}.npy", "rb") as f:
+                with open(f"{dir}/valid_features_M{mode_idx}S{i}.npy", "rb") as f:
                     valid_logits = np.load(f)
-                with open(f"features/test_features_M{mode_idx}S{i}.npy", "rb") as f:
+                with open(f"{dir}/test_features_M{mode_idx}S{i}.npy", "rb") as f:
                     test_logits = np.load(f)
                 train_Alogits_list.append(train_logits)
                 valid_Alogits_list.append(valid_logits)
@@ -135,6 +136,11 @@ def build_featureloaders(config):
         shuffle=False,
         transform=None
     )
+    normalize = partial(normalize_logits,  features_dir=dir)
+    unnormalize = partial(unnormalize_logits,  features_dir=dir)
+    # >------------------------------------------------------------------
+    # > Compute statistics (mean, std)
+    # >------------------------------------------------------------------
     # count = 0
     # sum = 0
     # for batch in dataloaders["trn_featureloader"](rng=None):
@@ -157,10 +163,11 @@ def build_featureloaders(config):
     #     sum += jnp.sum((logitsA-mean)**2, axis=[0, 1])
     # var = sum/count
     # std = jnp.sqrt(var)
+    # print("dims", len(mean))
     # print("mean", mean)
     # print("std", std)
 
-    return dataloaders
+    return dataloaders, normalize, unnormalize
 
 
 class TrainState(train_state.TrainState):
@@ -251,7 +258,7 @@ def launch(config, print_fn):
         )[0].platform == 'tpu' else jnp.float16
 
     # build dataloaders
-    dataloaders = build_featureloaders(config)
+    dataloaders, normalize, unnormalize = build_featureloaders(config)
     config.n_classes = dataloaders["num_classes"]
 
     beta1 = config.beta1
@@ -260,8 +267,9 @@ def launch(config, print_fn):
     for k, v in dsb_stats.items():
         print(f"{k}: {v}")
 
+    x_dim = 64
     score_func = MLP(
-        x_dim=10,
+        x_dim=x_dim,
         pos_dim=128,
         encoder_layers=[128, 128],
         decoder_layers=[128, 128]
@@ -273,7 +281,7 @@ def launch(config, print_fn):
         def init(*args, **kwargs):
             return model.init(*args, **kwargs)
         return init({'params': key},
-                    x=jnp.ones((1, config.n_classes), model_dtype),
+                    x=jnp.ones((1, x_dim), model_dtype),
                     t=jnp.ones((1,)))
     variables = initialize_model(init_rng, score_func)
 
@@ -309,8 +317,8 @@ def launch(config, print_fn):
     def step_train(state, batch, config):
         logitsB = batch["images"]  # the current mode
         logitsA = batch["labels"]  # mixture of other modes
-        logitsB = normalize_logits(logitsB)
-        logitsA = normalize_logits(logitsA)
+        logitsB = normalize(logitsB)
+        logitsA = normalize(logitsA)
 
         def loss_fn(params):
             logits_t, sigma_t, kwargs = state.forward(
@@ -362,8 +370,8 @@ def launch(config, print_fn):
     def step_valid(state, batch):
         logitsB = batch["images"]
         logitsA = batch["labels"]
-        logitsB = normalize_logits(logitsB)
-        logitsA = normalize_logits(logitsA)
+        logitsB = normalize(logitsB)
+        logitsA = normalize(logitsA)
         logits_t, sigma_t, kwargs = state.forward(
             logitsA, logitsB, training=False, rng=state.rng)
         params_dict = dict(params=state.params)
@@ -390,17 +398,17 @@ def launch(config, print_fn):
             return output
         logitsB = batch["images"]  # current mode
         logitsA = batch["labels"]  # other modes
-        logitsB = normalize_logits(logitsB)
-        logitsA = normalize_logits(logitsA)
-        # jprint(">--------------------------------")
-        # jprint(logitsB[-1])
+        logitsB = normalize(logitsB)
+        logitsA = normalize(logitsA)
+        jprint(">--------------------------------")
+        jprint(logitsB[-1])
         f_gen = state.sample(
             state.rng, apply, logitsB, dsb_stats)
-        # jprint(logitsA[-1])
-        # jprint(">--------------------------------")
-        f_gen = unnormalize_logits(f_gen)
-        f_real = unnormalize_logits(logitsA)
-        f_init = unnormalize_logits(logitsB)
+        jprint(logitsA[-1])
+        jprint(">--------------------------------")
+        f_gen = unnormalize(f_gen)
+        f_real = unnormalize(logitsA)
+        f_init = unnormalize(logitsB)
 
         f_all = jnp.stack([f_init, f_gen, f_real], axis=-1)
 
@@ -517,6 +525,7 @@ def main():
     parser.add_argument("--n_feat", default=64, type=int)
     parser.add_argument("--beta1", default=1e-4, type=float)
     parser.add_argument("--beta2", default=0.02, type=float)
+    parser.add_argument("--features_dir", default="features_last", type=str)
 
     args = parser.parse_args()
 

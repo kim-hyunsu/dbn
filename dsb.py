@@ -32,8 +32,12 @@ from PIL import Image
 from tqdm import tqdm
 from utils import model_list, normalize, unnormalize, pixelize, normalize_logits, unnormalize_logits
 
+import tensorflow as tf
 
 def build_featureloaders(config):
+    """
+        Call (1 + nAmodes) collections of logits and return `dataloader`.
+    """
     # B: current mode, A: other modes
     n_Amodes = 1
     n_samples_each_mode = 1
@@ -183,6 +187,14 @@ class TrainState(train_state.TrainState):
 
     # equation (11) in I2SB
     def forward(self, x0, x1, training=True, **kwargs):
+        """
+            Args:
+                x0: 
+                x1:
+                training (bool): True if training, False if evaluation
+                **kwargs:
+                    rng: RNG keys.
+        """
         # rng
         rng = kwargs["rng"]
         t_rng, n_rng = jax.random.split(rng, 2)
@@ -195,7 +207,7 @@ class TrainState(train_state.TrainState):
 
         # q(X_t|X_0,X_1) = N(X_t;mu_t,bigsigma_t)
         noise = jax.random.normal(n_rng, mu_t.shape)  # (B, d)
-        x_t = mu_t + bigsigma_t*noise
+        x_t = mu_t + jnp.sqrt(bigsigma_t)*noise
 
         kwargs["t"] = _ts/self.n_T  # (B,)
         kwargs["training"] = training
@@ -221,7 +233,7 @@ class TrainState(train_state.TrainState):
             eps = apply(x_n, t_n)  # (2*B, d)
             eps1 = eps[:n_samples]  # (B, d)
             eps2 = eps[n_samples:]  # (B, d)
-            eps = (1-guide_w)*eps1 - guide_w*eps2  # (B, d)
+            eps = (1-guide_w)*eps1 + guide_w*eps2  # (B, d)
             x_n = x_n[:n_samples]  # (B, d)
             x_n = (
                 stats["oneover_sqrta"][idx] *
@@ -250,15 +262,17 @@ def launch(config, print_fn):
     config.n_classes = dataloaders["num_classes"]
     config.ws_test = [0.0, 0.5, 2.0]
 
-    beta1 = 1e-4
-    beta2 = 0.02
+    # beta1 = 1e-4
+    # beta2 = 0.02
+    beta1 = config.beta1
+    beta2 = config.beta2
     dsb_stats = dsb_schedules(beta1, beta2, config.T)
 
     score_func = MLP(
         x_dim=10,
         pos_dim=16,
         encoder_layers=[16],
-        decoder_layers=[128, 128]
+        decoder_layers=[128, 128, 128]
     )
 
     # initialize model
@@ -276,9 +290,16 @@ def launch(config, print_fn):
         dynamic_scale = dynamic_scale_lib.DynamicScale()
 
     # define optimizer with scheduler
-    scheduler = optax.cosine_decay_schedule(
-        init_value=config.optim_lr,
-        decay_steps=config.optim_ne * dataloaders["trn_steps_per_epoch"])
+    if config.lr_schedule == 'cosine':
+      scheduler = optax.cosine_decay_schedule(
+          init_value=config.optim_lr,
+          decay_steps=config.optim_ne * dataloaders["trn_steps_per_epoch"])
+    elif config.lr_schedule == 'constant':
+      scheduler = optax.constant_schedule(
+        value=config.optim_lr
+      )
+    else:
+      raise NotImplementedError()
     optimizer = optax.adam(learning_rate=scheduler)
 
     # Train state of diffusion bridge
@@ -307,12 +328,13 @@ def launch(config, print_fn):
         logitsA = normalize_logits(logitsA)
 
         def loss_fn(params):
+            # I2SB, Eq. 12
             logits_t, sigma_t, kwargs = state.forward(
                 logitsA, logitsB, training=True, rng=state.rng)
             epsilon, new_model_state = state.apply_fn(
                 {"params": params, "batch_stats": state.batch_stats}, logits_t, mutable="batch_stats", **kwargs)
-            diff = (logits_t - logitsA) / sigma_t[:, None]
-            loss = mse_loss(epsilon, diff)
+            diff = (logits_t - logitsA) / sigma_t[:, None] # (Xt-X0) / sigma_t
+            loss = mse_loss(epsilon, diff) # ||eps(Xt,t;theta) - diff||
             loss = jnp.where(batch["marker"], loss, jnp.zeros_like(loss))
             count = jnp.sum(batch["marker"])
             loss = jnp.sum(loss) / count
@@ -431,6 +453,7 @@ def launch(config, print_fn):
             metrics = p_step_valid(state, batch)
             valid_metrics.append(metrics)
 
+            tf.io.gfile.mkdir(config.logdir)
             if batch_idx == 1:
                 z_list = p_step_sample(state, batch)
                 for i, z_all in enumerate(z_list):
@@ -439,7 +462,7 @@ def launch(config, print_fn):
                     image_array = np.array(image_array)
                     image_array = pixelize(image_array)
                     image = Image.fromarray(image_array)
-                    image.save(f"dsb_w{config.ws_test[i]}.png")
+                    image.save(os.path.join(config.logdir, f"dsb_w{config.ws_test[i]}.png"))
         valid_metrics = common_utils.get_metrics(valid_metrics)
         val_summarized = {f'val/{k}': v for k,
                           v in jax.tree_util.tree_map(lambda e: e.sum(), valid_metrics).items()}
@@ -500,6 +523,16 @@ def main():
                         choices=['fp16', 'fp32'])
     parser.add_argument("--T", default=400, type=int)
     parser.add_argument("--n_feat", default=64, type=int)
+
+    parser.add_argument("--logdir", default='eval', type=str,
+                        help='Directory of saved logs and figures.')
+    parser.add_argument("--lr_schedule", default='cosine', type=str,
+                        choices=['cosine', 'constant'])
+    
+    parser.add_argument("--beta1", default=1.5e-4, type=float,
+                        help='beta1 (minimum beta) for DSB')
+    parser.add_argument("--beta2", default=1.5e-3, type=float,
+                        help='beta2 (maximum beta) for DSB')
 
     args = parser.parse_args()
 

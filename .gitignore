@@ -23,6 +23,11 @@ wandb
 .venv
 
 /assets
+/eval
 
 *.png
 *.pdf
+
+dump*
+
+scripts/run.sh

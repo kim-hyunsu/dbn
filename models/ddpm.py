@@ -447,20 +447,53 @@ class MLP(nn.Module):
 
 def dsb_schedules(beta1, beta2, T):
     # TODO
+    """
+        Args
+          beta1 (float, default: 1e-4), beta2 (float, default: 0.02)
+            beta_t = beta1 if t=0, beta2 if t=1
+          T (int)
+            Partition of diffusion trajectory
+
+        Return
+          alpha_t:
+            sqrt(alpha_t) is data-side coefficient of one-step forward propagation.
+          oneover_sqrta:
+            1 / sqrt(alpha_t)
+          sqrt_beta_t:
+            Noise-side coefficient of one-step forward propagation.
+          alphabar_t:
+            Data-side exponent integrated from 0 to t, correspond to `sqrt_alphas_cumprod ** 2` in score_sde.
+          sqrtab:
+            Correspond to `sqrt_alphas_cumprod`.
+          sqrtmab:
+            Correspond to `sqrt_1m_alphas_cumprod`.
+          mab_over_sqrtmab
+          sigma_t:
+            sqrt(int_0^t (beta_t) dt), noise exponent integrated from 0 to t
+          sigmabar_t:
+            sqrt(int_t^1 (beta_t) dt), noise exponent integrated from t to 1
+          sigma_weight_t:
+            mu = ($) * X0 + (1 - $) * X1, X0 (original)-side weight of DSB noisy data.
+          bigsigma_t:
+            Variance of DSB noisy data.
+    """
     assert beta1 < beta2 < 1.0, "beta1 and beta2 must be in (0, 1)"
 
     t = jnp.arange(0, T+1, dtype=jnp.float32)
     tau = t/T
 
-    beta_t = (beta2 - beta1) * tau + beta1
+    # beta_t = (beta2 - beta1) * tau + beta1 # Current: 1e-4 ~ 0.02
+    beta_t = beta2 + (beta1 - beta2) * jnp.abs(tau - 0.5) * 2 # beta1: beta_min, beta2: beta_max
 
-    sigma_t_square = 0.5*(beta2-beta1)*tau**2 + beta1*tau
-    sigmabar_t_square = 0.5*(beta2-beta1)+beta1 - sigma_t_square
+    # DSB coefficients
+    sigma_t_square = nn.relu(0.5*(beta2-beta1)*tau**2 + beta1*tau) # int_0^t (beta_t) dt
+    sigmabar_t_square = nn.relu(0.5*(beta2-beta1)+beta1 - sigma_t_square) # int_t^1 (beta_t) dt
     sigma_t = jnp.sqrt(sigma_t_square)
     sigmabar_t = jnp.sqrt(sigmabar_t_square)
-    sigma_weight_t = sigmabar_t_square/(sigma_t_square+sigmabar_t_square)
+    sigma_weight_t = sigmabar_t_square/(sigma_t_square+sigmabar_t_square) # mu = ($)*X0 + (1-$)*X1
     bigsigma_t = sigma_t_square*sigma_weight_t
 
+    # DDPM coefficients
     sqrt_beta_t = jnp.sqrt(beta_t)
     alpha_t = 1 - beta_t
     log_alpha_t = jnp.log(alpha_t)

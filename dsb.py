@@ -26,11 +26,11 @@ import defaults_dsb as defaults
 from tabulate import tabulate
 import sys
 from giung2.data.build import build_dataloaders, _build_dataloader
-from models.ddpm import dsb_schedules, MLP
+from models.bridge import dsb_schedules, MLP
 from collections import OrderedDict
 from PIL import Image
 from tqdm import tqdm
-from utils import model_list, normalize, unnormalize, pixelize, normalize_logits, unnormalize_logits
+from utils import pixelize, normalize_logits, unnormalize_logits, jprint
 
 
 def build_featureloaders(config):
@@ -69,8 +69,10 @@ def build_featureloaders(config):
                 valid_Alogits_list.append(valid_logits)
                 test_Alogits_list.append(test_logits)
 
+    shift = 0
+
     train_logitsA = np.concatenate(train_Alogits_list, axis=0)
-    train_logitsA = jnp.array(train_logitsA)
+    train_logitsA = jnp.array(train_logitsA) + shift
     del train_Alogits_list
 
     train_logitsB = np.concatenate(train_Blogits_list, axis=0)
@@ -78,7 +80,7 @@ def build_featureloaders(config):
     del train_Blogits_list
 
     valid_logitsA = np.concatenate(valid_Alogits_list, axis=0)
-    valid_logitsA = jnp.array(valid_logitsA)
+    valid_logitsA = jnp.array(valid_logitsA) + shift
     del valid_Alogits_list
 
     valid_logitsB = np.concatenate(valid_Blogits_list, axis=0)
@@ -86,7 +88,7 @@ def build_featureloaders(config):
     del valid_Blogits_list
 
     test_logitsA = np.concatenate(test_Alogits_list, axis=0)
-    test_logitsA = jnp.array(test_logitsA)
+    test_logitsA = jnp.array(test_logitsA) + shift
     del test_Alogits_list
 
     test_logitsB = np.concatenate(test_Blogits_list, axis=0)
@@ -195,7 +197,7 @@ class TrainState(train_state.TrainState):
 
         # q(X_t|X_0,X_1) = N(X_t;mu_t,bigsigma_t)
         noise = jax.random.normal(n_rng, mu_t.shape)  # (B, d)
-        x_t = mu_t + bigsigma_t*noise
+        x_t = mu_t + noise*jnp.sqrt(bigsigma_t)
 
         kwargs["t"] = _ts/self.n_T  # (B,)
         kwargs["training"] = training
@@ -216,6 +218,16 @@ class TrainState(train_state.TrainState):
             h = jnp.where(idx > 1, jax.random.normal(
                 _rng, shape), jnp.zeros(shape))  # (B, d)
             eps = apply(x_n, t_n)  # (2*B, d)
+            ########
+            # e1 = stats["oneover_sqrta"][idx]
+            # jprint(e1, "*(")
+            # e2 = x_n[-1]
+            # jprint(e2, "-")
+            # e3 = (eps*stats["mab_over_sqrtmab"][idx])[-1]
+            # jprint(e3, ")")
+            # e4 = (stats["sqrt_beta_t"][idx]*h)[-1]
+            # jprint("+", e4)
+            ##########
             x_n = (
                 stats["oneover_sqrta"][idx] *
                 (x_n-eps*stats["mab_over_sqrtmab"][idx])
@@ -245,11 +257,13 @@ def launch(config, print_fn):
     beta1 = config.beta1
     beta2 = config.beta2
     dsb_stats = dsb_schedules(beta1, beta2, config.T)
+    for k, v in dsb_stats.items():
+        print(f"{k}: {v}")
 
     score_func = MLP(
         x_dim=10,
-        pos_dim=16,
-        encoder_layers=[16],
+        pos_dim=128,
+        encoder_layers=[128, 128],
         decoder_layers=[128, 128]
     )
 
@@ -278,7 +292,7 @@ def launch(config, print_fn):
         apply_fn=score_func.apply,
         params=variables["params"],
         tx=optimizer,
-        batch_stats=variables["batch_stats"],
+        batch_stats=variables.get("batch_stats"),
         rng=init_rng,
         dynamic_scale=dynamic_scale,
         betas=(beta1, beta2),
@@ -293,16 +307,21 @@ def launch(config, print_fn):
 
     # training
     def step_train(state, batch, config):
-        logitsB = batch["images"]  # mixture of other modes
-        logitsA = batch["labels"]  # the current mode
+        logitsB = batch["images"]  # the current mode
+        logitsA = batch["labels"]  # mixture of other modes
         logitsB = normalize_logits(logitsB)
         logitsA = normalize_logits(logitsA)
 
         def loss_fn(params):
             logits_t, sigma_t, kwargs = state.forward(
                 logitsA, logitsB, training=True, rng=state.rng)
+            params_dict = dict(params=params)
+            mutable = []
+            if state.batch_stats is not None:
+                params_dict["batch_stats"] = state.batch_stats
+                mutable.append("batch_stats")
             epsilon, new_model_state = state.apply_fn(
-                {"params": params, "batch_stats": state.batch_stats}, logits_t, mutable="batch_stats", **kwargs)
+                params_dict, logits_t, mutable=mutable, **kwargs)
             diff = (logits_t - logitsA) / sigma_t[:, None]
             loss = mse_loss(epsilon, diff)
             loss = jnp.where(batch["marker"], loss, jnp.zeros_like(loss))
@@ -326,7 +345,7 @@ def launch(config, print_fn):
         grads = jax.tree_util.tree_map(
             lambda g, p: g + config.optim_weight_decay * p, grads, state.params)
         new_state = state.apply_gradients(
-            grads=grads, batch_stats=new_model_state['batch_stats'])
+            grads=grads, batch_stats=new_model_state.get('batch_stats'))
         metrics = jax.lax.pmean(metrics, axis_name="batch")
         metrics["lr"] = scheduler(state.step)
 
@@ -347,8 +366,10 @@ def launch(config, print_fn):
         logitsA = normalize_logits(logitsA)
         logits_t, sigma_t, kwargs = state.forward(
             logitsA, logitsB, training=False, rng=state.rng)
-        output = state.apply_fn(
-            {"params": state.params, "batch_stats": state.batch_stats}, logits_t, **kwargs)
+        params_dict = dict(params=state.params)
+        if state.batch_stats is not None:
+            params_dict["batch_stats"] = state.batch_stats
+        output = state.apply_fn(params_dict, logits_t, **kwargs)
         diff = (logits_t - logitsA) / sigma_t[:, None]
         loss = mse_loss(output, diff)
         loss = jnp.sum(jnp.where(batch["marker"], loss, jnp.zeros_like(
@@ -362,16 +383,21 @@ def launch(config, print_fn):
 
     def step_sample(state, batch, config):
         def apply(x_n, t_n):
-            output = state.apply_fn(
-                {"params": state.params, "batch_stats": state.batch_stats},
-                x=x_n, t=t_n, training=False)
+            params_dict = dict(params=state.params)
+            if state.batch_stats is not None:
+                params_dict["batch_stats"] = state.batch_stats
+            output = state.apply_fn(params_dict, x=x_n, t=t_n, training=False)
             return output
         logitsB = batch["images"]  # current mode
         logitsA = batch["labels"]  # other modes
         logitsB = normalize_logits(logitsB)
         logitsA = normalize_logits(logitsA)
+        # jprint(">--------------------------------")
+        # jprint(logitsB[-1])
         f_gen = state.sample(
             state.rng, apply, logitsB, dsb_stats)
+        # jprint(logitsA[-1])
+        # jprint(">--------------------------------")
         f_gen = unnormalize_logits(f_gen)
         f_real = unnormalize_logits(logitsA)
         f_init = unnormalize_logits(logitsB)
@@ -388,6 +414,8 @@ def launch(config, print_fn):
         partial(step_sample, config=config), axis_name="batch")
     state = jax_utils.replicate(state)
     best_loss = float("inf")
+    image_name = datetime.datetime.now().strftime('%d%m%y%H%M%S')
+    image_name = f"images/dsb{image_name}.png"
 
     for epoch_idx, _ in enumerate(range(config.optim_ne), start=1):
         log_str = '[Epoch {:5d}/{:5d}] '.format(epoch_idx, config.optim_ne)
@@ -406,8 +434,9 @@ def launch(config, print_fn):
                           v in jax.tree_util.tree_map(lambda e: e.mean(), train_metrics).items()}
         log_str += ', '.join(f'{k} {v:.3e}' for k, v in trn_summarized.items())
 
-        state = state.replace(
-            batch_stats=cross_replica_mean(state.batch_stats))
+        if state.batch_stats is not None:
+            state = state.replace(
+                batch_stats=cross_replica_mean(state.batch_stats))
 
         valid_metrics = []
         valid_loader = dataloaders["val_featureloader"](rng=None)
@@ -418,14 +447,14 @@ def launch(config, print_fn):
             metrics = p_step_valid(state, batch)
             valid_metrics.append(metrics)
 
-            if batch_idx == 1:
+            if epoch_idx > 10 and batch_idx == 1:
                 z_all = p_step_sample(state, batch)
                 image_array = z_all[0][0]
                 image_array = jax.nn.sigmoid(image_array)
                 image_array = np.array(image_array)
                 image_array = pixelize(image_array)
                 image = Image.fromarray(image_array)
-                image.save(f"dsb.png")
+                image.save(image_name)
         valid_metrics = common_utils.get_metrics(valid_metrics)
         val_summarized = {f'val/{k}': v for k,
                           v in jax.tree_util.tree_map(lambda e: e.sum(), valid_metrics).items()}
@@ -475,7 +504,7 @@ def main():
                         help='base learning rate (default: 1e-4)')
     parser.add_argument('--optim_momentum', default=0.9, type=float,
                         help='momentum coefficient (default: 0.9)')
-    parser.add_argument('--optim_weight_decay', default=0.0001, type=float,
+    parser.add_argument('--optim_weight_decay', default=0., type=float,
                         help='weight decay coefficient (default: 0.0001)')
 
     parser.add_argument('--save', default=None, type=str,

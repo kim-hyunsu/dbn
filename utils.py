@@ -1,5 +1,6 @@
 import jax.numpy as jnp
 import defaults_sghmc as defaults
+from jax.experimental.host_callback import call as jcall
 
 model_list = [
     "./checkpoints/frn_sd2",
@@ -33,11 +34,28 @@ def unnormalize(x):
 
 def normalize_logits(x):
     return (x-logits_mean)/logits_std
+    # return (x-logits_mean)
 
 
 def unnormalize_logits(x):
     return logits_mean+logits_std*x
+    # return logits_mean+x
 
 
 def pixelize(x):
     return (x*255).astype("uint8")
+
+
+def jprint(*args):
+    fstring = ""
+    arrays = []
+    for i, a in enumerate(args):
+        if i != 0:
+            fstring += " "
+        if isinstance(a, str):
+            fstring += a
+        else:
+            fstring += '{}'
+            arrays.append(a)
+
+    jcall(lambda arrays: print(fstring.format(*arrays)), arrays)

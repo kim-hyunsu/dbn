@@ -171,15 +171,13 @@ class EmbedFC(nn.Module):
         return out
 
 
-class ResidualConvBlock(nn.Module):
+class ResidualBlock(nn.Module):
     in_channels: int
     out_channels: int
     is_res: bool = False
     dtype: Any = jnp.float32
-    conv1: nn.Module = partial(
-        nn.Conv, kernel_size=3, strides=1, padding=1)
-    conv2: nn.Module = partial(
-        nn.Conv, kernel_size=3, strides=1, padding=1)
+    dense1: nn.Module = nn.Dense
+    dense2: nn.Module = nn.Dense
     batchnorm1: nn.Module = partial(nn.BatchNorm, momentum=0.9, epsilon=1e-5, use_bias=True, use_scale=True,
                                     scale_init=jax.nn.initializers.ones,
                                     bias_init=jax.nn.initializers.zeros)
@@ -190,7 +188,7 @@ class ResidualConvBlock(nn.Module):
 
     @nn.compact
     def __call__(self, x, **kwargs):
-        training = kwargs["training"]
+        training = kwargs.get("training")
         same_channels = (self.in_channels == self.out_channels)
         if "use_running_average" in inspect.signature(self.batchnorm1).parameters:
             if training is False:
@@ -201,19 +199,19 @@ class ResidualConvBlock(nn.Module):
                 self.batchnorm2.keywords["use_running_average"] = False
 
         block1 = nn.Sequential([
-            self.conv1(self.out_channels),
+            self.dense1(self.out_channels),
             self.batchnorm1(),
             self.gelu
         ])
         block2 = nn.Sequential([
-            self.conv2(self.out_channels),
+            self.dense2(self.out_channels),
             self.batchnorm2(),
             self.gelu
         ])
 
         if self.is_res:
-            x1 = block1(x)  # (B,H,W,out_ch)
-            x2 = block2(x1)  # (B,H,W,out_ch)
+            x1 = block1(x)
+            x2 = block2(x1)
             if same_channels:
                 out = x + x2
             else:
@@ -228,102 +226,217 @@ class ResidualConvBlock(nn.Module):
 class UnetDown(nn.Module):
     in_channels: int
     out_channels: int
-    conv: nn.Module = ResidualConvBlock
-    # maxpool: Callable = partial(nn.max_pool, window_shape=(2, 2))
-    maxpool: Callable = nn.max_pool
+    dense: nn.Module = ResidualBlock
+    gelu: Callable = partial(nn.gelu, approximate=False)
 
     @nn.compact
     def __call__(self, x, **kwargs):
-        x = self.conv(self.in_channels, self.out_channels)(
-            x, **kwargs)  # (B, H, W, out_ch)
-        w = x.shape[1]//2+1
-        out = self.maxpool(x, window_shape=w)
+        x = self.dense(self.in_channels, self.out_channels)(
+            x, **kwargs)  # (B, out_ch)
+        out = self.gelu(x)
         return out
 
 
 class UnetUp(nn.Module):
     in_channels: int
     out_channels: int
-    convt: nn.Module = partial(
-        nn.ConvTranspose, kernel_size=2, strides=2)
-    conv1: nn.Module = ResidualConvBlock
-    conv2: nn.Module = ResidualConvBlock
+    dense1: nn.Module = ResidualBlock
+    dense2: nn.Module = ResidualBlock
+    gelu: Callable = partial(nn.gelu, approximate=False)
 
     @nn.compact
     def __call__(self, x, **kwargs):
         skip = kwargs["skip"]
         x = jnp.concatenate([x, skip], axis=-1)
-        x = self.convt(self.out_channels)(x)
-        x = self.conv1(self.out_channels, self.out_channels)(x, **kwargs)
-        out = self.conv2(self.out_channels, self.out_channels)(x, **kwargs)
+        x = self.dense1(self.in_channels, self.out_channels)(x, **kwargs)
+        x = self.gelu(x)
+        out = self.dense2(self.out_channels, self.out_channels)(x, **kwargs)
         return out
 
 
 class FeatureUnet(nn.Module):
     in_channels: int
+    ver: str
     n_feat: int = 256
-    init_conv: nn.Module = partial(ResidualConvBlock, is_res=True)
+    init_block: nn.Module = partial(ResidualBlock, is_res=True)
     down1: nn.Module = UnetDown
     down2: nn.Module = UnetDown
-    avgpool1d: Callable = partial(nn.avg_pool, window_shape=8)
+    down3: nn.Module = nn.Dense
     gelu: Callable = partial(nn.gelu, approximate=False)
+    timeembed0: nn.Module = EmbedTime
     timeembed1: nn.Module = EmbedFC
     timeembed2: nn.Module = EmbedFC
-    contextembed1: nn.Module = EmbedFC
-    contextembed2: nn.Module = EmbedFC
-    convt: nn.Module = partial(
-        nn.ConvTranspose, kernel_size=8, strides=8)
-    groupnorm1: nn.Module = nn.GroupNorm
+    layernorm1: nn.Module = nn.LayerNorm
     relu: Callable = nn.relu
+    tanh: Callable = nn.tanh
+    up0: nn.Module = nn.Dense
     up1: nn.Module = UnetUp
     up2: nn.Module = UnetUp
-    conv1: nn.Module = partial(
-        nn.Conv, kernel_size=3, strides=1, padding=1)
-    groupnorm2: nn.Module = nn.GroupNorm
-    conv2: nn.Module = partial(
-        nn.Conv, kernel_size=3, strides=1, padding=1)
+    dense1: nn.Module = nn.Dense
+    layernorm2: nn.Module = nn.LayerNorm
+    dense2: nn.Module = nn.Dense
 
     @nn.compact
     def __call__(self, x, t, **kwargs):
+        if self.ver == "v1.0":
+            return self._call_v1_0(x, t, **kwargs)
+        elif self.ver == "v1.1":
+            return self._call_v1_1(x, t, **kwargs)
+        elif self.ver == "v1.2":
+            return self._call_v1_2(x, t, **kwargs)
 
-        x = self.init_conv(self.in_channels, self.n_feat)(
-            x, **kwargs)  # (B,H,W,n_feat)
-        down1 = self.down1(self.n_feat, self.n_feat)(
-            x, **kwargs)  # (B,H//2,W//2,n_feat)
-        down2 = self.down2(self.n_feat, 2*self.n_feat)(down1,
-                                                       **kwargs)  # (B,H//4,W//4,2*n_feat)
-        hiddenvec = self.avgpool2d(down2)  # (B,1,1,2*feat)
+    def _call_v1_0(self, x, t, **kwargs):
+        x = self.init_block(
+            self.in_channels, self.n_feat
+        )(x, **kwargs)  # (B,n_feat)
+        down1 = self.down1(
+            self.n_feat, self.n_feat
+        )(x, **kwargs)  # (B,n_feat)
+        down2 = self.down2(
+            self.n_feat, self.n_feat
+        )(down1, **kwargs)  # (B,n_feat)
+        hiddenvec = self.down3(
+            self.n_feat
+        )(down2)  # (B,n_feat)
         hiddenvec = self.gelu(hiddenvec)
 
         temb1 = self.timeembed1(
-            1, 2*self.n_feat
-        )(t)  # (B,256)
-        temb1 = temb1[:, None, None, :]
+            1, self.n_feat
+        )(t)  # (B,n_feat)
         temb2 = self.timeembed2(
             1, self.n_feat
-        )(t)  # (B,128)
-        temb2 = temb2[:, None, None, :]
+        )(t)  # (B,n_feat)
 
         up0 = nn.Sequential([
-            self.convt(2*self.n_feat),
-            self.groupnorm1(8),
-            self.relu
+            self.up0(self.n_feat),
+            self.layernorm1(),
+            self.gelu
         ])
 
-        up1 = up0(hiddenvec)  # (B,H//4,W//4,2*n_feat)
+        up1 = up0(hiddenvec)  # (B,n_feat)
         up2 = self.up1(
-            4*self.n_feat, self.n_feat
-        )(up1+temb1, skip=down2, **kwargs)  # (B,H//2,W//2, n_feat)
+            self.n_feat*2, self.n_feat
+        )(up1+temb1, skip=down2, **kwargs)  # (B,n_feat)
         up3 = self.up2(
-            2*self.n_feat, self.n_feat
-        )(up2+temb2, skip=down1, **kwargs)  # (B,H,W,n_feat)
+            self.n_feat*2, self.n_feat
+        )(up2+temb2, skip=down1, **kwargs)  # (B, n_feat)
 
         out_fn = nn.Sequential([
-            self.conv1(self.n_feat),
-            self.groupnorm2(8),
-            self.relu,
-            self.conv2(self.in_channels)
-        ])  # (B,H,W,in_ch)
+            self.dense1(self.n_feat),
+            self.layernorm2(),
+            self.gelu,
+            self.dense2(self.in_channels)
+        ])  # (B,in_ch)
+
+        out = out_fn(jnp.concatenate([up3, x], axis=-1))
+
+        return out
+
+    def _call_v1_1(self, x, t, **kwargs):
+        x = self.init_block(
+            self.in_channels, self.n_feat
+        )(x, **kwargs)  # (B,n_feat)
+        down1 = self.down1(
+            self.n_feat, self.n_feat//2
+        )(x, **kwargs)  # (B,n_feat//2)
+        down2 = self.down2(
+            self.n_feat//2, self.n_feat//4
+        )(down1, **kwargs)  # (B,n_feat//4)
+        hiddenvec = self.down3(
+            self.n_feat//4
+        )(down2)  # (B,n_feat//4)
+        hiddenvec = self.gelu(hiddenvec)
+
+        temb01 = self.timeembed0(
+            self.n_feat//4
+        )(t)  # (B, n_feat//4)
+        temb02 = self.timeembed0(
+            self.n_feat//2
+        )(t)  # (B, n_feat//2)
+        temb1 = self.timeembed1(
+            1, self.n_feat//4
+        )(t)  # (B,n_feat//4)
+        temb2 = self.timeembed2(
+            1, self.n_feat//2
+        )(t)  # (B,n_feat//2)
+
+        up0 = nn.Sequential([
+            self.up0(self.n_feat//4),
+            self.layernorm1(),
+            self.gelu
+        ])
+
+        up1 = up0(hiddenvec)  # (B,n_feat//4)
+        up2_input = jnp.concatenate([up1, temb1], axis=-1)
+        up2_skip = jnp.concatenate([down2, temb01], axis=-1)
+        up2 = self.up1(
+            self.n_feat, self.n_feat//2
+        )(up2_input, skip=up2_skip, **kwargs)  # (B,n_feat//2)
+        up3_input = jnp.concatenate([up2, temb2], axis=-1)
+        up3_skip = jnp.concatenate([down1, temb02], axis=-1)
+        up3 = self.up2(
+            self.n_feat*2, self.n_feat
+        )(up3_input, skip=up3_skip, **kwargs)  # (B, n_feat)
+
+        out_fn = nn.Sequential([
+            self.dense1(self.n_feat),
+            self.layernorm2(),
+            self.gelu,
+            self.dense2(self.in_channels)
+        ])  # (B,in_ch)
+
+        out = out_fn(jnp.concatenate([up3, x], axis=-1))
+
+        return out
+
+    def _call_v1_2(self, x, t, **kwargs):
+        x = self.init_block(
+            self.in_channels, self.n_feat
+        )(x, **kwargs)  # (B,n_feat)
+        down1 = self.down1(
+            self.n_feat, self.n_feat
+        )(x, **kwargs)  # (B,n_feat)
+        down2 = self.down2(
+            self.n_feat, self.n_feat
+        )(down1, **kwargs)  # (B,n_feat)
+        hiddenvec = self.down3(
+            self.n_feat
+        )(down2)  # (B,n_feat)
+        hiddenvec = self.gelu(hiddenvec)
+
+        temb0 = self.timeembed0(
+            self.n_feat
+        )(t)  # (B, n_feat)
+        temb1 = self.timeembed1(
+            self.n_feat, self.n_feat//2
+        )(temb0)  # (B,n_feat//2)
+        temb2 = self.timeembed2(
+            self.n_feat, self.n_feat//2
+        )(temb0)  # (B,n_feat//2)
+
+        up0 = nn.Sequential([
+            self.up0(self.n_feat//2),
+            self.layernorm1(),
+            self.gelu
+        ])
+
+        up1 = up0(hiddenvec)  # (B,n_feat//2)
+
+        up2_input = jnp.concatenate([up1, temb1], axis=-1)
+        up2 = self.up1(
+            self.n_feat*2, self.n_feat//2
+        )(up2_input, skip=down2, **kwargs)  # (B,n_feat//2)
+        up3_input = jnp.concatenate([up2, temb2], axis=-1)
+        up3 = self.up2(
+            self.n_feat*2, self.n_feat
+        )(up3_input, skip=down1, **kwargs)  # (B, n_feat)
+
+        out_fn = nn.Sequential([
+            self.dense1(self.n_feat),
+            self.layernorm2(),
+            self.gelu,
+            self.dense2(self.in_channels)
+        ])  # (B,in_ch)
 
         out = out_fn(jnp.concatenate([up3, x], axis=-1))
 

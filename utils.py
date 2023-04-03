@@ -98,6 +98,6 @@ def jprint_fn(*args):
     jcall(lambda arrays: print(fstring.format(*arrays)), arrays)
 
 
-jprint = lambda *args: None
+jprint = lambda *args: ...
 if debug:
     jprint = jprint_fn

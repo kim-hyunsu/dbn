@@ -226,31 +226,31 @@ class ResidualBlock(nn.Module):
 class UnetDown(nn.Module):
     in_channels: int
     out_channels: int
-    dense: nn.Module = ResidualBlock
+    block: nn.Module = ResidualBlock
     gelu: Callable = partial(nn.gelu, approximate=False)
 
     @nn.compact
     def __call__(self, x, **kwargs):
-        x = self.dense(self.in_channels, self.out_channels)(
+        out = self.block(self.in_channels, self.out_channels)(
             x, **kwargs)  # (B, out_ch)
-        out = self.gelu(x)
+        # out = self.gelu(x)
         return out
 
 
 class UnetUp(nn.Module):
     in_channels: int
     out_channels: int
-    dense1: nn.Module = ResidualBlock
-    dense2: nn.Module = ResidualBlock
+    block1: nn.Module = ResidualBlock
+    block2: nn.Module = ResidualBlock
     gelu: Callable = partial(nn.gelu, approximate=False)
 
     @nn.compact
     def __call__(self, x, **kwargs):
         skip = kwargs["skip"]
         x = jnp.concatenate([x, skip], axis=-1)
-        x = self.dense1(self.in_channels, self.out_channels)(x, **kwargs)
-        x = self.gelu(x)
-        out = self.dense2(self.out_channels, self.out_channels)(x, **kwargs)
+        x = self.block1(self.in_channels, self.out_channels)(x, **kwargs)
+        # x = self.gelu(x)
+        out = self.block2(self.out_channels, self.out_channels)(x, **kwargs)
         return out
 
 
@@ -284,6 +284,10 @@ class FeatureUnet(nn.Module):
             return self._call_v1_1(x, t, **kwargs)
         elif self.ver == "v1.2":
             return self._call_v1_2(x, t, **kwargs)
+        elif self.ver == "v1.3":
+            return self._call_v1_3(x, t, **kwargs)
+        else:
+            raise Exception("Invalid FeatureUnet Version")
 
     def _call_v1_0(self, x, t, **kwargs):
         x = self.init_block(
@@ -429,6 +433,55 @@ class FeatureUnet(nn.Module):
         up3_input = jnp.concatenate([up2, temb2], axis=-1)
         up3 = self.up2(
             self.n_feat*2, self.n_feat
+        )(up3_input, skip=down1, **kwargs)  # (B, n_feat)
+
+        out_fn = nn.Sequential([
+            self.dense1(self.n_feat),
+            self.layernorm2(),
+            self.gelu,
+            self.dense2(self.in_channels)
+        ])  # (B,in_ch)
+
+        out = out_fn(jnp.concatenate([up3, x], axis=-1))
+
+        return out
+
+    def _call_v1_3(self, x, t, **kwargs):
+        x = self.init_block(
+            self.in_channels, self.n_feat
+        )(x, **kwargs)  # (B,n_feat)
+        down1 = self.down1(
+            self.n_feat, self.n_feat
+        )(x, **kwargs)  # (B,n_feat)
+        down2 = self.down2(
+            self.n_feat, self.n_feat
+        )(down1, **kwargs)  # (B,n_feat)
+        hiddenvec = self.down3(
+            self.n_feat
+        )(down2)  # (B,n_feat)
+        hiddenvec = self.gelu(hiddenvec)
+
+        temb1 = self.timeembed1(
+            1, self.n_feat
+        )(t)  # (B,n_feat)
+        temb2 = self.timeembed2(
+            1, self.n_feat
+        )(t)  # (B,n_feat)
+
+        up0 = nn.Sequential([
+            self.up0(self.n_feat),
+            self.layernorm1(),
+            self.gelu
+        ])
+
+        up1 = up0(hiddenvec)  # (B,n_feat)
+        up2_input = jnp.concatenate([up1, temb1], axis=-1)
+        up2 = self.up1(
+            self.n_feat*3, self.n_feat
+        )(up2_input, skip=down2, **kwargs)  # (B,n_feat)
+        up3_input = jnp.concatenate([up2, temb2], axis=-1)
+        up3 = self.up2(
+            self.n_feat*3, self.n_feat
         )(up3_input, skip=down1, **kwargs)  # (B, n_feat)
 
         out_fn = nn.Sequential([

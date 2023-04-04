@@ -359,4 +359,3 @@ class CondMLP(nn.Module):
         z5 = self.gelu(z5)
 
         return z5
-

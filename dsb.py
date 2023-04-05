@@ -246,12 +246,12 @@ class TrainState(train_state.TrainState):
         def body_fn(n, val):
             rng, x_n = val
             idx = self.n_T - n
-            _rng, rng = jax.random.split(rng)
+            rng = jax.random.fold_in(rng, idx)
             t_n = jnp.array([idx/self.n_T])  # (1,)
             t_n = jnp.tile(t_n, [batch_size])  # (B,)
 
             h = jnp.where(idx > 1, jax.random.normal(
-                _rng, shape), jnp.zeros(shape))  # (B, d)
+                rng, shape), jnp.zeros(shape))  # (B, d)
             eps = apply(x_n, t_n)  # (2*B, d)
             ########
             # e1 = stats["oneover_sqrta"][idx]
@@ -321,16 +321,22 @@ def launch(config, print_fn):
         )
     variables = initialize_model(init_rng, score_func)
     variables_cls = initialize_model(init_rng, classifier)
-    variables_cls = variables_cls.unfreeze()
-    ckpt = checkpoints.restore_checkpoint(
-        ckpt_dir=os.path.join(model_list[0], "sghmc"),
-        target=None
-    )
-    current_valid_acc = ckpt["best_acc"]
-    # variables_cls["params"]["Dense_0"] = ckpt["model"]["params"]["Dense_0"]
-    variables_cls["fc"] = ckpt["model"]["params"]["Dense_0"]
-    variables_cls = freeze(variables_cls)
-    del ckpt
+
+    def load_classifier(variables_cls, ckpt_dir):
+        variables_cls = variables_cls.unfreeze()
+        ckpt = checkpoints.restore_checkpoint(
+            ckpt_dir=os.path.join(ckpt_dir, "sghmc"),
+            target=None
+        )
+        current_valid_acc = ckpt["best_acc"]
+        # variables_cls["params"]["Dense_0"] = ckpt["model"]["params"]["Dense_0"]
+        variables_cls["params"]["Dense_0"] = ckpt["model"]["params"]["Dense_0"]
+        variables_cls = freeze(variables_cls)
+        del ckpt
+
+        return variables_cls
+
+    variables_cls = load_classifier(variables_cls, model_list[1])
 
     dynamic_scale = None
     if config.precision == 'fp16' and jax.local_devices()[0].platform == 'gpu':
@@ -360,11 +366,38 @@ def launch(config, print_fn):
         loss = jnp.sum((noise-output)**2, axis=1)
         return loss
 
+    def accuracy(f_gen, labels, marker):
+        if f_gen.shape[-1] == 10:
+            logits = f_gen
+        else:
+            logits = classifier.apply(
+                {"params": variables_cls["params"]}, f_gen
+            )
+        predictions = jax.nn.log_softmax(logits, axis=-1)
+        acc = evaluate_acc(
+            predictions, labels, log_input=True, reduction="none"
+        )
+        acc = jnp.sum(jnp.where(marker, acc, jnp.zeros_like(acc)))
+        return acc
+
+    def cross_entropy(f_gen, labels):
+        if f_gen.shape[-1] == 10:
+            logits = f_gen
+        else:
+            logits = classifier.apply(
+                {"params": variables_cls["params"]}, f_gen
+            )
+        target = common_utils.onehot(
+            labels, num_classes=logits.shape[-1])  # [B, K,]
+        loss = -jnp.sum(target * jax.nn.log_softmax(logits,
+                        axis=-1), axis=-1)      # [B,]
+        return loss
+
     # training
     def step_train(state, batch, config):
         logitsB = batch["images"]  # the current mode
         # mixture of other modes
-        logitsA, _ = jnp.split(
+        logitsA, labels = jnp.split(
             batch["labels"], [logitsB.shape[0]], axis=-1)
         logitsB = normalize(logitsB)
         logitsA = normalize(logitsA)
@@ -381,13 +414,19 @@ def launch(config, print_fn):
                 params_dict, logits_t, mutable=mutable, **kwargs)
             diff = (logits_t - logitsA) / sigma_t[:, None]
             loss = mse_loss(epsilon, diff)
-            loss = jnp.where(batch["marker"], loss, jnp.zeros_like(loss))
+            celoss = cross_entropy(unnormalize(logits_t), labels)
             count = jnp.sum(batch["marker"])
+            loss = jnp.where(batch["marker"], loss, jnp.zeros_like(loss))
             loss = jnp.sum(loss) / count
+            celoss = jnp.where(batch["marker"], celoss, jnp.zeros_like(celoss))
+            celoss = jnp.sum(celoss) / count
 
-            metrics = OrderedDict({"loss": loss*count, "count": count})
+            totalloss = loss + config.gamma*celoss
 
-            return loss, (metrics, new_model_state)
+            metrics = OrderedDict(
+                {"loss": loss*count, "count": count, "celoss": celoss*count})
+
+            return totalloss, (metrics, new_model_state)
 
         dynamic_scale = state.dynamic_scale
         if dynamic_scale:
@@ -445,29 +484,23 @@ def launch(config, print_fn):
                 params_dict["batch_stats"] = state.batch_stats
             output = state.apply_fn(params_dict, x=x_n, t=t_n, training=False)
             return output
-        logitsB = batch["images"]  # current mode
-        logitsA, labels = jnp.split(
-            batch["labels"], [logitsB.shape[0]], axis=-1)
+        _logitsB = batch["images"]  # current mode
+        _logitsA, labels = jnp.split(
+            batch["labels"], [_logitsB.shape[0]], axis=-1)
         labels = jnp.squeeze(labels, -1)
-        logitsB = normalize(logitsB)
-        logitsA = normalize(logitsA)
+        logitsB = normalize(_logitsB)
+        logitsA = normalize(_logitsA)
         # jprint(logitsB[-1], "first")
         f_gen = state.sample(
             state.rng, apply, logitsB, dsb_stats)
         # jprint(logitsA[-1], "last")
         f_gen = unnormalize(f_gen)
-        f_real = unnormalize(logitsA)
-        f_init = unnormalize(logitsB)
+        f_real = _logitsA
+        f_init = _logitsB
 
         f_all = jnp.stack([f_init, f_gen, f_real], axis=-1)
-        logits = classifier.apply(
-            {"params": variables_cls["params"]}, f_gen
-        )
-        predictions = jax.nn.log_softmax(logits, axis=-1)
-        acc = evaluate_acc(
-            predictions, labels, log_input=True, reduction="none"
-        )
-        acc = jnp.sum(jnp.where(batch["marker"], acc, jnp.zeros_like(acc)))
+
+        acc = accuracy(f_gen, labels, batch["marker"])
         count = jnp.sum(batch["marker"])
 
         metrics = OrderedDict({"acc": acc, "count": count})
@@ -490,7 +523,6 @@ def launch(config, print_fn):
         if (epoch_idx+1) % 50 == 0 and os.environ.get("DEBUG") != True:
             z_all, _ = p_step_sample(state, batch)
             image_array = z_all[0][0]
-            print("generated_sample", image_array)
             image_array = jax.nn.sigmoid(image_array)
             image_array = np.array(image_array)
             image_array = pixelize(image_array)
@@ -499,14 +531,15 @@ def launch(config, print_fn):
 
     for epoch_idx, _ in enumerate(range(config.optim_ne), start=1):
         log_str = '[Epoch {:5d}/{:5d}] '.format(epoch_idx, config.optim_ne)
+        rng = jax.random.fold_in(rng, epoch_idx)
         data_rng, rng = jax.random.split(rng)
 
         train_metrics = []
         train_loader = dataloaders["featureloader"](rng=data_rng)
         train_loader = jax_utils.prefetch_to_device(train_loader, size=2)
         for batch_idx, batch in enumerate(train_loader, start=1):
-            loss_rng, rng = jax.random.split(rng)
-            state.replace(rng=loss_rng)
+            rng = jax.random.fold_in(rng, batch_idx)
+            state = state.replace(rng=jax_utils.replicate(rng))
             state, metrics = p_step_train(state, batch)
 
             # if batch_idx == dataloaders["trn_steps_per_epoch"]:
@@ -514,6 +547,8 @@ def launch(config, print_fn):
             if (epoch_idx+1) % 1 == 0:
                 _, acc_metrics = p_step_sample(state, batch)
                 metrics["acc"] = acc_metrics["acc"]
+                # metrics["acc_ref"] = acc_metrics["acc_ref"]
+                # metrics["acc_exact"] = acc_metrics["acc_exact"]
                 assert jnp.all(metrics["count"] == acc_metrics["count"])
 
             train_metrics.append(metrics)
@@ -535,8 +570,8 @@ def launch(config, print_fn):
         valid_loader = dataloaders["val_featureloader"](rng=None)
         valid_loader = jax_utils.prefetch_to_device(valid_loader, size=2)
         for batch_idx, batch in enumerate(valid_loader, start=1):
-            loss_rng, rng = jax.random.split(rng)
-            state.replace(rng=loss_rng)
+            rng = jax.random.fold_in(rng, batch_idx)
+            state = state.replace(rng=jax_utils.replicate(rng))
             metrics = p_step_valid(state, batch)
 
             # if batch_idx == dataloaders["val_steps_per_epoch"]:
@@ -544,6 +579,8 @@ def launch(config, print_fn):
             if (epoch_idx+1) % 50 == 0:
                 _, acc_metrics = p_step_sample(state, batch)
                 metrics["acc"] = acc_metrics["acc"]
+                # metrics["acc_ref"] = acc_metrics["acc_ref"]
+                # metrics["acc_exact"] = acc_metrics["acc_exact"]
                 assert jnp.all(metrics["count"] == acc_metrics["count"])
 
             valid_metrics.append(metrics)
@@ -565,7 +602,7 @@ def launch(config, print_fn):
             for batch_idx, batch in enumerate(test_loader, start=1):
                 metrics = p_step_valid(state, batch)
                 loss_rng, rng = jax.random.split(rng)
-                state.replace(rng=loss_rng)
+                state = state.replace(rng=jax_utils.replicate(loss_rng))
                 test_metrics.append(metrics)
             test_metrics = common_utils.get_metrics(test_metrics)
             tst_summarized = {
@@ -623,6 +660,7 @@ def main():
     parser.add_argument("--beta2", default=0.02, type=float)
     parser.add_argument("--features_dir", default="features_last", type=str)
     parser.add_argument("--version", default="v1", type=str)
+    parser.add_argument("--gamma", default=1, type=float)
 
     args = parser.parse_args()
 

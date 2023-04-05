@@ -8,6 +8,21 @@ import jax.numpy as jnp
 import flax.linen as nn
 
 
+class FlaxResNetClassifier(nn.Module):
+    """
+    For transfering only the last layer of the ResNet
+    """
+    num_classes: int = None
+    dtype: Any = jnp.float32
+    fc: nn.Module = functools.partial(nn.Dense, use_bias=True,
+                                      kernel_init=jax.nn.initializers.he_normal(),
+                                      bias_init=jax.nn.initializers.zeros)
+
+    @nn.compact
+    def __call__(self, x, **kwargs):
+        return self.fc(features=self.num_classes, dtype=self.dtype)(x)
+
+
 class FlaxResNet(nn.Module):
     depth:        int = 20
     widen_factor: float = 1.

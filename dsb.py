@@ -1,13 +1,14 @@
 from functools import partial
 import os
 import math
+import orbax
 
 from typing import Any, OrderedDict, Tuple
 
 import flax
-from flax.training import train_state
-from flax.training import common_utils
+from flax.training import train_state, common_utils, checkpoints
 from flax.training import dynamic_scale as dynamic_scale_lib
+from flax.core.frozen_dict import freeze
 from flax import jax_utils
 
 import optax
@@ -23,11 +24,13 @@ import defaults_dsb as defaults
 from tabulate import tabulate
 import sys
 from giung2.data.build import build_dataloaders, _build_dataloader
+from giung2.metrics import evaluate_acc
 from models.bridge import FeatureUnet, dsb_schedules, MLP
 from collections import OrderedDict
 from PIL import Image
 from tqdm import tqdm
-from utils import pixelize, normalize_logits, unnormalize_logits, jprint
+from models.resnet import FlaxResNetClassifier
+from utils import pixelize, normalize_logits, unnormalize_logits, jprint, model_list
 
 
 def build_featureloaders(config):
@@ -92,6 +95,31 @@ def build_featureloaders(config):
     test_logitsB = np.concatenate(test_Blogits_list, axis=0)
     test_logitsB = jnp.array(test_logitsB)
     del test_Blogits_list
+
+    # classifying labels
+    trn_labels = np.load(os.path.join(
+        config.data_root, f'{config.data_name}/train_labels.npy'))
+    tst_labels = np.load(os.path.join(
+        config.data_root, f'{config.data_name}/test_labels.npy'))
+    if config.data_name == "CIFAR10_x32":
+        trn_labels, val_labels = trn_labels[:40960], trn_labels[40960:]
+
+    trn_labels = jnp.tile(trn_labels, [n_samples_each_Bmode])
+    val_labels = jnp.tile(val_labels, [n_samples_each_Bmode])
+    tst_labels = jnp.tile(tst_labels, [n_samples_each_Bmode])
+
+    train_logitsA = jnp.concatenate([
+        train_logitsA,
+        trn_labels[:, None]
+    ], axis=-1)
+    valid_logitsA = jnp.concatenate([
+        valid_logitsA,
+        val_labels[:, None]
+    ], axis=-1)
+    test_logitsA = jnp.concatenate([
+        test_logitsA,
+        tst_labels[:, None]
+    ], axis=-1)
 
     dataloaders = dict(
         train_length=len(train_logitsA),
@@ -280,15 +308,29 @@ def launch(config, print_fn):
         n_feat=config.n_feat,
     )
 
+    classifier = FlaxResNetClassifier(
+        num_classes=dataloaders["num_classes"]
+    )
+
     # initialize model
     def initialize_model(key, model):
-        @jax.jit
-        def init(*args, **kwargs):
-            return model.init(*args, **kwargs)
-        return init({'params': key},
-                    x=jnp.ones((1, x_dim), model_dtype),
-                    t=jnp.ones((1,)))
+        return model.init(
+            {'params': key},
+            x=jnp.empty((1, x_dim), model_dtype),
+            t=jnp.empty((1,))
+        )
     variables = initialize_model(init_rng, score_func)
+    variables_cls = initialize_model(init_rng, classifier)
+    variables_cls = variables_cls.unfreeze()
+    ckpt = checkpoints.restore_checkpoint(
+        ckpt_dir=os.path.join(model_list[0], "sghmc"),
+        target=None
+    )
+    current_valid_acc = ckpt["best_acc"]
+    # variables_cls["params"]["Dense_0"] = ckpt["model"]["params"]["Dense_0"]
+    variables_cls["fc"] = ckpt["model"]["params"]["Dense_0"]
+    variables_cls = freeze(variables_cls)
+    del ckpt
 
     dynamic_scale = None
     if config.precision == 'fp16' and jax.local_devices()[0].platform == 'gpu':
@@ -321,7 +363,9 @@ def launch(config, print_fn):
     # training
     def step_train(state, batch, config):
         logitsB = batch["images"]  # the current mode
-        logitsA = batch["labels"]  # mixture of other modes
+        # mixture of other modes
+        logitsA, _ = jnp.split(
+            batch["labels"], [logitsB.shape[0]], axis=-1)
         logitsB = normalize(logitsB)
         logitsA = normalize(logitsA)
 
@@ -341,7 +385,7 @@ def launch(config, print_fn):
             count = jnp.sum(batch["marker"])
             loss = jnp.sum(loss) / count
 
-            metrics = OrderedDict({"loss": loss})
+            metrics = OrderedDict({"loss": loss*count, "count": count})
 
             return loss, (metrics, new_model_state)
 
@@ -359,7 +403,7 @@ def launch(config, print_fn):
             lambda g, p: g + config.optim_weight_decay * p, grads, state.params)
         new_state = state.apply_gradients(
             grads=grads, batch_stats=new_model_state.get('batch_stats'))
-        metrics = jax.lax.pmean(metrics, axis_name="batch")
+        metrics = jax.lax.psum(metrics, axis_name="batch")
         metrics["lr"] = scheduler(state.step)
 
         if dynamic_scale:
@@ -374,7 +418,8 @@ def launch(config, print_fn):
 
     def step_valid(state, batch):
         logitsB = batch["images"]
-        logitsA = batch["labels"]
+        logitsA, _ = jnp.split(
+            batch["labels"], [logitsB.shape[0]], axis=-1)
         logitsB = normalize(logitsB)
         logitsA = normalize(logitsA)
         logits_t, sigma_t, kwargs = state.forward(
@@ -385,12 +430,11 @@ def launch(config, print_fn):
         output = state.apply_fn(params_dict, logits_t, **kwargs)
         diff = (logits_t - logitsA) / sigma_t[:, None]
         loss = mse_loss(output, diff)
-        loss = jnp.sum(jnp.where(batch["marker"], loss, jnp.zeros_like(
-            loss)))/jnp.sum(batch["marker"])
-        count = jnp.sum(batch["marker"])
         loss = jnp.where(batch["marker"], loss, jnp.zeros_like(loss))
+        count = jnp.sum(batch["marker"])
+        loss = jnp.sum(loss)/count
 
-        metrics = OrderedDict({"loss": loss, "count": count})
+        metrics = OrderedDict({"loss": loss*count, "count": count})
         metrics = jax.lax.psum(metrics, axis_name="batch")
         return metrics
 
@@ -402,7 +446,9 @@ def launch(config, print_fn):
             output = state.apply_fn(params_dict, x=x_n, t=t_n, training=False)
             return output
         logitsB = batch["images"]  # current mode
-        logitsA = batch["labels"]  # other modes
+        logitsA, labels = jnp.split(
+            batch["labels"], [logitsB.shape[0]], axis=-1)
+        labels = jnp.squeeze(labels, -1)
         logitsB = normalize(logitsB)
         logitsA = normalize(logitsA)
         # jprint(logitsB[-1], "first")
@@ -414,8 +460,19 @@ def launch(config, print_fn):
         f_init = unnormalize(logitsB)
 
         f_all = jnp.stack([f_init, f_gen, f_real], axis=-1)
+        logits = classifier.apply(
+            {"params": variables_cls["params"]}, f_gen
+        )
+        predictions = jax.nn.log_softmax(logits, axis=-1)
+        acc = evaluate_acc(
+            predictions, labels, log_input=True, reduction="none"
+        )
+        acc = jnp.sum(jnp.where(batch["marker"], acc, jnp.zeros_like(acc)))
+        count = jnp.sum(batch["marker"])
 
-        return f_all
+        metrics = OrderedDict({"acc": acc, "count": count})
+        metrics = jax.lax.psum(metrics, axis_name='batch')
+        return f_all, metrics
 
     cross_replica_mean = jax.pmap(lambda x: jax.lax.pmean(x, 'x'), 'x')
     p_step_train = jax.pmap(
@@ -429,10 +486,11 @@ def launch(config, print_fn):
     train_image_name = f"images/{config.version}train{image_name}.png"
     valid_image_name = f"images/{config.version}valid{image_name}.png"
 
-    def save_samples(epoch_idx, train):
+    def save_samples(state, batch, epoch_idx, train):
         if (epoch_idx+1) % 50 == 0 and os.environ.get("DEBUG") != True:
-            z_all = p_step_sample(state, batch)
+            z_all, _ = p_step_sample(state, batch)
             image_array = z_all[0][0]
+            print("generated_sample", image_array)
             image_array = jax.nn.sigmoid(image_array)
             image_array = np.array(image_array)
             image_array = pixelize(image_array)
@@ -450,14 +508,23 @@ def launch(config, print_fn):
             loss_rng, rng = jax.random.split(rng)
             state.replace(rng=loss_rng)
             state, metrics = p_step_train(state, batch)
-            train_metrics.append(metrics)
 
-            if batch_idx == dataloaders["trn_steps_per_epoch"]:
-                save_samples(epoch_idx, train=True)
+            # if batch_idx == dataloaders["trn_steps_per_epoch"]:
+            #     save_samples(state, batch, epoch_idx, train=True)
+            if (epoch_idx+1) % 1 == 0:
+                _, acc_metrics = p_step_sample(state, batch)
+                metrics["acc"] = acc_metrics["acc"]
+                assert jnp.all(metrics["count"] == acc_metrics["count"])
+
+            train_metrics.append(metrics)
 
         train_metrics = common_utils.get_metrics(train_metrics)
         trn_summarized = {f'trn/{k}': v for k,
-                          v in jax.tree_util.tree_map(lambda e: e.mean(), train_metrics).items()}
+                          v in jax.tree_util.tree_map(lambda e: e.sum(), train_metrics).items()}
+        for k, v in trn_summarized.items():
+            if "count" not in k:
+                trn_summarized[k] /= trn_summarized["trn/count"]
+        del trn_summarized["trn/count"]
         log_str += ', '.join(f'{k} {v:.3e}' for k, v in trn_summarized.items())
 
         if state.batch_stats is not None:
@@ -471,15 +538,22 @@ def launch(config, print_fn):
             loss_rng, rng = jax.random.split(rng)
             state.replace(rng=loss_rng)
             metrics = p_step_valid(state, batch)
-            valid_metrics.append(metrics)
 
-            if batch_idx == dataloaders["val_steps_per_epoch"]:
-                save_samples(epoch_idx, train=False)
+            # if batch_idx == dataloaders["val_steps_per_epoch"]:
+            #     save_samples(state, batch, epoch_idx, train=False)
+            if (epoch_idx+1) % 50 == 0:
+                _, acc_metrics = p_step_sample(state, batch)
+                metrics["acc"] = acc_metrics["acc"]
+                assert jnp.all(metrics["count"] == acc_metrics["count"])
+
+            valid_metrics.append(metrics)
 
         valid_metrics = common_utils.get_metrics(valid_metrics)
         val_summarized = {f'val/{k}': v for k,
                           v in jax.tree_util.tree_map(lambda e: e.sum(), valid_metrics).items()}
-        val_summarized['val/loss'] /= val_summarized['val/count']
+        for k, v in val_summarized.items():
+            if "count" not in k:
+                val_summarized[k] /= val_summarized["val/count"]
         del val_summarized["val/count"]
         log_str += ', ' + \
             ', '.join(f'{k} {v:.3e}' for k, v in val_summarized.items())
@@ -500,8 +574,17 @@ def launch(config, print_fn):
             del val_summarized["tst/count"]
             log_str += ', ' + \
                 ', '.join(f'{k} {v:.3e}' for k, v in tst_summarized.items())
-
             best_loss = val_summarized['val/loss']
+
+            save_state = jax_utils.unreplicate(state)
+            ckpt = dict(model=save_state, config=vars(
+                config), best_loss=best_loss)
+            orbax_checkpointer = orbax.checkpoint.PyTreeCheckpointer()
+            checkpoints.save_checkpoint(ckpt_dir=config.save,
+                                        target=ckpt,
+                                        step=epoch_idx,
+                                        overwrite=True,
+                                        orbax_checkpointer=orbax_checkpointer)
 
         log_str = datetime.datetime.now().strftime(
             '[%Y-%m-%d %H:%M:%S] ') + log_str

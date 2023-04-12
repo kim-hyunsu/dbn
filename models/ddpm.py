@@ -8,6 +8,9 @@ import jax
 from tqdm import tqdm
 import inspect
 
+import os
+import matplotlib.pyplot as plt
+import numpy as np
 
 def mse_loss(logit, target):
     return jnp.mean((logit-target)**2)
@@ -389,6 +392,35 @@ class MLPBlock(nn.Module):
         return x
 
 
+# class ResBlock(nn.Module):
+#     layer_widths: list
+#     activate_final: bool = False
+#     activation_fn: Callable = nn.relu
+#     norm: bool = False
+#     batchnorm: nn.Module = partial(nn.BatchNorm, momentum=0.9, epsilon=1e-5, use_bias=True, use_scale=True,
+#                                    scale_init=jax.nn.initializers.ones,
+#                                    bias_init=jax.nn.initializers.zeros)
+
+
+#     @nn.compact
+#     def __call__(self, x, **kwargs):
+#         if "use_running_average" in inspect.signature(self.batchnorm).parameters:
+#             if kwargs.get("training") is False:
+#                 self.batchnorm.keywords["use_running_average"] = True
+#             else:
+#                 self.batchnorm.keywords["use_running_average"] = False
+
+#         for ch in self.layer_widths[:-1]:
+#             x = nn.Dense(ch)(x)
+#             if self.norm:
+#                 x = self.batchnorm()(x)
+#             x = self.activation_fn(x)
+#         x = nn.Dense(self.layer_widths[-1])(x)
+#         if self.activate_final:
+#             x = self.activation_fn(x)
+#         return x
+
+
 class EmbedTime(nn.Module):
     embedding_dim: int = 128
 
@@ -416,13 +448,23 @@ class MLP(nn.Module):
     encoder_layers: list
     decoder_layers: list
 
+    """
+      MLP definition.
+        Args:
+          x_dim
+            Dimension of input x.
+          pos_dim
+            Size of positional encoding t.
+          encoder_layers
+            # of hidden neurons of x_encoder and t_encoder MLP.
+          decoder_layers
+            # of hidden neurons of decoder MLP.
+    """
+
     @nn.compact
     def __call__(self, x, t, **kwargs):
         t_enc_dim = 2*self.pos_dim
 
-        net = MLPBlock(layer_widths=list(self.decoder_layers)+[self.x_dim],
-                       activate_final=False,
-                       activation_fn=nn.leaky_relu)
         t_encoder = MLPBlock(layer_widths=list(self.encoder_layers)+[t_enc_dim],
                              activate_final=False,
                              activation_fn=nn.leaky_relu,
@@ -431,6 +473,9 @@ class MLP(nn.Module):
                              activate_final=False,
                              activation_fn=nn.leaky_relu,
                              norm=True)
+        net = MLPBlock(layer_widths=list(self.decoder_layers)+[self.x_dim],
+                       activate_final=False,
+                       activation_fn=nn.leaky_relu)
 
         timestep_embed = EmbedTime(self.pos_dim)
 
@@ -438,12 +483,59 @@ class MLP(nn.Module):
             x = x[None, ...]
 
         temb = timestep_embed(t)  # (B, pos_dim)
-        temb = t_encoder(temb, **kwargs)  # (B, t_enc_dim)
-        xemb = x_encoder(x, **kwargs)  # (B, t_enc_dim)
+        temb = t_encoder(temb, **kwargs)  # (B, pos_dim) --> (B, t_enc_dim)
+        xemb = x_encoder(x, **kwargs)  # (B, x_dim) --> (B, t_enc_dim)
         h = jnp.concatenate([xemb, temb], axis=-1)  # (B, 2*t_enc_dim)
-        out = net(h)  # (B, x_dim)
+        out = net(h)  # (B, 2*t_enc_dim) --> (B, x_dim)
         return out
 
+
+# class ResNet(nn.Module):
+#     x_dim: int
+#     pos_dim: int
+#     encoder_layers: list
+#     decoder_layers: list
+
+#     """
+#       ResNet definition.
+#         Args:
+#           x_dim
+#             Dimension of input x.
+#           pos_dim
+#             Size of positional encoding t.
+#           encoder_layers
+#             # of hidden neurons of x_encoder and t_encoder MLP.
+#           decoder_layers
+#             # of hidden neurons of decoder MLP.
+#     """
+
+#     @nn.compact
+#     def __call__(self, x, t, **kwargs):
+#         t_enc_dim = 2*self.pos_dim
+
+#         t_encoder = ResBlock(layer_widths=list(self.encoder_layers)+[t_enc_dim],
+#                              activate_final=False,
+#                              activation_fn=nn.leaky_relu,
+#                              norm=True)
+#         x_encoder = ResBlock(layer_widths=list(self.encoder_layers)+[t_enc_dim],
+#                              activate_final=False,
+#                              activation_fn=nn.leaky_relu,
+#                              norm=True)
+#         net = ResBlock(layer_widths=list(self.decoder_layers)+[self.x_dim],
+#                        activate_final=False,
+#                        activation_fn=nn.leaky_relu)
+
+#         timestep_embed = EmbedTime(self.pos_dim)
+
+#         if len(x.shape) == 1:
+#             x = x[None, ...]
+
+#         temb = timestep_embed(t)  # (B, pos_dim)
+#         temb = t_encoder(temb, **kwargs)  # (B, pos_dim) --> (B, t_enc_dim)
+#         xemb = x_encoder(x, **kwargs)  # (B, x_dim) --> (B, t_enc_dim)
+#         h = jnp.concatenate([xemb, temb], axis=-1)  # (B, 2*t_enc_dim)
+#         out = net(h)  # (B, 2*t_enc_dim) --> (B, x_dim)
+#         return out
 
 def dsb_schedules(beta1, beta2, T):
     # TODO
@@ -467,7 +559,8 @@ def dsb_schedules(beta1, beta2, T):
             Correspond to `sqrt_alphas_cumprod`.
           sqrtmab:
             Correspond to `sqrt_1m_alphas_cumprod`.
-          mab_over_sqrtmab
+          mab_over_sqrtmab:
+
           sigma_t:
             sqrt(int_0^t (beta_t) dt), noise exponent integrated from 0 to t
           sigmabar_t:
@@ -477,17 +570,23 @@ def dsb_schedules(beta1, beta2, T):
           bigsigma_t:
             Variance of DSB noisy data.
     """
-    assert beta1 < beta2 < 1.0, "beta1 and beta2 must be in (0, 1)"
+    # assert beta1 < beta2 < 1.0, "beta1 and beta2 must be in (0, 1)"
 
     t = jnp.arange(0, T+1, dtype=jnp.float32)
-    tau = t/T
+    tau = t / T
 
+    # Case: Linearly increase from beta1 to beta2
     # beta_t = (beta2 - beta1) * tau + beta1 # Current: 1e-4 ~ 0.02
-    beta_t = beta2 + (beta1 - beta2) * jnp.abs(tau - 0.5) * 2 # beta1: beta_min, beta2: beta_max
+    # cum_beta_t = 0.5 * (beta2 - beta1) * tau ** 2 + beta1 * tau
+    # cum_beta_bar_t = (0.5 * (beta2 - beta1) + beta1) - cum_beta_t
+    # sigma_t_square = nn.relu(cum_beta_t) # int_0^t (beta_t) dt
+    # sigmabar_t_square = nn.relu(cum_beta_bar_t) # int_t^1 (beta_t) dt
 
+    beta_t = beta2 + (beta1 - beta2) * jnp.abs(tau - 0.5) * 2 # beta1: beta_min, beta2: beta_max
+    cum_beta_t = tau * beta1 + (beta2 - beta1) * tau ** 2 - 2 * (beta2 - beta1) * nn.relu(tau - 0.5) ** 2
     # DSB coefficients
-    sigma_t_square = nn.relu(0.5*(beta2-beta1)*tau**2 + beta1*tau) # int_0^t (beta_t) dt
-    sigmabar_t_square = nn.relu(0.5*(beta2-beta1)+beta1 - sigma_t_square) # int_t^1 (beta_t) dt
+    sigma_t_square = cum_beta_t
+    sigmabar_t_square = cum_beta_t[-1] - cum_beta_t
     sigma_t = jnp.sqrt(sigma_t_square)
     sigmabar_t = jnp.sqrt(sigmabar_t_square)
     sigma_weight_t = sigmabar_t_square/(sigma_t_square+sigmabar_t_square) # mu = ($)*X0 + (1-$)*X1
@@ -520,3 +619,26 @@ def dsb_schedules(beta1, beta2, T):
         "sigma_weight_t": sigma_weight_t,
         "bigsigma_t": bigsigma_t
     }
+
+
+def visualize_dsb_stats(stats, config):
+    figure_path = os.path.join(config.logdir)
+    
+    # Print posterior components
+    """
+      q(X_t|X_0, X_1) = N(X_t; mu_t(X_0, X_1), bigsigma_t)
+      mu_t = sigma_weight_t * X0 + (1 - sigma_weight_t) * X1
+    """
+    fig1 = plt.figure()
+    ax1 = fig1.add_subplot(1, 1, 1)
+
+    n_T = stats["alpha_t"].shape[0]
+    lins = np.arange(0, n_T, dtype=float)
+    ax1.set(xlim = [0., n_T])
+    ax1.set_title('Posterior coefficients, q(Xt|X0,X1)=m0*X0+m1*X1+sN(0,1)')
+    ax1.plot(lins, np.array(stats["sigma_weight_t"]), color='b', label='m0')
+    ax1.plot(lins, 1 - np.array(stats["sigma_weight_t"]), color='k', label='m1')
+    ax1.plot(lins, np.sqrt(np.array(stats["bigsigma_t"])), color='r', label='s')
+    ax1.legend()
+    fig1.savefig(os.path.join(figure_path,'posterior_coefficients.png'))
+    fig1.savefig(os.path.join(figure_path,'posterior_coefficients.pdf'))

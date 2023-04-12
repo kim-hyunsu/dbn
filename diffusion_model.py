@@ -380,7 +380,7 @@ def launch(config, print_fn):
         for batch_idx, batch in enumerate(train_loader, start=1):
             # TODO arange feature and input seperately
             loss_rng, rng = jax.random.split(rng)
-            state.replace(rng=loss_rng)
+            state = state.replace(rng=jax_utils.replicate(loss_rng))
             state, metrics = p_step_train(state, batch)
             train_metrics.append(metrics)
         train_metrics = common_utils.get_metrics(train_metrics)
@@ -397,7 +397,7 @@ def launch(config, print_fn):
         for batch_idx, batch in enumerate(valid_loader, start=1):
             # TODO arange feature and input seperately
             loss_rng, rng = jax.random.split(rng)
-            state.replace(rng=loss_rng)
+            state = state.replace(rng=jax_utils.replicate(loss_rng))
             metrics = p_step_valid(state, batch)
             valid_metrics.append(metrics)
 
@@ -429,7 +429,7 @@ def launch(config, print_fn):
             for batch_idx, batch in enumerate(test_loader, start=1):
                 metrics = p_step_valid(state, batch)
                 loss_rng, rng = jax.random.split(rng)
-                state.replace(rng=loss_rng)
+                state = state.replace(rng=jax_utils.replicate(loss_rng))
                 test_metrics.append(metrics)
             test_metrics = common_utils.get_metrics(test_metrics)
             tst_summarized = {

@@ -19,11 +19,13 @@ def default_argument_parser():
                         help='use the proportional train split if specified (default: 1.0)')
 
     parser.add_argument('--model_depth', default=20, type=int,
-                        choices=[2, 3, 20, 32, 44, 56, 110])
-    parser.add_argument('--model_width', default=1., type=float,
+                        choices=[20, 32, 44, 56, 110])
+    parser.add_argument('--model_width', default=1, type=int,
                         help='widen factor (default: 1)')
     parser.add_argument('--model_style', default='BN-ReLU', type=str,
                         choices=['BN-ReLU', "FRN-Swish"])
+    parser.add_argument('--model_name', default='FlaxResNet', type=str,
+                        choices=['FlaxResNet', "FlaxPreResNet"])
 
     parser.add_argument('--optim_bs', default=256, type=int,
                         help='mini-batch size (default: 256)')

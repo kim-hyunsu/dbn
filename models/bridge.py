@@ -139,6 +139,13 @@ def dsb_schedules(beta1, beta2, T):
     sqrtmab = jnp.sqrt(1 - alphabar_t)
     mab_over_sqrtmab_inv = (1 - alpha_t) / sqrtmab
 
+    # posterior coefficients
+    alpos_t = sigma_t_square[1:] - sigma_t_square[:-1]
+    alpos_t = jnp.concatenate([jnp.zeros(1), alpos_t])
+    sigma_t_square_minus_zero = jnp.concatenate(
+        [jnp.zeros(1), sigma_t_square[:-1]])
+    alpos_weight_t = alpos_t / (alpos_t + sigma_t_square_minus_zero)
+
     return {
         "alpha_t": alpha_t,  # \alpha_t
         "oneover_sqrta": oneover_sqrta,  # 1/\sqrt{\alpha_t}
@@ -151,7 +158,10 @@ def dsb_schedules(beta1, beta2, T):
         "sigma_t": sigma_t,
         "sigmabar_t": sigmabar_t,
         "sigma_weight_t": sigma_weight_t,
-        "bigsigma_t": bigsigma_t
+        "bigsigma_t": bigsigma_t,
+        "alpos_t": alpos_t,
+        "alpos_weight_t": alpos_weight_t,
+        "sigma_t_square": sigma_t_square
     }
 
 
@@ -286,6 +296,8 @@ class FeatureUnet(nn.Module):
             return self._call_v1_2(x, t, **kwargs)
         elif self.ver == "v1.3":
             return self._call_v1_3(x, t, **kwargs)
+        elif self.ver == "v1.4":
+            return self._call_v1_4(x, t, **kwargs)
         else:
             raise Exception("Invalid FeatureUnet Version")
 
@@ -494,3 +506,8 @@ class FeatureUnet(nn.Module):
         out = out_fn(jnp.concatenate([up3, x], axis=-1))
 
         return out
+
+    def _call_v1_4(self, x, t, **kwargs):
+        x = self._call_v1_0(x, t, **kwargs)
+        x = self.tanh(x)
+        return x

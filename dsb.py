@@ -19,18 +19,20 @@ import jax
 import jaxlib
 
 import datetime
+import wandb
 
 import defaults_dsb as defaults
 from tabulate import tabulate
 import sys
 from giung2.data.build import build_dataloaders, _build_dataloader
-from giung2.metrics import evaluate_acc
+from giung2.metrics import evaluate_acc, evaluate_nll
 from models.bridge import FeatureUnet, dsb_schedules, MLP
 from collections import OrderedDict
 from PIL import Image
 from tqdm import tqdm
 from models.resnet import FlaxResNetClassifier
-from utils import pixelize, normalize_logits, unnormalize_logits, jprint, model_list
+from utils import pixelize, normalize_logits, unnormalize_logits, jprint, model_list, logit_dir_list, feature_dir_list
+from tqdm import tqdm
 
 
 def build_featureloaders(config):
@@ -70,6 +72,7 @@ def build_featureloaders(config):
                 valid_Alogits_list.append(valid_logits)
                 test_Alogits_list.append(test_logits)
 
+    # shift = 0.5
     shift = 0
 
     train_logitsA = np.concatenate(train_Alogits_list, axis=0)
@@ -173,7 +176,8 @@ def build_featureloaders(config):
     # sum = 0
     # for batch in dataloaders["trn_featureloader"](rng=None):
     #     logitsB = batch["images"]
-    #     logitsA = batch["labels"]
+    #     logitsA, labels = jnp.split(
+    #         batch["labels"], [logitsB.shape[-1]], axis=-1)
     #     logitsB = jnp.where(
     #         batch["marker"][..., None], logitsB, jnp.zeros_like(logitsB))
     #     logitsA = jnp.where(
@@ -183,6 +187,9 @@ def build_featureloaders(config):
     # mean = sum/count
     # sum = 0
     # for batch in dataloaders["trn_featureloader"](rng=None):
+    #     logitsB = batch["images"]
+    #     logitsA, labels = jnp.split(
+    #         batch["labels"], [logitsB.shape[-1]], axis=-1)
     #     logitsB = jnp.where(
     #         batch["marker"][..., None], logitsB, jnp.zeros_like(logitsB))
     #     logitsA = jnp.where(
@@ -217,6 +224,9 @@ class TrainState(train_state.TrainState):
     sigma_t: Any
     sigmabar_t: Any
     bigsigma_t: Any
+    alpos_t: Any
+    alpos_weight_t: Any
+    sigma_t_square: Any
 
     # equation (11) in I2SB
     def forward(self, x0, x1, training=True, **kwargs):
@@ -234,6 +244,11 @@ class TrainState(train_state.TrainState):
         noise = jax.random.normal(n_rng, mu_t.shape)  # (B, d)
         x_t = mu_t + noise*jnp.sqrt(bigsigma_t)
 
+        # temp
+        # x_min = jnp.where(x0 < x1, x0, x1)
+        # x_max = jnp.where(x0 < x1, x1, x0)
+        # x_t = jnp.clip(x_t, x_min, x_max)
+
         kwargs["t"] = _ts/self.n_T  # (B,)
         kwargs["training"] = training
         return x_t, sigma_t, kwargs
@@ -244,7 +259,7 @@ class TrainState(train_state.TrainState):
         x_n = x0  # (B, d)
 
         def body_fn(n, val):
-            rng, x_n = val
+            rng, x_n, dir = val
             idx = self.n_T - n
             rng = jax.random.fold_in(rng, idx)
             t_n = jnp.array([idx/self.n_T])  # (1,)
@@ -253,24 +268,25 @@ class TrainState(train_state.TrainState):
             h = jnp.where(idx > 1, jax.random.normal(
                 rng, shape), jnp.zeros(shape))  # (B, d)
             eps = apply(x_n, t_n)  # (2*B, d)
-            ########
-            # e1 = stats["oneover_sqrta"][idx]
-            # jprint(e1, "*(")
-            # e2 = x_n[-1]
-            # jprint(e2, "-")
-            # e3 = (eps*stats["mab_over_sqrtmab"][idx])[-1]
-            # jprint(e3, ")")
-            # e4 = (stats["sqrt_beta_t"][idx]*h)[-1]
-            # jprint("+", e4)
-            ##########
-            x_n = (
-                stats["oneover_sqrta"][idx] *
-                (x_n-eps*stats["mab_over_sqrtmab"][idx])
-                + stats["sqrt_beta_t"][idx]*h
-            )  # (B, d)
-            return rng, x_n
 
-        _, x_n = jax.lax.fori_loop(0, self.n_T, body_fn, (rng, x_n))
+            sigma_t = stats["sigma_t"][idx]
+            alpos_weight_t = stats["alpos_weight_t"][idx]
+            sigma_t_square = stats["sigma_t_square"][idx]
+            std = jnp.sqrt(alpos_weight_t*sigma_t_square)
+
+            x_0_eps = x_n - sigma_t*eps
+            mean = alpos_weight_t*x_0_eps + (1-alpos_weight_t)*x_n
+            x_n = mean + std * h  # (B, d)
+
+            # dir = jnp.where(n == 0, x_n >= x0, dir)
+            # x_min = jnp.where(dir, x0, x_n-1e-8)
+            # x_max = jnp.where(dir, x_n+1e-8, x0)
+            # x_n = jnp.clip(x_n, x_min, x_max)
+
+            return rng, x_n, dir
+
+        dir = jnp.zeros_like(x_n, dtype=bool)
+        _, x_n, _ = jax.lax.fori_loop(0, self.n_T, body_fn, (rng, x_n, dir))
 
         return x_n
 
@@ -292,16 +308,14 @@ def launch(config, print_fn):
     beta1 = config.beta1
     beta2 = config.beta2
     dsb_stats = dsb_schedules(beta1, beta2, config.T)
-    for k, v in dsb_stats.items():
-        print(f"{k}: {v}")
+    # for k, v in dsb_stats.items():
+    #     print(f"{k}: {v}")
 
-    x_dim = 64
-    # score_func = MLP(
-    #     x_dim=x_dim,
-    #     pos_dim=config.n_feat,
-    #     encoder_layers=[config.n_feat, config.n_feat],
-    #     decoder_layers=[config.n_feat, config.n_feat]
-    # )
+    if config.features_dir in logit_dir_list:
+        x_dim = 10
+    elif config.features_dir in feature_dir_list:
+        x_dim = 64
+
     score_func = FeatureUnet(
         in_channels=x_dim,
         ver=config.version,
@@ -320,7 +334,8 @@ def launch(config, print_fn):
             t=jnp.empty((1,))
         )
     variables = initialize_model(init_rng, score_func)
-    variables_cls = initialize_model(init_rng, classifier)
+    variables_clsB = initialize_model(init_rng, classifier)
+    variables_clsA = initialize_model(init_rng, classifier)
 
     def load_classifier(variables_cls, ckpt_dir):
         variables_cls = variables_cls.unfreeze()
@@ -328,15 +343,16 @@ def launch(config, print_fn):
             ckpt_dir=os.path.join(ckpt_dir, "sghmc"),
             target=None
         )
-        current_valid_acc = ckpt["best_acc"]
-        # variables_cls["params"]["Dense_0"] = ckpt["model"]["params"]["Dense_0"]
         variables_cls["params"]["Dense_0"] = ckpt["model"]["params"]["Dense_0"]
         variables_cls = freeze(variables_cls)
         del ckpt
 
         return variables_cls
 
-    variables_cls = load_classifier(variables_cls, model_list[1])
+    variables_clsB = load_classifier(
+        variables_clsB, model_list[0])  # current mode
+    variables_clsA = load_classifier(
+        variables_clsA, model_list[1])  # target mode
 
     dynamic_scale = None
     if config.precision == 'fp16' and jax.local_devices()[0].platform == 'gpu':
@@ -366,12 +382,16 @@ def launch(config, print_fn):
         loss = jnp.sum((noise-output)**2, axis=1)
         return loss
 
-    def accuracy(f_gen, labels, marker):
+    def accuracy(f_gen, labels, marker, mode="A"):
         if f_gen.shape[-1] == 10:
             logits = f_gen
         else:
+            if mode.lower() == "a":
+                variables_cls_params = variables_clsA["params"]
+            elif mode.lower() == "b":
+                variables_cls_params = variables_clsB["params"]
             logits = classifier.apply(
-                {"params": variables_cls["params"]}, f_gen
+                {"params": variables_cls_params}, f_gen
             )
         predictions = jax.nn.log_softmax(logits, axis=-1)
         acc = evaluate_acc(
@@ -380,25 +400,81 @@ def launch(config, print_fn):
         acc = jnp.sum(jnp.where(marker, acc, jnp.zeros_like(acc)))
         return acc
 
-    def cross_entropy(f_gen, labels):
+    def ensemble_accuracy(f_list, labels, marker, mode):
+        assert len(f_list) == len(mode)
+        avg_logits = 0
+        each_acc = []
+        for m, f_gen in zip(mode, f_list):
+            if f_gen.shape[-1] == 10:
+                logits = f_gen
+            else:
+                if m.lower() == "a":
+                    variables_cls_params = variables_clsA["params"]
+                elif m.lower() == "b":
+                    variables_cls_params = variables_clsB["params"]
+                logits = classifier.apply(
+                    {"params": variables_cls_params}, f_gen
+                )
+
+            avg_logits += logits
+
+            predictions = jax.nn.log_softmax(logits, axis=-1)
+            acc = evaluate_acc(
+                predictions, labels, log_input=True, reduction="none")
+            acc = jnp.sum(jnp.where(marker, acc, jnp.zeros_like(acc)))
+            each_acc.append(acc)
+        avg_logits /= len(f_list)
+
+        predictions = jax.nn.log_softmax(avg_logits, axis=-1)
+        acc = evaluate_acc(
+            predictions, labels, log_input=True, reduction="none")
+        nll = evaluate_nll(
+            predictions, labels, log_input=True, reduction='none')
+        acc = jnp.sum(jnp.where(marker, acc, jnp.zeros_like(acc)))
+        nll = jnp.sum(jnp.where(marker, nll, jnp.zeros_like(nll)))
+        return (acc, nll), each_acc
+
+    def cross_entropy(f_gen, labels, mode="A"):
         if f_gen.shape[-1] == 10:
             logits = f_gen
         else:
+            if mode.lower() == "a":
+                variables_cls_params = variables_clsA["params"]
+            elif mode.lower() == "b":
+                variables_cls_params = variables_clsB["params"]
             logits = classifier.apply(
-                {"params": variables_cls["params"]}, f_gen
+                {"params": variables_cls_params}, f_gen
             )
         target = common_utils.onehot(
             labels, num_classes=logits.shape[-1])  # [B, K,]
-        loss = -jnp.sum(target * jax.nn.log_softmax(logits,
-                        axis=-1), axis=-1)      # [B,]
+        loss = -jnp.sum(
+            target * jax.nn.log_softmax(logits, axis=-1),
+            axis=-1)      # [B,]
         return loss
 
+    def kl_divergence(logit_tar, logit_ref, marker):
+        """
+        logit_tar ~ q(x)
+        logit_ref ~ p(x)
+
+        return KL(q||p)
+        """
+        logq = jax.nn.log_softmax(logit_tar, axis=-1)
+        logp = jax.nn.log_softmax(logit_ref, axis=-1)
+        q = jnp.exp(logq)
+        integrand = q*(logq-logp)
+        assert len(integrand.shape) == 2
+        kld = jnp.sum(integrand, axis=-1)
+        kld = jnp.where(marker, kld, 0)
+        return jnp.sum(kld)
+
     # training
+
     def step_train(state, batch, config):
         logitsB = batch["images"]  # the current mode
         # mixture of other modes
         logitsA, labels = jnp.split(
-            batch["labels"], [logitsB.shape[0]], axis=-1)
+            batch["labels"], [logitsB.shape[-1]], axis=-1)
         logitsB = normalize(logitsB)
         logitsA = normalize(logitsA)
 
@@ -443,7 +519,6 @@ def launch(config, print_fn):
         new_state = state.apply_gradients(
             grads=grads, batch_stats=new_model_state.get('batch_stats'))
         metrics = jax.lax.psum(metrics, axis_name="batch")
-        metrics["lr"] = scheduler(state.step)
 
         if dynamic_scale:
             new_state = new_state.replace(
@@ -458,7 +533,7 @@ def launch(config, print_fn):
     def step_valid(state, batch):
         logitsB = batch["images"]
         logitsA, _ = jnp.split(
-            batch["labels"], [logitsB.shape[0]], axis=-1)
+            batch["labels"], [logitsB.shape[-1]], axis=-1)
         logitsB = normalize(logitsB)
         logitsA = normalize(logitsA)
         logits_t, sigma_t, kwargs = state.forward(
@@ -471,7 +546,7 @@ def launch(config, print_fn):
         loss = mse_loss(output, diff)
         loss = jnp.where(batch["marker"], loss, jnp.zeros_like(loss))
         count = jnp.sum(batch["marker"])
-        loss = jnp.sum(loss)/count
+        loss = jnp.where(count > 0, jnp.sum(loss)/count, 0)
 
         metrics = OrderedDict({"loss": loss*count, "count": count})
         metrics = jax.lax.psum(metrics, axis_name="batch")
@@ -486,38 +561,44 @@ def launch(config, print_fn):
             return output
         _logitsB = batch["images"]  # current mode
         _logitsA, labels = jnp.split(
-            batch["labels"], [_logitsB.shape[0]], axis=-1)
+            batch["labels"], [_logitsB.shape[-1]], axis=-1)
         labels = jnp.squeeze(labels, -1)
         logitsB = normalize(_logitsB)
         logitsA = normalize(_logitsA)
-        # jprint(logitsB[-1], "first")
         f_gen = state.sample(
             state.rng, apply, logitsB, dsb_stats)
-        # jprint(logitsA[-1], "last")
         f_gen = unnormalize(f_gen)
         f_real = _logitsA
         f_init = _logitsB
 
         f_all = jnp.stack([f_init, f_gen, f_real], axis=-1)
 
-        acc = accuracy(f_gen, labels, batch["marker"])
+        (ens_acc, ens_nll), (b_acc, a_acc) = ensemble_accuracy(
+            [f_init, f_gen], labels, batch["marker"], ["B", "A"])
         count = jnp.sum(batch["marker"])
+        kld = kl_divergence(f_gen, f_real, batch["marker"])
 
-        metrics = OrderedDict({"acc": acc, "count": count})
+        metrics = OrderedDict({
+            "acc": a_acc, "ens_acc": ens_acc, "ens_nll": ens_nll,
+            "count": count, "kld": kld
+        })
         metrics = jax.lax.psum(metrics, axis_name='batch')
+
         return f_all, metrics
 
-    cross_replica_mean = jax.pmap(lambda x: jax.lax.pmean(x, 'x'), 'x')
-    p_step_train = jax.pmap(
-        partial(step_train, config=config), axis_name="batch")
-    p_step_valid = jax.pmap(step_valid, axis_name="batch")
-    p_step_sample = jax.pmap(
-        partial(step_sample, config=config), axis_name="batch")
-    state = jax_utils.replicate(state)
-    best_loss = float("inf")
-    image_name = datetime.datetime.now().strftime('%y%m%d%H%M%S%f')
-    train_image_name = f"images/{config.version}train{image_name}.png"
-    valid_image_name = f"images/{config.version}valid{image_name}.png"
+    def step_acc_ref(state, batch):
+        _logitsB = batch["images"]  # current mode
+        _logitsA, labels = jnp.split(
+            batch["labels"], [_logitsB.shape[-1]], axis=-1)
+        labels = jnp.squeeze(labels, -1)
+        f_real = _logitsA
+        f_init = _logitsB
+        (ens_acc, ens_nll), (b_acc, a_acc) = ensemble_accuracy(
+            [f_init, f_real], labels, batch["marker"], ["B", "A"])
+        metrics = OrderedDict(
+            {"acc_ref": a_acc, "ens_acc_ref": ens_acc, "ens_nll_ref": ens_nll})
+        metrics = jax.lax.psum(metrics, axis_name='batch')
+        return metrics
 
     def save_samples(state, batch, epoch_idx, train):
         if (epoch_idx+1) % 50 == 0 and os.environ.get("DEBUG") != True:
@@ -529,8 +610,47 @@ def launch(config, print_fn):
             image = Image.fromarray(image_array)
             image.save(train_image_name if train else valid_image_name)
 
-    for epoch_idx, _ in enumerate(range(config.optim_ne), start=1):
-        log_str = '[Epoch {:5d}/{:5d}] '.format(epoch_idx, config.optim_ne)
+    def log_wandb(object):
+        to_summary = [
+            "trn/acc_ref", "trn/ens_acc_ref", "trn/ens_nll_ref",
+            "val/acc_ref", "val/ens_acc_ref", "val/ens_nll_ref"
+        ]
+        for k in to_summary:
+            value = object.get(k)
+            if value is None:
+                continue
+            wandb.run.summary[k] = value
+            del object[k]
+        wandb.log(object)
+
+    cross_replica_mean = jax.pmap(lambda x: jax.lax.pmean(x, 'x'), 'x')
+    p_step_train = jax.pmap(
+        partial(step_train, config=config), axis_name="batch")
+    p_step_valid = jax.pmap(step_valid, axis_name="batch")
+    p_step_sample = jax.pmap(
+        partial(step_sample, config=config), axis_name="batch")
+    p_step_acc_ref = jax.pmap(step_acc_ref, axis_name="batch")
+    state = jax_utils.replicate(state)
+    best_loss = float("inf")
+    image_name = datetime.datetime.now().strftime('%y%m%d%H%M%S%f')
+    feature_type = "last" if config.features_dir in feature_dir_list else "logit"
+    train_image_name = f"images/{config.version}train{feature_type}{image_name}.png"
+    valid_image_name = f"images/{config.version}valid{feature_type}{image_name}.png"
+    trn_summary = dict()
+    val_summary = dict()
+
+    run = wandb.init(
+        project="dsb-bnn",
+        config=vars(config),
+        mode="disabled" if config.nowandb else "online"
+    )
+    wandb.define_metric("val/loss", summary="min")
+    wandb.define_metric("val/acc", summary="max")
+    wandb.define_metric("val/ens_acc", summary="max")
+    wandb.define_metric("val/ens_nll", summary="min")
+
+    for epoch_idx, _ in enumerate(tqdm(range(config.optim_ne)), start=1):
+        # log_str = '[Epoch {:5d}/{:5d}] '.format(epoch_idx, config.optim_ne)
         rng = jax.random.fold_in(rng, epoch_idx)
         data_rng, rng = jax.random.split(rng)
 
@@ -542,14 +662,16 @@ def launch(config, print_fn):
             state = state.replace(rng=jax_utils.replicate(rng))
             state, metrics = p_step_train(state, batch)
 
-            # if batch_idx == dataloaders["trn_steps_per_epoch"]:
-            #     save_samples(state, batch, epoch_idx, train=True)
-            if (epoch_idx+1) % 1 == 0:
-                _, acc_metrics = p_step_sample(state, batch)
-                metrics["acc"] = acc_metrics["acc"]
-                # metrics["acc_ref"] = acc_metrics["acc_ref"]
-                # metrics["acc_exact"] = acc_metrics["acc_exact"]
-                assert jnp.all(metrics["count"] == acc_metrics["count"])
+            if epoch_idx == 1:
+                acc_ref_metrics = p_step_acc_ref(state, batch)
+                metrics.update(acc_ref_metrics)
+            if config.show:
+                if batch_idx == dataloaders["trn_steps_per_epoch"]:
+                    save_samples(state, batch, epoch_idx, train=True)
+            else:
+                if (epoch_idx+1) % 1 == 0:
+                    _, acc_metrics = p_step_sample(state, batch)
+                    metrics.update(acc_metrics)
 
             train_metrics.append(metrics)
 
@@ -557,10 +679,13 @@ def launch(config, print_fn):
         trn_summarized = {f'trn/{k}': v for k,
                           v in jax.tree_util.tree_map(lambda e: e.sum(), train_metrics).items()}
         for k, v in trn_summarized.items():
-            if "count" not in k:
+            if "count" not in k and "lr" not in k:
                 trn_summarized[k] /= trn_summarized["trn/count"]
         del trn_summarized["trn/count"]
-        log_str += ', '.join(f'{k} {v:.3e}' for k, v in trn_summarized.items())
+        del trn_summarized["trn/celoss"]
+        trn_summary.update(trn_summarized)
+        # log_str += ', '.join(f'{k} {v:.3e}' for k, v in trn_summary.items())
+        log_wandb(trn_summary)
 
         if state.batch_stats is not None:
             state = state.replace(
@@ -574,14 +699,17 @@ def launch(config, print_fn):
             state = state.replace(rng=jax_utils.replicate(rng))
             metrics = p_step_valid(state, batch)
 
-            # if batch_idx == dataloaders["val_steps_per_epoch"]:
-            #     save_samples(state, batch, epoch_idx, train=False)
-            if (epoch_idx+1) % 50 == 0:
-                _, acc_metrics = p_step_sample(state, batch)
-                metrics["acc"] = acc_metrics["acc"]
-                # metrics["acc_ref"] = acc_metrics["acc_ref"]
-                # metrics["acc_exact"] = acc_metrics["acc_exact"]
-                assert jnp.all(metrics["count"] == acc_metrics["count"])
+            if epoch_idx == 1:
+                acc_ref_metrics = p_step_acc_ref(state, batch)
+                metrics.update(acc_ref_metrics)
+            if config.show:
+                if batch_idx == dataloaders["val_steps_per_epoch"]:
+                    save_samples(state, batch, epoch_idx, train=False)
+            else:
+                if (epoch_idx+1) % 1 == 0:
+                    _, acc_metrics = p_step_sample(state, batch)
+                    metrics.update(acc_metrics)
+                    assert jnp.all(metrics["count"] == acc_metrics["count"])
 
             valid_metrics.append(metrics)
 
@@ -589,13 +717,15 @@ def launch(config, print_fn):
         val_summarized = {f'val/{k}': v for k,
                           v in jax.tree_util.tree_map(lambda e: e.sum(), valid_metrics).items()}
         for k, v in val_summarized.items():
-            if "count" not in k:
+            if "count" not in k and "lr" not in k:
                 val_summarized[k] /= val_summarized["val/count"]
         del val_summarized["val/count"]
-        log_str += ', ' + \
-            ', '.join(f'{k} {v:.3e}' for k, v in val_summarized.items())
+        val_summary.update(val_summarized)
+        # log_str += ', ' + \
+        #     ', '.join(f'{k} {v:.3e}' for k, v in val_summary.items())
+        log_wandb(val_summary)
 
-        if config.save and best_loss > val_summarized["val/loss"]:
+        if config.save and best_loss < val_summarized["val/loss"]:
             test_metrics = []
             test_loader = dataloaders["tst_featureloader"](rng=None)
             test_loader = jax_utils.prefetch_to_device(test_loader, size=2)
@@ -609,8 +739,8 @@ def launch(config, print_fn):
                 f'tst/{k}': v for k, v in jax.tree_util.tree_map(lambda e: e.sum(), test_metrics).items()}
             test_nll = tst_summarized['tst/loss'] / tst_summarized['tst/count']
             del val_summarized["tst/count"]
-            log_str += ', ' + \
-                ', '.join(f'{k} {v:.3e}' for k, v in tst_summarized.items())
+            # log_str += ', ' + \
+            #     ', '.join(f'{k} {v:.3e}' for k, v in tst_summarized.items())
             best_loss = val_summarized['val/loss']
 
             save_state = jax_utils.unreplicate(state)
@@ -623,14 +753,16 @@ def launch(config, print_fn):
                                         overwrite=True,
                                         orbax_checkpointer=orbax_checkpointer)
 
-        log_str = datetime.datetime.now().strftime(
-            '[%Y-%m-%d %H:%M:%S] ') + log_str
-        print_fn(log_str)
+        # log_str = datetime.datetime.now().strftime(
+        #     '[%Y-%m-%d %H:%M:%S] ') + log_str
+        # print_fn(log_str)
 
         # wait until computations are done
         jax.random.normal(jax.random.PRNGKey(0), ()).block_until_ready()
         if jnp.isnan(trn_summarized['trn/loss']):
             break
+
+    wandb.finish()
 
 
 def main():
@@ -660,7 +792,9 @@ def main():
     parser.add_argument("--beta2", default=0.02, type=float)
     parser.add_argument("--features_dir", default="features_last", type=str)
     parser.add_argument("--version", default="v1", type=str)
-    parser.add_argument("--gamma", default=1, type=float)
+    parser.add_argument("--gamma", default=0., type=float)
+    parser.add_argument("--show", action="store_true")
+    parser.add_argument("--nowandb", action="store_true")
 
     args = parser.parse_args()
 

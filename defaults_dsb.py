@@ -19,7 +19,7 @@ def default_argument_parser():
                         help='use the proportional train split if specified (default: 1.0)')
 
     parser.add_argument('--model_depth', default=20, type=int,
-                        choices=[2, 3, 20, 32, 44, 56, 110])
+                        choices=[20, 32, 44, 56, 110])
     parser.add_argument('--model_width', default=1., type=float,
                         help='widen factor (default: 1)')
     parser.add_argument('--model_style', default='FRN-Swish', type=str,

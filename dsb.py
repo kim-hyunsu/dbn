@@ -38,8 +38,8 @@ from tqdm import tqdm
 def build_featureloaders(config):
     dir = config.features_dir
     # B: current mode, A: other modes
-    n_Amodes = 1
-    n_samples_each_mode = 1
+    n_Amodes = config.n_Amodes
+    n_samples_each_mode = config.n_samples_each_mode
     n_samples_each_Bmode = n_Amodes*n_samples_each_mode
     n_samples_each_Amode = n_samples_each_mode
     train_Alogits_list = []
@@ -72,7 +72,6 @@ def build_featureloaders(config):
                 valid_Alogits_list.append(valid_logits)
                 test_Alogits_list.append(test_logits)
 
-    # shift = 0.5
     shift = 0
 
     train_logitsA = np.concatenate(train_Alogits_list, axis=0)
@@ -106,6 +105,10 @@ def build_featureloaders(config):
         config.data_root, f'{config.data_name}/test_labels.npy'))
     if config.data_name == "CIFAR10_x32":
         trn_labels, val_labels = trn_labels[:40960], trn_labels[40960:]
+        num_classes = 10
+    elif config.data_name == "CIFAR100_x32":
+        trn_labels, val_labels = trn_labels[:40960], trn_labels[40960:]
+        num_classes = 100
 
     trn_labels = jnp.tile(trn_labels, [n_samples_each_Bmode])
     val_labels = jnp.tile(val_labels, [n_samples_each_Bmode])
@@ -128,7 +131,7 @@ def build_featureloaders(config):
         train_length=len(train_logitsA),
         valid_length=len(valid_logitsA),
         test_length=len(test_logitsA),
-        num_classes=10,
+        num_classes=num_classes,
         image_shape=(1, 32, 32, 3),
         trn_steps_per_epoch=math.ceil(len(train_logitsA)/config.optim_bs),
         val_steps_per_epoch=math.ceil(len(valid_logitsA)/config.optim_bs),
@@ -169,38 +172,40 @@ def build_featureloaders(config):
     )
     normalize = partial(normalize_logits,  features_dir=dir)
     unnormalize = partial(unnormalize_logits,  features_dir=dir)
-    # >------------------------------------------------------------------
-    # > Compute statistics (mean, std)
-    # >------------------------------------------------------------------
-    # count = 0
-    # sum = 0
-    # for batch in dataloaders["trn_featureloader"](rng=None):
-    #     logitsB = batch["images"]
-    #     logitsA, labels = jnp.split(
-    #         batch["labels"], [logitsB.shape[-1]], axis=-1)
-    #     logitsB = jnp.where(
-    #         batch["marker"][..., None], logitsB, jnp.zeros_like(logitsB))
-    #     logitsA = jnp.where(
-    #         batch["marker"][..., None], logitsA, jnp.zeros_like(logitsA))
-    #     sum += jnp.sum(logitsB, [0, 1])+jnp.sum(logitsA, [0, 1])
-    #     count += 2*batch["marker"].sum()
-    # mean = sum/count
-    # sum = 0
-    # for batch in dataloaders["trn_featureloader"](rng=None):
-    #     logitsB = batch["images"]
-    #     logitsA, labels = jnp.split(
-    #         batch["labels"], [logitsB.shape[-1]], axis=-1)
-    #     logitsB = jnp.where(
-    #         batch["marker"][..., None], logitsB, jnp.zeros_like(logitsB))
-    #     logitsA = jnp.where(
-    #         batch["marker"][..., None], logitsA, jnp.zeros_like(logitsA))
-    #     sum += jnp.sum((logitsB-mean)**2, axis=[0, 1])
-    #     sum += jnp.sum((logitsA-mean)**2, axis=[0, 1])
-    # var = sum/count
-    # std = jnp.sqrt(var)
-    # print("dims", len(mean))
-    # print("mean", mean)
-    # print("std", std)
+    if config.get_stats:
+        # >------------------------------------------------------------------
+        # > Compute statistics (mean, std)
+        # >------------------------------------------------------------------
+        count = 0
+        sum = 0
+        for batch in dataloaders["trn_featureloader"](rng=None):
+            logitsB = batch["images"]
+            logitsA, labels = jnp.split(
+                batch["labels"], [logitsB.shape[-1]], axis=-1)
+            logitsB = jnp.where(
+                batch["marker"][..., None], logitsB, jnp.zeros_like(logitsB))
+            logitsA = jnp.where(
+                batch["marker"][..., None], logitsA, jnp.zeros_like(logitsA))
+            sum += jnp.sum(logitsB, [0, 1])+jnp.sum(logitsA, [0, 1])
+            count += 2*batch["marker"].sum()
+        mean = sum/count
+        sum = 0
+        for batch in dataloaders["trn_featureloader"](rng=None):
+            logitsB = batch["images"]
+            logitsA, labels = jnp.split(
+                batch["labels"], [logitsB.shape[-1]], axis=-1)
+            mseB = jnp.where(
+                batch["marker"][..., None], (logitsB-mean)**2, jnp.zeros_like(logitsB))
+            mseA = jnp.where(
+                batch["marker"][..., None], (logitsA-mean)**2, jnp.zeros_like(logitsA))
+            sum += jnp.sum(mseB, axis=[0, 1])
+            sum += jnp.sum(mseA, axis=[0, 1])
+        var = sum/count
+        std = jnp.sqrt(var)
+        print("dims", len(mean))
+        print("mean", mean)
+        print("std", std)
+        assert False, "Terminate Program"
 
     return dataloaders, normalize, unnormalize
 
@@ -244,11 +249,6 @@ class TrainState(train_state.TrainState):
         noise = jax.random.normal(n_rng, mu_t.shape)  # (B, d)
         x_t = mu_t + noise*jnp.sqrt(bigsigma_t)
 
-        # temp
-        # x_min = jnp.where(x0 < x1, x0, x1)
-        # x_max = jnp.where(x0 < x1, x1, x0)
-        # x_t = jnp.clip(x_t, x_min, x_max)
-
         kwargs["t"] = _ts/self.n_T  # (B,)
         kwargs["training"] = training
         return x_t, sigma_t, kwargs
@@ -277,11 +277,6 @@ class TrainState(train_state.TrainState):
             x_0_eps = x_n - sigma_t*eps
             mean = alpos_weight_t*x_0_eps + (1-alpos_weight_t)*x_n
             x_n = mean + std * h  # (B, d)
-
-            # dir = jnp.where(n == 0, x_n >= x0, dir)
-            # x_min = jnp.where(dir, x0, x_n-1e-8)
-            # x_max = jnp.where(dir, x_n+1e-8, x0)
-            # x_n = jnp.clip(x_n, x_min, x_max)
 
             return rng, x_n, dir
 
@@ -421,8 +416,11 @@ def launch(config, print_fn):
             predictions = jax.nn.log_softmax(logits, axis=-1)
             acc = evaluate_acc(
                 predictions, labels, log_input=True, reduction="none")
+            nll = evaluate_nll(
+                predictions, labels, log_input=True, reduction='none')
             acc = jnp.sum(jnp.where(marker, acc, jnp.zeros_like(acc)))
-            each_acc.append(acc)
+            nll = jnp.sum(jnp.where(marker, nll, jnp.zeros_like(nll)))
+            each_acc.append((acc, nll))
         avg_logits /= len(f_list)
 
         predictions = jax.nn.log_softmax(avg_logits, axis=-1)
@@ -573,13 +571,14 @@ def launch(config, print_fn):
 
         f_all = jnp.stack([f_init, f_gen, f_real], axis=-1)
 
-        (ens_acc, ens_nll), (b_acc, a_acc) = ensemble_accuracy(
+        (ens_acc, ens_nll), ((b_acc, b_nll), (a_acc, a_nll)) = ensemble_accuracy(
             [f_init, f_gen], labels, batch["marker"], ["B", "A"])
         count = jnp.sum(batch["marker"])
         kld = kl_divergence(f_gen, f_real, batch["marker"])
 
         metrics = OrderedDict({
-            "acc": a_acc, "ens_acc": ens_acc, "ens_nll": ens_nll,
+            "acc": a_acc, "nll": a_nll,
+            "ens_acc": ens_acc, "ens_nll": ens_nll,
             "count": count, "kld": kld
         })
         metrics = jax.lax.psum(metrics, axis_name='batch')
@@ -593,10 +592,11 @@ def launch(config, print_fn):
         labels = jnp.squeeze(labels, -1)
         f_real = _logitsA
         f_init = _logitsB
-        (ens_acc, ens_nll), (b_acc, a_acc) = ensemble_accuracy(
+        (ens_acc, ens_nll), ((b_acc, b_nll), (a_acc, a_nll)) = ensemble_accuracy(
             [f_init, f_real], labels, batch["marker"], ["B", "A"])
         metrics = OrderedDict(
-            {"acc_ref": a_acc, "ens_acc_ref": ens_acc, "ens_nll_ref": ens_nll})
+            {"acc_ref": a_acc, "nll_ref": a_nll,
+             "ens_acc_ref": ens_acc, "ens_nll_ref": ens_nll})
         metrics = jax.lax.psum(metrics, axis_name='batch')
         return metrics
 
@@ -612,8 +612,12 @@ def launch(config, print_fn):
 
     def log_wandb(object):
         to_summary = [
-            "trn/acc_ref", "trn/ens_acc_ref", "trn/ens_nll_ref",
-            "val/acc_ref", "val/ens_acc_ref", "val/ens_nll_ref"
+            "trn/acc_ref", "trn/nll_ref", "trn/ens_acc_ref", "trn/ens_nll_ref",
+            "val/acc_ref", "val/nll_ref", "val/ens_acc_ref", "val/ens_nll_ref",
+            "tst/acc_ref", "tst/nll_ref", "tst/ens_acc_ref", "tst/ens_nll_ref",
+            "tst/acc", "tst/nll",
+            "tst/ens_acc", "tst/ens_nll",
+            "tst/loss", "tst/kld", "tst/ens_nll",
         ]
         for k in to_summary:
             value = object.get(k)
@@ -638,6 +642,7 @@ def launch(config, print_fn):
     valid_image_name = f"images/{config.version}valid{feature_type}{image_name}.png"
     trn_summary = dict()
     val_summary = dict()
+    tst_summary = dict()
 
     run = wandb.init(
         project="dsb-bnn",
@@ -650,7 +655,6 @@ def launch(config, print_fn):
     wandb.define_metric("val/ens_nll", summary="min")
 
     for epoch_idx, _ in enumerate(tqdm(range(config.optim_ne)), start=1):
-        # log_str = '[Epoch {:5d}/{:5d}] '.format(epoch_idx, config.optim_ne)
         rng = jax.random.fold_in(rng, epoch_idx)
         data_rng, rng = jax.random.split(rng)
 
@@ -684,7 +688,6 @@ def launch(config, print_fn):
         del trn_summarized["trn/count"]
         del trn_summarized["trn/celoss"]
         trn_summary.update(trn_summarized)
-        # log_str += ', '.join(f'{k} {v:.3e}' for k, v in trn_summary.items())
         log_wandb(trn_summary)
 
         if state.batch_stats is not None:
@@ -721,41 +724,41 @@ def launch(config, print_fn):
                 val_summarized[k] /= val_summarized["val/count"]
         del val_summarized["val/count"]
         val_summary.update(val_summarized)
-        # log_str += ', ' + \
-        #     ', '.join(f'{k} {v:.3e}' for k, v in val_summary.items())
         log_wandb(val_summary)
 
-        if config.save and best_loss < val_summarized["val/loss"]:
+        if best_loss > val_summarized["val/loss"]:
             test_metrics = []
             test_loader = dataloaders["tst_featureloader"](rng=None)
             test_loader = jax_utils.prefetch_to_device(test_loader, size=2)
             for batch_idx, batch in enumerate(test_loader, start=1):
-                metrics = p_step_valid(state, batch)
-                loss_rng, rng = jax.random.split(rng)
-                state = state.replace(rng=jax_utils.replicate(loss_rng))
+                rng = jax.random.fold_in(rng, batch_idx)
+                state = state.replace(rng=jax_utils.replicate(rng))
+                _, metrics = p_step_sample(state, batch)
+                if best_loss == float("inf"):
+                    acc_ref_metrics = p_step_acc_ref(state, batch)
+                    metrics.update(acc_ref_metrics)
                 test_metrics.append(metrics)
             test_metrics = common_utils.get_metrics(test_metrics)
             tst_summarized = {
                 f'tst/{k}': v for k, v in jax.tree_util.tree_map(lambda e: e.sum(), test_metrics).items()}
-            test_nll = tst_summarized['tst/loss'] / tst_summarized['tst/count']
-            del val_summarized["tst/count"]
-            # log_str += ', ' + \
-            #     ', '.join(f'{k} {v:.3e}' for k, v in tst_summarized.items())
+            for k, v in tst_summarized.items():
+                if "count" not in k and "lr" not in k:
+                    tst_summarized[k] /= tst_summarized["tst/count"]
+            del tst_summarized["tst/count"]
+            tst_summary.update(tst_summarized)
+            log_wandb(tst_summary)
             best_loss = val_summarized['val/loss']
 
-            save_state = jax_utils.unreplicate(state)
-            ckpt = dict(model=save_state, config=vars(
-                config), best_loss=best_loss)
-            orbax_checkpointer = orbax.checkpoint.PyTreeCheckpointer()
-            checkpoints.save_checkpoint(ckpt_dir=config.save,
-                                        target=ckpt,
-                                        step=epoch_idx,
-                                        overwrite=True,
-                                        orbax_checkpointer=orbax_checkpointer)
-
-        # log_str = datetime.datetime.now().strftime(
-        #     '[%Y-%m-%d %H:%M:%S] ') + log_str
-        # print_fn(log_str)
+            if config.save:
+                save_state = jax_utils.unreplicate(state)
+                ckpt = dict(model=save_state, config=vars(
+                    config), best_loss=best_loss)
+                orbax_checkpointer = orbax.checkpoint.PyTreeCheckpointer()
+                checkpoints.save_checkpoint(ckpt_dir=config.save,
+                                            target=ckpt,
+                                            step=epoch_idx,
+                                            overwrite=True,
+                                            orbax_checkpointer=orbax_checkpointer)
 
         # wait until computations are done
         jax.random.normal(jax.random.PRNGKey(0), ()).block_until_ready()
@@ -771,34 +774,36 @@ def main():
 
     parser = defaults.default_argument_parser()
 
-    parser.add_argument('--optim_ne', default=200, type=int,
+    parser.add_argument('--optim_ne', default=300, type=int,
                         help='the number of training epochs (default: 200)')
     parser.add_argument('--optim_lr', default=1e-4, type=float,
                         help='base learning rate (default: 1e-4)')
     parser.add_argument('--optim_momentum', default=0.9, type=float,
                         help='momentum coefficient (default: 0.9)')
-    parser.add_argument('--optim_weight_decay', default=0., type=float,
+    parser.add_argument('--optim_weight_decay', default=1e-4, type=float,
                         help='weight decay coefficient (default: 0.0001)')
-
     parser.add_argument('--save', default=None, type=str,
                         help='save the *.log and *.ckpt files if specified (default: False)')
-    parser.add_argument('--seed', default=None, type=int,
+    parser.add_argument('--seed', default=2023, type=int,
                         help='random seed for training (default: None)')
     parser.add_argument('--precision', default='fp32', type=str,
                         choices=['fp16', 'fp32'])
-    parser.add_argument("--T", default=400, type=int)
+    parser.add_argument("--T", default=50, type=int)
     parser.add_argument("--n_feat", default=64, type=int)
     parser.add_argument("--beta1", default=1e-4, type=float)
     parser.add_argument("--beta2", default=0.02, type=float)
-    parser.add_argument("--features_dir", default="features_last", type=str)
-    parser.add_argument("--version", default="v1", type=str)
+    parser.add_argument("--features_dir", default="features_fixed", type=str)
+    parser.add_argument("--version", default="v1.0", type=str)
     parser.add_argument("--gamma", default=0., type=float)
     parser.add_argument("--show", action="store_true")
     parser.add_argument("--nowandb", action="store_true")
+    parser.add_argument("--get_stats", action="store_true")
+    parser.add_argument("--n_Amodes", default=1, type=int)
+    parser.add_argument("--n_samples_each_mode", default=1, type=int)
 
     args = parser.parse_args()
 
-    if args.seed is None:
+    if args.seed < 0:
         args.seed = (
             os.getpid()
             + int(datetime.datetime.now().strftime('%S%f'))

@@ -10,7 +10,7 @@ def default_argument_parser():
 
     parser.add_argument('--data_root', default='./data/', type=str,
                         help='root directory containing datasets (default: ./data/)')
-    parser.add_argument('--data_name', default='CIFAR10_x32', type=str,
+    parser.add_argument('--data_name', default='CIFAR100_x32', type=str,
                         choices=['CIFAR10_x32', 'CIFAR100_x32',])
     parser.add_argument('--data_augmentation', default='none', type=str,
                         choices=['none',])

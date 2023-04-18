@@ -25,3 +25,5 @@ flower102
 wandb
 *.pdf
 .venv
+images
+score_checkpoints

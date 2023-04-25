@@ -7,19 +7,39 @@ debug = os.environ.get("DEBUG")
 if isinstance(debug, str):
     debug = debug.lower() == "true"
 
-model_list = [
-    "./checkpoints/frn_sd2",
-    "./checkpoints/frn_sd3",
-    "./checkpoints/frn_sd5",
-    "./checkpoints/frn_sd7",
-    "./checkpoints/frn_sd11",
-    "./checkpoints/frn_sd13",
-    "./checkpoints/frn_sd17"
-]
+
+def model_list(data_name, model_style):
+    if data_name == "CIFAR100_x32" and model_style == "BN-ReLU":
+        return [
+            "./checkpoints/bn100_sd2",
+            "./checkpoints/bn100_sd3",
+            "./checkpoints/bn100_sd5",
+            "./checkpoints/bn100_sd7",
+            "./checkpoints/bn100_sd11",
+            "./checkpoints/bn100_sd13",
+            "./checkpoints/bn100_sd17",
+        ]
+    elif data_name == "CIFAR10_x32" and model_style == "FRN-Swish":
+        return [
+            "./checkpoints/frn_sd2",
+            "./checkpoints/frn_sd3",
+            "./checkpoints/frn_sd5",
+            "./checkpoints/frn_sd7",
+            "./checkpoints/frn_sd11",
+            "./checkpoints/frn_sd13",
+            "./checkpoints/frn_sd17",
+            "./checkpoints/frn_sd19",
+        ]
+    else:
+        raise Exception("Invalid data_name and model_style.")
+
+
 logit_dir_list = ["features", "features_fixed",
-                  "features_1mixup", "features100"]
+                  "features_1mixup10", "features_1mixup10_fixed",
+                  "features_1mixupplus10", "features100", "features100_fixed"]
 feature_dir_list = ["features_last", "features_last_fixed",
-                    "features_last_1mixup", "features100_last"]
+                    "features_last_1mixup10", "features_last_1mixup10_fixed",
+                    "features_last_1mixupplus10", "features100_last", "features100_last_fixed"]
 
 
 pixel_mean = jnp.array(defaults.PIXEL_MEAN, dtype=jnp.float32)
@@ -81,12 +101,42 @@ features_fixed_std = jnp.array(
      0.7616899, 0.26205933, 0.58135045, 0.42836696, 0.59881216, 0.6225946,
      0.5618599, 0.16933021, 0.7180478, 0.57931596, 0.62415534, 0.27320555,
      0.6263999, 0.5018518, 0.56142384, 0.35803506])
-logits_1mixup_mean = jnp.array([])
-logits_1mixup_std = jnp.array([])
-features_1mixup_mean = jnp.array([])
-features_1mixup_std = jnp.array([])
-logits100_mean = jnp.array([])
-logits100_std = jnp.array([])
+logits_1mixup10_mean = jnp.array([])
+logits_1mixup10_std = jnp.array([])
+features_1mixup10_mean = jnp.array([])
+features_1mixup10_std = jnp.array([])
+logits100_mean = jnp.array([-0.78918993,  0.18090598, 0.86517256, 0.30723083, 0.15103784, 0.09180187,
+                            -0.44571838, 0.06200991, 0.14822228, 0.20730133, -0.03349496, 0.2144022,
+                            -0.22495835, -0.6576749, 0.3294145, 0.42581627, -0.03646952, -0.2745286,
+                            0.5139872, 0.13040869, -0.39609373, 0.11353918, -0.09560826, -0.7812039,
+                            -0.01596168, 0.6383833, 0.2423121, 0.35803756, -0.694735, 0.30421862,
+                            -0.51733416, 0.6392468, 0.9821324, 0.44309995, -0.52617687, 0.7559611,
+                            -0.19326943, 0.25391576, 0.26185268, 0.69964933, 0.67458445, 0.4378887,
+                            -0.50212127, -0.6836131, 0.81061697, 1.1402507, 0.38741606, -1.2742743,
+                            -0.4928542, -0.11932599, 0.73366827, 0.92223614, -1.5527763, -0.8730931,
+                            -0.03154067, 0.4191136, 0.16300222, -0.11278426, -0.81230134, -0.3627709,
+                            -0.5530198, -0.34061927, -0.43050647, -0.0126726, 0.43686315, 1.0989546,
+                            0.1716562, 0.6125122, -0.18166947, -0.16695522, -0.793086, -0.601069,
+                            0.31621766, -0.2643169, -0.12333494, 0.45243606, -0.4168915, 0.41478395,
+                            0.5238542, -0.15747295, 0.24275906, -0.87225085, 0.21865062, -0.19165191,
+                            0.73901576, -0.20824657, -0.21554343, 0.6735802, -0.229494, 0.15955655,
+                            0.24073105, -0.00808247, -0.56759256, 0.3187379, -0.6380629, -0.93570644,
+                            -0.44494024, -0.46781015, 0.32707706, 0.2370915])
+logits100_std = jnp.array([4.594066, 4.5431347, 4.8213224, 4.446335, 4.612145, 4.8464046, 4.6765847,
+                           4.540119, 4.3807864, 4.8282657, 4.7882257, 4.864854, 4.9172616, 4.931213,
+                           4.542918, 4.1491427, 4.8020263, 4.4095273, 4.38634, 4.5744014, 4.26479,
+                           4.218057, 4.463791, 4.4645486, 4.5250025, 4.771777, 4.5610957, 4.3980875,
+                           4.8701997, 4.733348, 4.687855, 4.420623, 4.4623585, 4.633992, 4.6156363,
+                           4.7556376, 4.590167, 4.3946466, 4.5372133, 4.086129, 4.9869947, 4.7050343,
+                           4.8171053, 4.8260055, 4.399883, 4.2015305, 4.504707, 4.7722254, 4.5142837,
+                           4.676133, 4.5488057, 4.851657, 4.7159824, 4.786454, 4.5173264, 4.427982,
+                           4.704732, 4.9657974, 4.8360343, 4.6786017, 4.585559, 4.3839507, 4.9874907,
+                           4.348865, 4.5410476, 4.408959, 4.5149956, 4.479573, 4.287721, 4.653971,
+                           4.774027, 4.739601, 4.7271695, 5.0483737, 4.708262, 4.3029838, 4.572212,
+                           4.4828134, 4.2437286, 4.6564775, 4.5748825, 4.7701416, 4.6564527, 4.685759,
+                           4.545, 4.6726613, 4.753336, 4.603716, 4.613296, 4.608823, 4.528189,
+                           4.636887, 4.787973, 4.4409943, 4.425962, 4.6991243, 4.8889084, 4.523881,
+                           4.961424, 4.0169554])
 features100_mean = jnp.array([])
 features100_std = jnp.array([])
 
@@ -101,47 +151,43 @@ def unnormalize(x):
     # return x+pixel_mean
 
 
-def normalize_logits(x, features_dir="features_last"):
+def _get_meanstd(features_dir):
     if features_dir == "features":
         mean = logits_mean
         std = logits_std
-    elif features_dir == "features_fixed":
+    elif features_dir in [
+            "features_fixed",
+            "features_1mixup10",
+            "features_1mixup10_fixed",
+            "features_1mixupplus10"]:
         mean = logits_fixed_mean
         std = logits_fixed_std
     elif features_dir == "features_last":
         mean = features_mean
         std = features_std
-    elif features_dir == "features_last_fixed":
+    elif features_dir in [
+            "features_last_fixed",
+            "features_last_1mixup10",
+            "features_last_1mixup10_fixed",
+            "features_last_1mixupplus10"]:
         mean = features_fixed_mean
         std = features_fixed_std
-    elif features_dir == "features100":
+    elif features_dir in ["features100", "features100_fixed"]:
         mean = logits100_mean
         std = logits100_std
-    elif features_dir == "features100_last":
+    elif features_dir in ["features100_last", "features100_last_fixed"]:
         mean = features100_mean
         std = features100_std
+    return mean, std
+
+
+def normalize_logits(x, features_dir="features_last"):
+    mean, std = _get_meanstd(features_dir)
     return (x-mean)/std
 
 
 def unnormalize_logits(x, features_dir="features_last"):
-    if features_dir == "features":
-        mean = logits_mean
-        std = logits_std
-    elif features_dir == "features_fixed":
-        mean = logits_fixed_mean
-        std = logits_fixed_std
-    elif features_dir == "features_last":
-        mean = features_mean
-        std = features_std
-    elif features_dir == "features_last_fixed":
-        mean = features_fixed_mean
-        std = features_fixed_std
-    elif features_dir == "features100":
-        mean = logits100_mean
-        std = logits100_std
-    elif features_dir == "features100_last":
-        mean = features100_mean
-        std = features100_std
+    mean, std = _get_meanstd(features_dir)
     return mean+std*x
 
 

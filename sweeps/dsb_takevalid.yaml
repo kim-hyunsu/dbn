@@ -1,0 +1,37 @@
+project: dsb-bnn
+program: dsb.py
+method: bayes
+metric:
+  name: val/ens_acc.max
+  goal: maximize
+parameters:
+  data_name:
+    value: CIFAR10_x32
+  optim_ne:
+    values: [300, 400,500,600,700]
+  optim_lr:
+    values: [0.005,0.001,0.0005,0.0001, 0.00005, 0.00001]
+  optim_weight_decay:
+    values: [0,0.00001,0.0001,0.001,0.01,0.1]
+  optim_bs:
+    values: [64,128,256,512]
+  T:
+    values: [10,20,50,100,200,500,1000]
+  n_feat:
+    values: [64,128,256]
+  beta1:
+    values: [0.0001,0.0002,0.0005,0.001,0.002,0.005]
+  beta2:
+    values: [0.005,0.01,0.02,0.05,0.1,0.2]
+  features_dir:
+    value: features_fixed
+  take_valid:
+    value: True
+
+  
+command:
+  - ${env}
+  - ${interpreter}
+  - ${program}
+  - ${args_no_boolean_flags}
+  

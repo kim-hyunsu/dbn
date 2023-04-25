@@ -22,16 +22,16 @@ class MLPBlock(nn.Module):
 
     @nn.compact
     def __call__(self, x, **kwargs):
-        if "use_running_average" in inspect.signature(self.batchnorm).parameters:
-            if kwargs.get("training") is False:
-                self.batchnorm.keywords["use_running_average"] = True
-            else:
-                self.batchnorm.keywords["use_running_average"] = False
-
+        # if "use_running_average" in inspect.signature(self.batchnorm).parameters:
+        #     if kwargs.get("training") is False:
+        #         self.batchnorm.keywords["use_running_average"] = True
+        #     else:
+        #         self.batchnorm.keywords["use_running_average"] = False
+        training = kwargs["training"]
         for ch in self.layer_widths[:-1]:
             x = nn.Dense(ch)(x)
             if self.norm:
-                x = self.batchnorm()(x)
+                x = self.batchnorm(use_running_average=not training)(x)
             x = self.activation_fn(x)
         x = nn.Dense(self.layer_widths[-1])(x)
         if self.activate_final:
@@ -198,24 +198,24 @@ class ResidualBlock(nn.Module):
 
     @nn.compact
     def __call__(self, x, **kwargs):
-        training = kwargs.get("training")
+        training = kwargs["training"]
         same_channels = (self.in_channels == self.out_channels)
-        if "use_running_average" in inspect.signature(self.batchnorm1).parameters:
-            if training is False:
-                self.batchnorm1.keywords["use_running_average"] = True
-                self.batchnorm2.keywords["use_running_average"] = True
-            else:
-                self.batchnorm1.keywords["use_running_average"] = False
-                self.batchnorm2.keywords["use_running_average"] = False
+        # if "use_running_average" in inspect.signature(self.batchnorm1).parameters:
+        #     if training is False:
+        #         self.batchnorm1.keywords["use_running_average"] = True
+        #         self.batchnorm2.keywords["use_running_average"] = True
+        #     else:
+        #         self.batchnorm1.keywords["use_running_average"] = False
+        #         self.batchnorm2.keywords["use_running_average"] = False
 
         block1 = nn.Sequential([
             self.dense1(self.out_channels),
-            self.batchnorm1(),
+            self.batchnorm1(use_running_average=not training),
             self.gelu
         ])
         block2 = nn.Sequential([
             self.dense2(self.out_channels),
-            self.batchnorm2(),
+            self.batchnorm2(use_running_average=not training),
             self.gelu
         ])
 
@@ -268,6 +268,7 @@ class FeatureUnet(nn.Module):
     in_channels: int
     ver: str
     n_feat: int = 256
+    droprate: float = 0
     init_block: nn.Module = partial(ResidualBlock, is_res=True)
     down1: nn.Module = UnetDown
     down2: nn.Module = UnetDown
@@ -285,6 +286,7 @@ class FeatureUnet(nn.Module):
     dense1: nn.Module = nn.Dense
     layernorm2: nn.Module = nn.LayerNorm
     dense2: nn.Module = nn.Dense
+    dropout: nn.Module = nn.Dropout
 
     @nn.compact
     def __call__(self, x, t, **kwargs):
@@ -302,19 +304,25 @@ class FeatureUnet(nn.Module):
             raise Exception("Invalid FeatureUnet Version")
 
     def _call_v1_0(self, x, t, **kwargs):
+        training = kwargs["training"]
         x = self.init_block(
             self.in_channels, self.n_feat
         )(x, **kwargs)  # (B,n_feat)
+        x = self.dropout(self.droprate/2, deterministic=not training)(x)
         down1 = self.down1(
             self.n_feat, self.n_feat
         )(x, **kwargs)  # (B,n_feat)
+        down1 = self.dropout(self.droprate, deterministic=not training)(down1)
         down2 = self.down2(
             self.n_feat, self.n_feat
         )(down1, **kwargs)  # (B,n_feat)
+        down2 = self.dropout(self.droprate, deterministic=not training)(down2)
         hiddenvec = self.down3(
             self.n_feat
         )(down2)  # (B,n_feat)
         hiddenvec = self.gelu(hiddenvec)
+        hiddenvec = self.dropout(
+            self.droprate, deterministic=not training)(hiddenvec)
 
         temb1 = self.timeembed1(
             1, self.n_feat

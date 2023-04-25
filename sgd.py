@@ -1,11 +1,8 @@
-# Revised from https://github.com/cs-giung/giung2-dev/blob/main/projects/residual-networks/scripts/SGDM.py
+import wandb
+import time
+from tqdm import tqdm
 from giung2.metrics import evaluate_acc, evaluate_nll
-# from giung2.models.resnet import FlaxResNet
-from models.resnet import FlaxResNet
-from models.resnet_v2 import (
-    ResNet18, ResNet34, ResNet50, ResNet101, ResNet152, ResNet200
-)
-from utils import normalize, unnormalize
+from giung2.models.resnet import FlaxResNet
 from giung2.models.layers import FilterResponseNorm
 from giung2.data.build import build_dataloaders
 import defaults_sgd as defaults
@@ -13,8 +10,8 @@ from tensorflow.io import gfile
 from flax.training import dynamic_scale as dynamic_scale_lib
 from flax.training import common_utils, train_state, checkpoints
 from flax import jax_utils, serialization
-import orbax
 import flax
+import orbax
 import optax
 import jaxlib
 import jax.numpy as jnp
@@ -29,14 +26,9 @@ import sys
 sys.path.append('./')
 
 
-class TrainStateBatch(train_state.TrainState):
-    image_stats: Any
-    batch_stats: Any
-    dynamic_scale: dynamic_scale_lib.DynamicScale
-
-
 class TrainState(train_state.TrainState):
     image_stats: Any
+    batch_stats: Any
     dynamic_scale: dynamic_scale_lib.DynamicScale
 
 
@@ -52,29 +44,17 @@ def launch(config, print_fn):
     dataloaders = build_dataloaders(config)
 
     # build model
-    _ResNet = {
-        "0": partial(
+    if config.model_name == 'FlaxResNet':
+        _ResNet = partial(
             FlaxResNet,
             depth=config.model_depth,
             widen_factor=config.model_width,
             dtype=model_dtype,
             pixel_mean=defaults.PIXEL_MEAN,
             pixel_std=defaults.PIXEL_STD,
-            num_classes=dataloaders['num_classes']),  # legacy
-        "18": ResNet18,
-        "34": ResNet34,
-        "50": ResNet50,
-        "101": ResNet101,
-        "152": ResNet152,
-        "200": ResNet200,
-    }[config.v2]
+            num_classes=dataloaders['num_classes'])
 
-    if config.v2 != 0:
-        model = _ResNet(
-            num_classes=dataloaders["num_classes"],
-            dtype=model_dtype
-        )
-    elif config.model_style == "BN-ReLU":
+    if config.model_style == 'BN-ReLU':
         model = _ResNet()
     elif config.model_style == "FRN-Swish":
         model = _ResNet(
@@ -84,18 +64,14 @@ def launch(config, print_fn):
                 kernel_init=jax.nn.initializers.he_normal(),
                 bias_init=jax.nn.initializers.zeros),
             norm=FilterResponseNorm,
-            relu=flax.linen.swish
-        )
-    print(model.tabulate(jax.random.PRNGKey(0), jnp.ones((1, 32, 32, 1))))
+            relu=flax.linen.swish)
 
     # initialize model
     def initialize_model(key, model):
         @jax.jit
         def init(*args):
             return model.init(*args)
-        return init(
-            {'params': key},
-            jnp.ones(dataloaders['image_shape'], model.dtype))
+        return init({'params': key}, jnp.ones(dataloaders['image_shape'], model.dtype))
     variables = initialize_model(jax.random.PRNGKey(config.seed), model)
 
     # define dynamic_scale
@@ -115,7 +91,7 @@ def launch(config, print_fn):
         optimizer = optax.adam(learning_rate=scheduler)
 
     # build train state
-    state = TrainStateBatch.create(
+    state = TrainState.create(
         apply_fn=model.apply,
         params=variables['params'],
         tx=optimizer,
@@ -126,10 +102,7 @@ def launch(config, print_fn):
     # ---------------------------------------------------------------------- #
     # Optimization
     # ---------------------------------------------------------------------- #
-
     def step_trn(state, batch, config, scheduler):
-
-        # define loss function
         def loss_fn(params):
             params_dict = dict(params=params)
             mutable = ["intermediates"]
@@ -139,20 +112,11 @@ def launch(config, print_fn):
                 params_dict["batch_stats"] = state.batch_stats
                 mutable.append("batch_stats")
 
-            kwargs = dict()
-            if config.v2 == "0":
-                x = batch["images"]
-                kwargs["use_running_average"] = False
-            else:
-                x = normalize(batch["images"])
-                kwargs["train"] = True
-
             _, new_model_state = state.apply_fn(
-                params_dict,
-                x,
+                params_dict, batch['images'],
                 rngs=None,
                 mutable=mutable,
-                **kwargs)
+                use_running_average=False)
 
             # compute loss
             # [B, K,]
@@ -189,11 +153,11 @@ def launch(config, print_fn):
         metrics['lr'] = scheduler(state.step)
 
         # update train state
-        if new_model_state["batch_stats"] is None:
-            new_state = state.apply_gradients(grads=grads)
-        else:
+        if new_model_state.get("batch_stats") is not None:
             new_state = state.apply_gradients(
                 grads=grads, batch_stats=new_model_state['batch_stats'])
+        else:
+            new_state = state.apply_gradients(grads=grads)
 
         if dynamic_scale:
             new_state = new_state.replace(
@@ -213,20 +177,13 @@ def launch(config, print_fn):
         if state.batch_stats is not None:
             params_dict["batch_stats"] = state.batch_stats
 
-        kwargs = dict()
-        if config.v2 == "0":
-            x = batch["images"]
-            kwargs["use_running_average"] = True
-        else:
-            x = normalize(batch["images"])
-            kwargs["train"] = False
-
+        begin = time.time()
         _, new_model_state = state.apply_fn(
-            params_dict,
-            x,
+            params_dict, batch['images'],
             rngs=None,
             mutable='intermediates',
-            **kwargs)
+            use_running_average=True)
+        sec = time.time() - begin
 
         # compute metrics
         predictions = jax.nn.log_softmax(
@@ -241,7 +198,8 @@ def launch(config, print_fn):
         nll = jnp.sum(jnp.where(batch['marker'], nll, jnp.zeros_like(nll)))
         cnt = jnp.sum(batch['marker'])
 
-        metrics = OrderedDict({'acc': acc, 'nll': nll, 'cnt': cnt})
+        metrics = OrderedDict(
+            {'acc': acc, 'nll': nll, 'cnt': cnt, "sec": sec*cnt})
         metrics = jax.lax.psum(metrics, axis_name='batch')
         return metrics
 
@@ -256,9 +214,18 @@ def launch(config, print_fn):
     test_acc = 0.0
     test_nll = float('inf')
 
-    for epoch_idx, _ in enumerate(range(config.optim_ne), start=1):
+    wandb.init(
+        project="dsb-bnn-sgd",
+        config=vars(config),
+        mode="disabled" if config.nowandb else "online"
+    )
+    wandb.define_metric("val/loss", summary="min")
+    wandb.define_metric("val/nll", summary="min")
+    wandb.define_metric("val/acc", summary="max")
+    wandb.run.summary["params"] = sum(
+        x.size for x in jax.tree_util.tree_leaves(variables["params"]))
 
-        log_str = '[Epoch {:5d}/{:5d}] '.format(epoch_idx, config.optim_ne)
+    for epoch_idx, _ in enumerate(tqdm(range(config.optim_ne)), start=1):
         rng, data_rng = jax.random.split(rng)
 
         # ---------------------------------------------------------------------- #
@@ -273,7 +240,6 @@ def launch(config, print_fn):
         trn_metric = common_utils.get_metrics(trn_metric)
         trn_summarized = {f'trn/{k}': v for k,
                           v in jax.tree_util.tree_map(lambda e: e.mean(), trn_metric).items()}
-        log_str += ', '.join(f'{k} {v:.3e}' for k, v in trn_summarized.items())
 
         if state.batch_stats is not None:
             # synchronize batch normalization statistics
@@ -294,14 +260,15 @@ def launch(config, print_fn):
                           v in jax.tree_util.tree_map(lambda e: e.sum(), val_metric).items()}
         val_summarized['val/acc'] /= val_summarized['val/cnt']
         val_summarized['val/nll'] /= val_summarized['val/cnt']
+        val_summarized['val/sec'] /= val_summarized['val/cnt']
         del val_summarized['val/cnt']
-        log_str += ', ' + \
-            ', '.join(f'{k} {v:.3e}' for k, v in val_summarized.items())
+        val_summarized.update(trn_summarized)
+        wandb.log(val_summarized)
 
         # ---------------------------------------------------------------------- #
         # Save
         # ---------------------------------------------------------------------- #
-        if config.save and best_acc < val_summarized['val/acc']:
+        if best_acc < val_summarized['val/acc']:
 
             tst_metric = []
             tst_loader = dataloaders['tst_loader'](rng=None)
@@ -314,32 +281,30 @@ def launch(config, print_fn):
                 f'tst/{k}': v for k, v in jax.tree_util.tree_map(lambda e: e.sum(), tst_metric).items()}
             test_acc = tst_summarized['tst/acc'] / tst_summarized['tst/cnt']
             test_nll = tst_summarized['tst/nll'] / tst_summarized['tst/cnt']
+            test_sec = tst_summarized['tst/sec'] / tst_summarized['tst/cnt']
+            del tst_summarized["tst/cnt"]
+            wandb.run.summary["tst/acc"] = test_acc
+            wandb.run.summary["tst/nll"] = test_nll
+            wandb.run.summary["tst/sec"] = test_sec
 
-            log_str += ' (best_acc: {:.3e} -> {:.3e}, test_acc: {:.3e}, test_nll: {:.3e})'.format(
-                best_acc, val_summarized['val/acc'], test_acc, test_nll)
             best_acc = val_summarized['val/acc']
 
-            # _state = jax.device_get(jax.tree_util.tree_map(lambda x: x[0], state))
-            # with gfile.GFile(os.path.join("./checkpoints", config.save+'.ckpt'), 'wb') as fp:
-            #     fp.write(serialization.to_bytes(_state))
-            save_state = jax_utils.unreplicate(state)
-            ckpt = dict(model=save_state, config=vars(
-                config), best_acc=best_acc)
-            orbax_checkpointer = orbax.checkpoint.PyTreeCheckpointer()
-            checkpoints.save_checkpoint(ckpt_dir=config.save,
-                                        target=ckpt,
-                                        step=epoch_idx,
-                                        overwrite=True,
-                                        orbax_checkpointer=orbax_checkpointer)
-
-        log_str = datetime.datetime.now().strftime(
-            '[%Y-%m-%d %H:%M:%S] ') + log_str
-        print_fn(log_str)
-
+            if config.save:
+                save_state = jax_utils.unreplicate(state)
+                ckpt = dict(model=save_state, config=vars(
+                    config), best_acc=best_acc)
+                orbax_checkpointer = orbax.checkpoint.PyTreeCheckpointer()
+                checkpoints.save_checkpoint(ckpt_dir=config.save,
+                                            target=ckpt,
+                                            step=epoch_idx,
+                                            overwrite=True,
+                                            orbax_checkpointer=orbax_checkpointer)
         # wait until computations are done
         jax.random.normal(jax.random.PRNGKey(0), ()).block_until_ready()
         if jnp.isnan(trn_summarized['trn/loss']):
             break
+
+    wandb.finish()
 
 
 def main():
@@ -348,20 +313,28 @@ def main():
 
     parser = defaults.default_argument_parser()
 
-    parser.add_argument('--optim_ne', default=500, type=int)
-    parser.add_argument('--optim_lr', default=1e-4, type=float)
-    parser.add_argument('--optim_momentum', default=0.9, type=float)
-    parser.add_argument('--optim_weight_decay', default=0.0, type=float)
-    parser.add_argument('--save', default=None, type=str)
-    parser.add_argument('--seed', default=None, type=int)
-    parser.add_argument('--precision', default='fp32', type=str)
-    parser.add_argument("--optim", default="sgd", type=str)
-    parser.add_argument("--v2", default="0", type=str,
-                        choices=["18", "34", "50", "101", "152", "200", "18Local"])
+    parser.add_argument('--optim_ne', default=300, type=int,
+                        help='the number of training epochs (default: 200)')
+    parser.add_argument('--optim_lr', default=0.005, type=float,
+                        help='base learning rate (default: 0.1)')
+    parser.add_argument('--optim_momentum', default=0.9, type=float,
+                        help='momentum coefficient (default: 0.9)')
+    parser.add_argument('--optim_weight_decay', default=0.001, type=float,
+                        help='weight decay coefficient (default: 0.0001)')
+
+    parser.add_argument('--save', default=None, type=str,
+                        help='save the *.log and *.ckpt files if specified (default: False)')
+    parser.add_argument('--seed', default=2023, type=int,
+                        help='random seed for training (default: None)')
+    parser.add_argument('--precision', default='fp32', type=str,
+                        choices=['fp16', 'fp32'])
+    parser.add_argument("--optim", default="sgd", type=str,
+                        choices=["sgd", "adam"])
+    parser.add_argument("--nowandb", action="store_true")
 
     args = parser.parse_args()
 
-    if args.seed is None:
+    if args.seed < 0:
         args.seed = (
             os.getpid()
             + int(datetime.datetime.now().strftime('%S%f'))

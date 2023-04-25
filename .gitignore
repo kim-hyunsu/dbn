@@ -13,12 +13,18 @@ deprecated
 fashion/
 /fashion
 fashion
-features/
-/features
 features
-features_last/
-/features_last
+features_1mixup10
+features_1mixup10_fixed
+features_1mixupplus10
+features_fixed
 features_last
+features_last_1mixup10
+features_last_fixed
+features100
+features100_fixed
+features100_last
+features100_last_fixed
 flower102/
 /flower102
 flower102
@@ -27,3 +33,4 @@ wandb
 .venv
 images
 score_checkpoints
+tsne

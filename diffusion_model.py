@@ -22,7 +22,7 @@ import datetime
 import defaults_diffusion_model as defaults
 from tabulate import tabulate
 import sys
-import sghmc
+import sghmc_deprecated
 from giung2.data.build import build_dataloaders
 from giung2.models.layers import FilterResponseNorm
 from models.resnet import FlaxResNet
@@ -154,7 +154,7 @@ def get_ckpt_temp(ckpt_dir):
         return init({'params': key}, jnp.ones(dataloaders['image_shape'], model_dtype))
     variables = initialize_model(jax.random.PRNGKey(sghmc_config.seed), model)
 
-    sghmc_state = sghmc.get_sghmc_state(
+    sghmc_state = sghmc_deprecated.get_sghmc_state(
         sghmc_config, dataloaders, model, variables)
     sghmc_ckpt["model"] = sghmc_state
     sghmc_ckpt["ckpt_dir"] = sghmc_ckpt_dir

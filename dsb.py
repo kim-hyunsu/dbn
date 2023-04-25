@@ -1,4 +1,6 @@
 from functools import partial
+from re import I
+import time
 import os
 import math
 import orbax
@@ -35,7 +37,15 @@ from utils import pixelize, normalize_logits, unnormalize_logits, jprint, model_
 from tqdm import tqdm
 
 
-def build_featureloaders(config):
+def build_featureloaders(config, rng=None):
+    def load_arrays(dir, div, prop, mode_idx, i, length=None):
+        path = f"{dir}/{div}_{prop}_M{mode_idx}S{i}.npy"
+        if not os.path.exists(path):
+            return jnp.ones((length,))
+        with open(path, "rb") as f:
+            logits = np.load(f)
+        return logits
+
     dir = config.features_dir
     # B: current mode, A: other modes
     n_Amodes = config.n_Amodes
@@ -44,33 +54,49 @@ def build_featureloaders(config):
     n_samples_each_Amode = n_samples_each_mode
     train_Alogits_list = []
     train_Blogits_list = []
+    train_lambdas_list = []
+    train_lambdas_checker = []
     valid_Alogits_list = []
     valid_Blogits_list = []
+    valid_lambdas_list = []
     test_Alogits_list = []
     test_Blogits_list = []
+    test_lambdas_list = []
     for mode_idx in range(1+n_Amodes):  # total 1+n_Amodes
         if mode_idx == 0:  # p_B
             for i in tqdm(range(n_samples_each_Bmode)):
-                with open(f"{dir}/train_features_M{mode_idx}S{i}.npy", "rb") as f:
-                    train_logits = np.load(f)
-                with open(f"{dir}/valid_features_M{mode_idx}S{i}.npy", "rb") as f:
-                    valid_logits = np.load(f)
-                with open(f"{dir}/test_features_M{mode_idx}S{i}.npy", "rb") as f:
-                    test_logits = np.load(f)
+                train_logits = load_arrays(
+                    dir, "train", "features", mode_idx, i)
+                valid_logits = load_arrays(
+                    dir, "valid", "features", mode_idx, i)
+                test_logits = load_arrays(
+                    dir, "test", "features", mode_idx, i)
                 train_Blogits_list.append(train_logits)
                 valid_Blogits_list.append(valid_logits)
                 test_Blogits_list.append(test_logits)
+                train_lambdas = load_arrays(
+                    dir, "train", "lambdas", mode_idx, i, train_logits.shape[0])
+                valid_lambdas = load_arrays(
+                    dir, "valid", "lambdas", mode_idx, i, valid_logits.shape[0])
+                test_lambdas = load_arrays(
+                    dir, "test", "lambdas", mode_idx, i, test_logits.shape[0])
+                train_lambdas_list.append(train_lambdas)
+                valid_lambdas_list.append(valid_lambdas)
+                test_lambdas_list.append(test_lambdas)
         else:  # p_A (mixture of modes)
             for i in tqdm(range(n_samples_each_Amode)):
-                with open(f"{dir}/train_features_M{mode_idx}S{i}.npy", "rb") as f:
-                    train_logits = np.load(f)
-                with open(f"{dir}/valid_features_M{mode_idx}S{i}.npy", "rb") as f:
-                    valid_logits = np.load(f)
-                with open(f"{dir}/test_features_M{mode_idx}S{i}.npy", "rb") as f:
-                    test_logits = np.load(f)
+                train_logits = load_arrays(
+                    dir, "train", "features", mode_idx, i)
+                valid_logits = load_arrays(
+                    dir, "valid", "features", mode_idx, i)
+                test_logits = load_arrays(
+                    dir, "test", "features", mode_idx, i)
                 train_Alogits_list.append(train_logits)
                 valid_Alogits_list.append(valid_logits)
                 test_Alogits_list.append(test_logits)
+                train_lambdas = load_arrays(
+                    dir, "train", "lambdas", mode_idx, i, train_logits.shape[0])
+                train_lambdas_checker.append(train_lambdas)
 
     shift = 0
 
@@ -98,6 +124,23 @@ def build_featureloaders(config):
     test_logitsB = jnp.array(test_logitsB)
     del test_Blogits_list
 
+    train_lambdas = np.concatenate(train_lambdas_list, axis=0)
+    train_lambdas = jnp.array(train_lambdas)
+    del train_lambdas_list
+
+    train_lambdas_checker = np.concatenate(train_lambdas_checker, axis=0)
+    train_lambdas_checker = jnp.array(train_lambdas_checker)
+    assert jnp.all(train_lambdas_checker == train_lambdas)
+    del train_lambdas_checker
+
+    valid_lambdas = np.concatenate(valid_lambdas_list, axis=0)
+    valid_lambdas = jnp.array(valid_lambdas)
+    del valid_lambdas_list
+
+    test_lambdas = np.concatenate(test_lambdas_list, axis=0)
+    test_lambdas = jnp.array(test_lambdas)
+    del test_lambdas_list
+
     # classifying labels
     trn_labels = np.load(os.path.join(
         config.data_root, f'{config.data_name}/train_labels.npy'))
@@ -110,9 +153,26 @@ def build_featureloaders(config):
         trn_labels, val_labels = trn_labels[:40960], trn_labels[40960:]
         num_classes = 100
 
-    trn_labels = jnp.tile(trn_labels, [n_samples_each_Bmode])
+    if "mixup" in config.features_dir:
+        repeats = int(config.features_dir.split("mixup")[1].split("_")[0])
+    else:
+        repeats = 1
+    trn_labels = jnp.tile(trn_labels, [n_samples_each_Bmode*repeats])
     val_labels = jnp.tile(val_labels, [n_samples_each_Bmode])
     tst_labels = jnp.tile(tst_labels, [n_samples_each_Bmode])
+
+    train_logitsB = jnp.concatenate([
+        train_logitsB,
+        train_lambdas[:, None]
+    ], axis=-1)
+    valid_logitsB = jnp.concatenate([
+        valid_logitsB,
+        valid_lambdas[:, None]
+    ], axis=-1)
+    test_logitsB = jnp.concatenate([
+        test_logitsB,
+        test_lambdas[:, None]
+    ], axis=-1)
 
     train_logitsA = jnp.concatenate([
         train_logitsA,
@@ -126,6 +186,24 @@ def build_featureloaders(config):
         test_logitsA,
         tst_labels[:, None]
     ], axis=-1)
+
+    def mix_dataset(rng, train_logits, valid_logits):
+        assert len(train_logits) == len(valid_logits)
+        div = len(train_logits)
+        train_logits = jnp.stack(train_logits, axis=-1)
+        valid_logits = jnp.stack(valid_logits, axis=-1)
+        train_length = train_logits.shape[0]
+        logits = jnp.concatenate([train_logits, valid_logits], axis=0)
+        mixed_logits = jax.random.permutation(rng, logits, axis=0)
+        _train_logits = mixed_logits[:train_length]
+        _valid_logits = mixed_logits[train_length:]
+        train_logits = (_train_logits[..., i] for i in range(div))
+        valid_logits = (_valid_logits[..., i] for i in range(div))
+        return train_logits, valid_logits
+
+    if config.take_valid:
+        (train_logitsB, train_logitsA), (valid_logitsB, valid_logitsA) = mix_dataset(
+            rng, [train_logitsB, train_logitsA], [valid_logitsB, valid_logitsA])
 
     dataloaders = dict(
         train_length=len(train_logitsA),
@@ -172,6 +250,17 @@ def build_featureloaders(config):
     )
     normalize = partial(normalize_logits,  features_dir=dir)
     unnormalize = partial(unnormalize_logits,  features_dir=dir)
+
+    def get_data(batch, key):
+        array = batch[key]
+        logits, scalar = jnp.split(
+            array, [array.shape[-1]-1], axis=-1
+        )
+        logits = jnp.where(
+            batch["marker"][..., None], logits, float("nan")*jnp.ones_like(logits))
+        lambdas = jnp.squeeze(scalar, axis=-1)
+        return logits, lambdas
+
     if config.get_stats:
         # >------------------------------------------------------------------
         # > Compute statistics (mean, std)
@@ -179,21 +268,15 @@ def build_featureloaders(config):
         count = 0
         sum = 0
         for batch in dataloaders["trn_featureloader"](rng=None):
-            logitsB = batch["images"]
-            logitsA, labels = jnp.split(
-                batch["labels"], [logitsB.shape[-1]], axis=-1)
-            logitsB = jnp.where(
-                batch["marker"][..., None], logitsB, jnp.zeros_like(logitsB))
-            logitsA = jnp.where(
-                batch["marker"][..., None], logitsA, jnp.zeros_like(logitsA))
+            logitsB, _ = get_data(batch, "images")
+            logitsA, _ = get_data(batch, "labels")
             sum += jnp.sum(logitsB, [0, 1])+jnp.sum(logitsA, [0, 1])
             count += 2*batch["marker"].sum()
         mean = sum/count
         sum = 0
         for batch in dataloaders["trn_featureloader"](rng=None):
-            logitsB = batch["images"]
-            logitsA, labels = jnp.split(
-                batch["labels"], [logitsB.shape[-1]], axis=-1)
+            logitsB, _ = get_data(batch, "images")
+            logitsA, _ = get_data(batch, "labels")
             mseB = jnp.where(
                 batch["marker"][..., None], (logitsB-mean)**2, jnp.zeros_like(logitsB))
             mseA = jnp.where(
@@ -207,13 +290,14 @@ def build_featureloaders(config):
         print("std", std)
         assert False, "Terminate Program"
 
-    return dataloaders, normalize, unnormalize
+    return dataloaders, normalize, unnormalize, get_data
 
 
 class TrainState(train_state.TrainState):
     batch_stats: Any
     rng: Any
     dynamic_scale: dynamic_scale_lib.DynamicScale
+    ema_params: Any
 
     betas: Tuple
     n_T: int
@@ -259,7 +343,7 @@ class TrainState(train_state.TrainState):
         x_n = x0  # (B, d)
 
         def body_fn(n, val):
-            rng, x_n, dir = val
+            rng, x_n = val
             idx = self.n_T - n
             rng = jax.random.fold_in(rng, idx)
             t_n = jnp.array([idx/self.n_T])  # (1,)
@@ -278,18 +362,27 @@ class TrainState(train_state.TrainState):
             mean = alpos_weight_t*x_0_eps + (1-alpos_weight_t)*x_n
             x_n = mean + std * h  # (B, d)
 
-            return rng, x_n, dir
+            return rng, x_n
 
-        dir = jnp.zeros_like(x_n, dtype=bool)
-        _, x_n, _ = jax.lax.fori_loop(0, self.n_T, body_fn, (rng, x_n, dir))
+        _, x_n = jax.lax.fori_loop(0, self.n_T, body_fn, (rng, x_n))
 
         return x_n
 
 
 def launch(config, print_fn):
     rng = jax.random.PRNGKey(config.seed)
-    init_rng, rng = jax.random.split(rng)
+    init_rng, data_rng, rng = jax.random.split(rng, 3)
 
+    if config.features_dir in logit_dir_list:
+        if config.data_name == "CIFAR100_x32":
+            x_dim = 100
+        else:
+            x_dim = 10
+    elif config.features_dir in feature_dir_list:
+        if config.data_name == "CIFAR100_x32":
+            x_dim = 100
+        else:
+            x_dim = 64
     # specify precision
     model_dtype = jnp.float32
     if config.precision == 'fp16':
@@ -297,24 +390,19 @@ def launch(config, print_fn):
         )[0].platform == 'tpu' else jnp.float16
 
     # build dataloaders
-    dataloaders, normalize, unnormalize = build_featureloaders(config)
+    dataloaders, normalize, unnormalize, get_data = build_featureloaders(
+        config, data_rng)
     config.n_classes = dataloaders["num_classes"]
 
     beta1 = config.beta1
     beta2 = config.beta2
     dsb_stats = dsb_schedules(beta1, beta2, config.T)
-    # for k, v in dsb_stats.items():
-    #     print(f"{k}: {v}")
-
-    if config.features_dir in logit_dir_list:
-        x_dim = 10
-    elif config.features_dir in feature_dir_list:
-        x_dim = 64
 
     score_func = FeatureUnet(
         in_channels=x_dim,
         ver=config.version,
         n_feat=config.n_feat,
+        droprate=config.droprate
     )
 
     classifier = FlaxResNetClassifier(
@@ -326,7 +414,7 @@ def launch(config, print_fn):
         return model.init(
             {'params': key},
             x=jnp.empty((1, x_dim), model_dtype),
-            t=jnp.empty((1,))
+            t=jnp.empty((1,)), training=False
         )
     variables = initialize_model(init_rng, score_func)
     variables_clsB = initialize_model(init_rng, classifier)
@@ -344,10 +432,12 @@ def launch(config, print_fn):
 
         return variables_cls
 
+    name = config.data_name
+    style = config.model_style
     variables_clsB = load_classifier(
-        variables_clsB, model_list[0])  # current mode
+        variables_clsB, model_list(name, style)[0])  # current mode
     variables_clsA = load_classifier(
-        variables_clsA, model_list[1])  # target mode
+        variables_clsA, model_list(name, style)[1])  # target mode
 
     dynamic_scale = None
     if config.precision == 'fp16' and jax.local_devices()[0].platform == 'gpu':
@@ -363,6 +453,7 @@ def launch(config, print_fn):
     state = TrainState.create(
         apply_fn=score_func.apply,
         params=variables["params"],
+        ema_params=variables["params"],
         tx=optimizer,
         batch_stats=variables.get("batch_stats"),
         rng=init_rng,
@@ -377,30 +468,12 @@ def launch(config, print_fn):
         loss = jnp.sum((noise-output)**2, axis=1)
         return loss
 
-    def accuracy(f_gen, labels, marker, mode="A"):
-        if f_gen.shape[-1] == 10:
-            logits = f_gen
-        else:
-            if mode.lower() == "a":
-                variables_cls_params = variables_clsA["params"]
-            elif mode.lower() == "b":
-                variables_cls_params = variables_clsB["params"]
-            logits = classifier.apply(
-                {"params": variables_cls_params}, f_gen
-            )
-        predictions = jax.nn.log_softmax(logits, axis=-1)
-        acc = evaluate_acc(
-            predictions, labels, log_input=True, reduction="none"
-        )
-        acc = jnp.sum(jnp.where(marker, acc, jnp.zeros_like(acc)))
-        return acc
-
     def ensemble_accuracy(f_list, labels, marker, mode):
         assert len(f_list) == len(mode)
         avg_logits = 0
         each_acc = []
         for m, f_gen in zip(mode, f_list):
-            if f_gen.shape[-1] == 10:
+            if "last" not in config.features_dir:
                 logits = f_gen
             else:
                 if m.lower() == "a":
@@ -433,7 +506,7 @@ def launch(config, print_fn):
         return (acc, nll), each_acc
 
     def cross_entropy(f_gen, labels, mode="A"):
-        if f_gen.shape[-1] == 10:
+        if "last" not in config.features_dir:
             logits = f_gen
         else:
             if mode.lower() == "a":
@@ -469,10 +542,9 @@ def launch(config, print_fn):
     # training
 
     def step_train(state, batch, config):
-        logitsB = batch["images"]  # the current mode
+        logitsB, lambdas = get_data(batch, "images")  # the current mode
         # mixture of other modes
-        logitsA, labels = jnp.split(
-            batch["labels"], [logitsB.shape[-1]], axis=-1)
+        logitsA, labels = get_data(batch, "labels")
         logitsB = normalize(logitsB)
         logitsA = normalize(logitsA)
 
@@ -480,12 +552,13 @@ def launch(config, print_fn):
             logits_t, sigma_t, kwargs = state.forward(
                 logitsA, logitsB, training=True, rng=state.rng)
             params_dict = dict(params=params)
+            rngs_dict = dict(dropout=state.rng)
             mutable = []
             if state.batch_stats is not None:
                 params_dict["batch_stats"] = state.batch_stats
                 mutable.append("batch_stats")
             epsilon, new_model_state = state.apply_fn(
-                params_dict, logits_t, mutable=mutable, **kwargs)
+                params_dict, logits_t, mutable=mutable, rngs=rngs_dict, **kwargs)
             diff = (logits_t - logitsA) / sigma_t[:, None]
             loss = mse_loss(epsilon, diff)
             celoss = cross_entropy(unnormalize(logits_t), labels)
@@ -516,6 +589,12 @@ def launch(config, print_fn):
             lambda g, p: g + config.optim_weight_decay * p, grads, state.params)
         new_state = state.apply_gradients(
             grads=grads, batch_stats=new_model_state.get('batch_stats'))
+        a = config.ema_decay
+        new_state = new_state.replace(
+            ema_params=jax.tree_util.tree_map(
+                lambda wt, ema_tm1: jnp.where(a < 1, a*wt + (1-a)*ema_tm1, wt),
+                new_state.params,
+                new_state.ema_params))
         metrics = jax.lax.psum(metrics, axis_name="batch")
 
         if dynamic_scale:
@@ -529,17 +608,18 @@ def launch(config, print_fn):
         return new_state, metrics
 
     def step_valid(state, batch):
-        logitsB = batch["images"]
-        logitsA, _ = jnp.split(
-            batch["labels"], [logitsB.shape[-1]], axis=-1)
+        logitsB, lambdas = get_data(batch, "images")
+        logitsA, _ = get_data(batch, "labels")
         logitsB = normalize(logitsB)
         logitsA = normalize(logitsA)
         logits_t, sigma_t, kwargs = state.forward(
             logitsA, logitsB, training=False, rng=state.rng)
-        params_dict = dict(params=state.params)
+        params_dict = dict(params=state.ema_params)
+        rngs_dict = dict(dropout=state.rng)
         if state.batch_stats is not None:
             params_dict["batch_stats"] = state.batch_stats
-        output = state.apply_fn(params_dict, logits_t, **kwargs)
+        output = state.apply_fn(params_dict, logits_t,
+                                rngs=rngs_dict, **kwargs)
         diff = (logits_t - logitsA) / sigma_t[:, None]
         loss = mse_loss(output, diff)
         loss = jnp.where(batch["marker"], loss, jnp.zeros_like(loss))
@@ -552,19 +632,21 @@ def launch(config, print_fn):
 
     def step_sample(state, batch, config):
         def apply(x_n, t_n):
-            params_dict = dict(params=state.params)
+            params_dict = dict(params=state.ema_params)
+            rngs_dict = dict(dropout=state.rng)
             if state.batch_stats is not None:
                 params_dict["batch_stats"] = state.batch_stats
-            output = state.apply_fn(params_dict, x=x_n, t=t_n, training=False)
+            output = state.apply_fn(
+                params_dict, x=x_n, t=t_n, rngs=rngs_dict, training=False)
             return output
-        _logitsB = batch["images"]  # current mode
-        _logitsA, labels = jnp.split(
-            batch["labels"], [_logitsB.shape[-1]], axis=-1)
-        labels = jnp.squeeze(labels, -1)
+        _logitsB, lambdas = get_data(batch, "images")  # current mode
+        _logitsA, labels = get_data(batch, "labels")
         logitsB = normalize(_logitsB)
         logitsA = normalize(_logitsA)
+        begin = time.time()
         f_gen = state.sample(
             state.rng, apply, logitsB, dsb_stats)
+        sec = time.time()-begin
         f_gen = unnormalize(f_gen)
         f_real = _logitsA
         f_init = _logitsB
@@ -574,29 +656,36 @@ def launch(config, print_fn):
         (ens_acc, ens_nll), ((b_acc, b_nll), (a_acc, a_nll)) = ensemble_accuracy(
             [f_init, f_gen], labels, batch["marker"], ["B", "A"])
         count = jnp.sum(batch["marker"])
-        kld = kl_divergence(f_gen, f_real, batch["marker"])
+        kld = kl_divergence(f_real, f_gen, batch["marker"])
+        rkld = kl_divergence(f_gen, f_real, batch["marker"])
+        skld = kl_divergence(f_gen, f_init, batch["marker"])
+        rskld = kl_divergence(f_init, f_gen, batch["marker"])
 
         metrics = OrderedDict({
             "acc": a_acc, "nll": a_nll,
             "ens_acc": ens_acc, "ens_nll": ens_nll,
-            "count": count, "kld": kld
+            "count": count, "kld": kld,
+            "rkld": rkld, "skld": skld,
+            "rskld": rskld,
+            "sec": sec*count
         })
         metrics = jax.lax.psum(metrics, axis_name='batch')
 
         return f_all, metrics
 
     def step_acc_ref(state, batch):
-        _logitsB = batch["images"]  # current mode
-        _logitsA, labels = jnp.split(
-            batch["labels"], [_logitsB.shape[-1]], axis=-1)
-        labels = jnp.squeeze(labels, -1)
+        _logitsB, lambdas = get_data(batch, "images")  # current mode
+        _logitsA, labels = get_data(batch, "labels")
         f_real = _logitsA
         f_init = _logitsB
         (ens_acc, ens_nll), ((b_acc, b_nll), (a_acc, a_nll)) = ensemble_accuracy(
             [f_init, f_real], labels, batch["marker"], ["B", "A"])
+        rkld = kl_divergence(f_init, f_real, batch["marker"])
+        kld = kl_divergence(f_real, f_init, batch["marker"])
         metrics = OrderedDict(
             {"acc_ref": a_acc, "nll_ref": a_nll,
-             "ens_acc_ref": ens_acc, "ens_nll_ref": ens_nll})
+             "ens_acc_ref": ens_acc, "ens_nll_ref": ens_nll,
+             "kld_ref": kld, "rkld_ref": rkld})
         metrics = jax.lax.psum(metrics, axis_name='batch')
         return metrics
 
@@ -612,12 +701,13 @@ def launch(config, print_fn):
 
     def log_wandb(object):
         to_summary = [
-            "trn/acc_ref", "trn/nll_ref", "trn/ens_acc_ref", "trn/ens_nll_ref",
-            "val/acc_ref", "val/nll_ref", "val/ens_acc_ref", "val/ens_nll_ref",
-            "tst/acc_ref", "tst/nll_ref", "tst/ens_acc_ref", "tst/ens_nll_ref",
+            "trn/acc_ref", "trn/nll_ref", "trn/ens_acc_ref", "trn/ens_nll_ref", "trn/kld_ref", "trn/rkld_ref",
+            "val/acc_ref", "val/nll_ref", "val/ens_acc_ref", "val/ens_nll_ref", "val/kld_ref", "val/rkld_ref",
+            "tst/acc_ref", "tst/nll_ref", "tst/ens_acc_ref", "tst/ens_nll_ref", "tst/kld_ref", "tst/rkld_ref",
             "tst/acc", "tst/nll",
             "tst/ens_acc", "tst/ens_nll",
-            "tst/loss", "tst/kld", "tst/ens_nll",
+            "tst/loss", "tst/kld", "tst/rkld", "tst/skld", "tst/rkld"
+            "tst/sec", "val/sec", "trn/sec"
         ]
         for k in to_summary:
             value = object.get(k)
@@ -653,6 +743,8 @@ def launch(config, print_fn):
     wandb.define_metric("val/acc", summary="max")
     wandb.define_metric("val/ens_acc", summary="max")
     wandb.define_metric("val/ens_nll", summary="min")
+    wandb.run.summary["params"] = sum(
+        x.size for x in jax.tree_util.tree_leaves(variables["params"]))
 
     for epoch_idx, _ in enumerate(tqdm(range(config.optim_ne)), start=1):
         rng = jax.random.fold_in(rng, epoch_idx)
@@ -673,7 +765,7 @@ def launch(config, print_fn):
                 if batch_idx == dataloaders["trn_steps_per_epoch"]:
                     save_samples(state, batch, epoch_idx, train=True)
             else:
-                if (epoch_idx+1) % 1 == 0:
+                if (epoch_idx+1) % 50 == 0:
                     _, acc_metrics = p_step_sample(state, batch)
                     metrics.update(acc_metrics)
 
@@ -776,11 +868,11 @@ def main():
 
     parser.add_argument('--optim_ne', default=300, type=int,
                         help='the number of training epochs (default: 200)')
-    parser.add_argument('--optim_lr', default=1e-4, type=float,
+    parser.add_argument('--optim_lr', default=1e-3, type=float,
                         help='base learning rate (default: 1e-4)')
     parser.add_argument('--optim_momentum', default=0.9, type=float,
                         help='momentum coefficient (default: 0.9)')
-    parser.add_argument('--optim_weight_decay', default=1e-4, type=float,
+    parser.add_argument('--optim_weight_decay', default=1e-5, type=float,
                         help='weight decay coefficient (default: 0.0001)')
     parser.add_argument('--save', default=None, type=str,
                         help='save the *.log and *.ckpt files if specified (default: False)')
@@ -789,8 +881,8 @@ def main():
     parser.add_argument('--precision', default='fp32', type=str,
                         choices=['fp16', 'fp32'])
     parser.add_argument("--T", default=50, type=int)
-    parser.add_argument("--n_feat", default=64, type=int)
-    parser.add_argument("--beta1", default=1e-4, type=float)
+    parser.add_argument("--n_feat", default=256, type=int)
+    parser.add_argument("--beta1", default=1e-3, type=float)
     parser.add_argument("--beta2", default=0.02, type=float)
     parser.add_argument("--features_dir", default="features_fixed", type=str)
     parser.add_argument("--version", default="v1.0", type=str)
@@ -800,6 +892,9 @@ def main():
     parser.add_argument("--get_stats", action="store_true")
     parser.add_argument("--n_Amodes", default=1, type=int)
     parser.add_argument("--n_samples_each_mode", default=1, type=int)
+    parser.add_argument("--take_valid", action="store_true")
+    parser.add_argument("--droprate", default=0., type=float)
+    parser.add_argument("--ema_decay", default=1., type=float)
 
     args = parser.parse_args()
 
@@ -835,6 +930,14 @@ def main():
     log_str = datetime.datetime.now().strftime(
         '[%Y-%m-%d %H:%M:%S] ') + log_str
     print_fn(log_str)
+
+    settings = __import__(f"{args.features_dir}.settings", fromlist=[""])
+    for k, v in vars(settings).items():
+        if "__" in k:
+            continue
+        if isinstance(v, int) or isinstance(v, float) or isinstance(v, str) or isinstance(v, bool):
+            setattr(args, k, v)
+    del settings
 
     log_str = ''
     max_k_len = max(map(len, vars(args).keys()))

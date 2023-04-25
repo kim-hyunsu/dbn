@@ -1,4 +1,5 @@
 from tqdm import tqdm
+import argparse
 from flax import jax_utils
 from giung2.data.build import build_dataloaders
 import jax
@@ -6,8 +7,8 @@ import jax.numpy as jnp
 from flax.training import checkpoints
 from giung2.models.layers import FilterResponseNorm
 from models.resnet import FlaxResNet
+import sghmc_deprecated
 import sghmc
-import sghmc2
 from functools import partial
 import flax
 from easydict import EasyDict
@@ -68,10 +69,10 @@ def get_ckpt_temp(ckpt_dir):
     variables = initialize_model(init_rng, model)
 
     if variables.get("batch_stats") is not None:
-        sghmc_state = sghmc2.get_sghmc_state(
+        sghmc_state = sghmc.get_sghmc_state(
             sghmc_config, dataloaders, model, variables)
     else:
-        sghmc_state = sghmc.get_sghmc_state(
+        sghmc_state = sghmc_deprecated.get_sghmc_state(
             sghmc_config, dataloaders, model, variables)
 
     sghmc_ckpt["model"] = sghmc_state
@@ -79,8 +80,8 @@ def get_ckpt_temp(ckpt_dir):
     return sghmc_config, sghmc_ckpt, rng
 
 
-def load_classifer_state(mode_idx, sample_idx, template):
-    sghmc_ckpt_dir = model_list[mode_idx]
+def load_classifer_state(model_dir, sample_idx, template):
+    sghmc_ckpt_dir = model_dir
     if not sghmc_ckpt_dir.endswith("sghmc"):
         sghmc_ckpt_dir = os.path.join(sghmc_ckpt_dir, "sghmc")
     sghmc_ckpt = checkpoints.restore_checkpoint(
@@ -88,6 +89,78 @@ def load_classifer_state(mode_idx, sample_idx, template):
     )
     state = sghmc_ckpt["model"]
     return state, sghmc_ckpt
+
+
+class Bank():
+    def __init__(self, num_classes, maxlen=128):
+        self.bank = [jnp.array([]) for _ in range(num_classes)]
+        self.len = [0 for _ in range(num_classes)]
+        self.num_classes = num_classes
+        self.maxlen = maxlen
+        self.cached = None
+
+    def _squeeze(self, batch):
+        assert len(batch["images"].shape) == 5
+        images = batch["images"]
+        images = images.reshape(-1, *images.shape[2:])
+        labels = batch["labels"].reshape(-1, 1)
+        marker = batch["marker"].reshape(-1, 1)
+        return images, labels, marker
+
+    def _unpack(self, batch):
+        assert len(batch["images"].shape) == 4
+        images = batch["images"]
+        labels = batch["labels"]
+        marker = batch["marker"]
+        return images, labels, marker
+
+    def deposit(self, batch):
+        images, labels, marker = self._unpack(batch)
+        self._deposit(images, labels, marker)
+
+    def _deposit(self, images, labels, marker):
+        shape = images.shape
+        images = images[marker, ...]
+        if self.cached is None:
+            self.bank = list(
+                map(lambda x: x.reshape(-1, *shape[1:]), self.bank))
+
+        # def func(i, val):
+        def func(i):
+            in_class = images[labels == i, ...]
+            length = len(in_class)
+            exceed = len(self.bank[i]) + length - self.maxlen
+            if exceed > 0:
+                self.bank[i] = self.bank[i][exceed:]
+            self.bank[i] = jnp.concatenate([self.bank[i], in_class], axis=0)
+            self.len[i] = len(self.bank[i])
+            return val
+        # val = jax.lax.fori_loop(0, self.num_classes, func, None)
+        val = map(func, range(self.num_classes))
+        min_len = min(self.len)
+        # self.cached = jnp.array([t[-min_len:] for t in self.bank])
+
+        def func(x):
+            return x[-min_len:]
+        cached = list(map(func, self.bank))
+        self.cached = jnp.stack(cached)
+
+    def withdraw(self, rng, batch):
+        images, labels, marker = self._unpack(batch)
+        assert len(images.shape) == 4
+        out = self._withdraw(rng, labels)
+        if out is None:
+            return images
+        assert out.shape == images.shape
+        return out
+
+    def _withdraw(self, rng, labels):
+        min_len = min(self.len)
+        if min_len == 0:
+            return None
+        indices = jax.random.randint(rng, (len(labels),), 0, min_len)
+        new = self.cached[labels, indices]
+        return new
 
 
 def mixup_data(rng, batch, alpha=1.0):
@@ -107,16 +180,59 @@ def mixup_data(rng, batch, alpha=1.0):
     return batch
 
 
+def mixup_inclass(rng, batch, bank, alpha=1.0):
+    rng = jax_utils.unreplicate(rng)
+    shapes = dict(
+        images=batch["images"].shape,
+        labels=batch["labels"].shape,
+        marker=batch["marker"].shape)
+    assert len(shapes["images"]) == 5
+    batch["images"] = batch["images"].reshape(-1, *shapes["images"][2:])
+    batch["labels"] = batch["labels"].reshape(-1, *shapes["labels"][2:])
+    batch["marker"] = batch["marker"].reshape(-1, *shapes["marker"][2:])
+
+    x = batch["images"]
+    y = batch["labels"]
+    bank.deposit(batch)
+
+    beta_rng, perm_rng = jax.random.split(rng)
+    lam = jnp.where(alpha > 0, jax.random.beta(beta_rng, alpha, alpha), 1)
+    ingredient = bank.withdraw(perm_rng, batch)
+
+    mixed_x = lam*x + (1-lam)*ingredient
+    batch["images"] = mixed_x.reshape(*shapes["images"])
+    batch["lambdas"] = jnp.tile(
+        lam, reps=[x.shape[0]]).reshape(*shapes["labels"])
+    batch["labels"] = batch["labels"].reshape(*shapes["labels"])
+    batch["marker"] = batch["marker"].reshape(*shapes["marker"])
+    return batch
+
+
 if __name__ == "__main__":
     """
     'logits' and 'features' are used compatibly as terms of any features of a given data
     """
-    config, ckpt, rng = get_ckpt_temp(model_list[0])
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--dir", default="features_1mixupplus10", type=str)
+    args = parser.parse_args()
+    dir = args.dir
+
+    settings = __import__(f"{dir}.settings", fromlist=[""])
+    data_name = settings.data_name
+    model_style = settings.model_style
+    config, ckpt, rng = get_ckpt_temp(model_list(data_name, model_style)[0])
+    config.optim_bs = 512
     n_samples_each_mode = 30
-    n_modes = len(model_list)
+    n_modes = len(model_list(data_name, model_style))
     dataloaders = build_dataloaders(config)
-    dir = "features_last_1mixup"
-    alpha = float(dir.split("mixup")[0].split("_")[-1])
+    if "mixupplus" in dir:
+        sep = "mixupplus"
+    else:
+        sep = "mixup"
+    alpha = float(
+        dir.split(sep)[0].split("_")[-1]) if sep in dir else -1
+    repeats = int(
+        dir.split(sep)[1].split("_")[0]) if sep in dir else 1
 
     def get_logits(state, batch, feature_name="feature.vector"):
         x = batch["images"]
@@ -142,36 +258,50 @@ if __name__ == "__main__":
     else:
         raise Exception("Invalid directory for saving features")
 
-    p_mixup_data = jax.pmap(
-        partial(mixup_data, alpha=alpha if dir.endswith("mixup") else -1), axis_name="batch")
+    if data_name == "CIFAR100_x32":
+        num_classes = 100
+    elif data_name == "CIFAR10_x32":
+        num_classes = 10
 
+    bank = Bank(num_classes)
+    if "mixupplus" in dir:
+        p_mixup_data = partial(mixup_inclass, bank=bank, alpha=alpha)
+    else:
+        p_mixup_data = jax.pmap(
+            partial(mixup_data, alpha=alpha), axis_name="batch")
+
+    data_rng, rng = jax.random.split(rng)
     for mode_idx in range(n_modes):
-        rng = jax.random.fold_in(rng, mode_idx)
         for i in tqdm(range(n_samples_each_mode)):
-            rng = jax.random.fold_in(rng, i)
             feature_path = f"{dir}/train_features_M{mode_idx}S{i}.npy"
             lambda_path = f"{dir}/train_lambdas_M{mode_idx}S{i}.npy"
             if os.path.exists(feature_path):
                 continue
 
-            classifier_state, _ = load_classifer_state(mode_idx, i+1, ckpt)
+            model_dir = model_list(data_name, model_style)[mode_idx]
+            classifier_state, _ = load_classifer_state(model_dir, i+1, ckpt)
             classifier_state = jax_utils.replicate(classifier_state)
             # train set
-            train_loader = dataloaders["trn_loader"](rng=None)
-            train_loader = jax_utils.prefetch_to_device(train_loader, size=2)
             logits_list = []
             lambdas_list = []
-            for batch_idx, batch in enumerate(train_loader, start=1):
-                rng = jax.random.fold_in(rng, batch_idx)
-                batch = p_mixup_data(jax_utils.replicate(rng), batch)
-                _logits = p_get_logits(classifier_state, batch)
-                logits = _logits[batch["marker"] ==
-                                 True].reshape(-1, _logits.shape[-1])
-                assert len(logits.shape) == 2
-                lambdas = batch["lambdas"][batch["marker"] == True]
-                assert len(lambdas.shape) == 1
-                logits_list.append(logits)
-                lambdas_list.append(lambdas)
+            for rep in range(repeats):
+                train_rng = jax.random.fold_in(rng, rep)
+                _, mixup_rng = jax.random.split(train_rng)
+                train_loader = dataloaders["trn_loader"](rng=None)
+                train_loader = jax_utils.prefetch_to_device(
+                    train_loader, size=2)
+                for batch_idx, batch in enumerate(train_loader, start=1):
+                    b_mixup_rng = jax.random.fold_in(mixup_rng, batch_idx)
+                    batch = p_mixup_data(
+                        jax_utils.replicate(b_mixup_rng), batch)
+                    _logits = p_get_logits(classifier_state, batch)
+                    logits = _logits[batch["marker"] ==
+                                     True].reshape(-1, _logits.shape[-1])
+                    assert len(logits.shape) == 2
+                    lambdas = batch["lambdas"][batch["marker"] == True]
+                    assert len(lambdas.shape) == 1
+                    logits_list.append(logits)
+                    lambdas_list.append(lambdas)
             logits = jnp.concatenate(logits_list, axis=0)
             lambdas = jnp.concatenate(lambdas_list, axis=0)
             with open(feature_path, "wb") as f:

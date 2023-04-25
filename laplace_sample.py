@@ -15,7 +15,7 @@ import math
 from easydict import EasyDict
 import os
 from tqdm import tqdm
-from sgd import TrainState
+from sgd_deprecated import TrainState
 from flax.training import dynamic_scale as dynamic_scale_lib
 import optax
 

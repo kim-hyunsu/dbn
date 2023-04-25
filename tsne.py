@@ -22,7 +22,7 @@ from functools import partial
 import os
 from easydict import EasyDict
 from typing import Any
-import sghmc
+import sghmc_deprecated
 
 
 class TrainStateBatch(train_state.TrainState):
@@ -133,8 +133,8 @@ if __name__ == "__main__":
         return init({'params': key}, jnp.ones(dataloaders['image_shape'], model.dtype))
     variables = initialize_model(jax.random.PRNGKey(sgd_config.seed), model)
 
-    sgd_state = sghmc.get_sgd_state(sgd_config, dataloaders, model, variables)
-    sghmc_state = sghmc.get_sghmc_state(
+    sgd_state = sghmc_deprecated.get_sgd_state(sgd_config, dataloaders, model, variables)
+    sghmc_state = sghmc_deprecated.get_sghmc_state(
         sghmc_config, dataloaders, model, variables)
     samples = []
     indices = []

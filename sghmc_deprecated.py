@@ -4,7 +4,6 @@ from giung2.models.layers import FilterResponseNorm
 from models.resnet import FlaxResNet
 from giung2.data.build import build_dataloaders
 import defaults_sghmc as defaults
-from tensorflow.io import gfile
 from flax.training import common_utils, train_state, checkpoints
 from flax import jax_utils
 from flax.training import dynamic_scale as dynamic_scale_lib
@@ -23,7 +22,7 @@ import os
 import sys
 from easydict import EasyDict
 import orbax
-import sgd2
+import sgd_deprecated
 sys.path.append('./')
 
 
@@ -37,22 +36,27 @@ def get_sgd_state(config, dataloaders, model, variables):
     scheduler = optax.cosine_decay_schedule(
         init_value=config.optim_lr,
         decay_steps=config.optim_ne * dataloaders['trn_steps_per_epoch'])
-    if config.optim == "sgd":
-        optimizer = optax.sgd(
-            learning_rate=scheduler,
-            momentum=config.optim_momentum)
-    elif config.optim == "adam":
-        optimizer = optax.adam(
-            learning_rate=scheduler)
+    optimizer = optax.sgd(
+        learning_rate=scheduler,
+        momentum=config.optim_momentum)
 
-    # build train state
-    state = sgd2.TrainState.create(
-        apply_fn=model.apply,
-        params=variables['params'],
-        tx=optimizer,
-        image_stats=variables.get('image_stats'),
-        batch_stats=variables.get('batch_stats'),
-        dynamic_scale=dynamic_scale)
+    if config.model_style == "BN-ReLU":
+        # build train state
+        state = sgd_deprecated.TrainStateBatch.create(
+            apply_fn=model.apply,
+            params=variables['params'],
+            tx=optimizer,
+            image_stats=variables['image_stats'],
+            batch_stats=variables['batch_stats'],
+            dynamic_scale=dynamic_scale)
+    elif config.model_style == "FRN-Swish":
+        # build train state
+        state = sgd_deprecated.TrainState.create(
+            apply_fn=model.apply,
+            params=variables['params'],
+            tx=optimizer,
+            image_stats=variables['image_stats'],
+            dynamic_scale=dynamic_scale)
 
     return state
 
@@ -87,13 +91,21 @@ def get_sghmc_state(config, dataloaders, model, variables):
         learning_rate=scheduler,
         alpha=(1.0 - config.optim_momentum))
 
-    # build train state
-    state = TrainState.create(
-        apply_fn=model.apply,
-        params=variables['params'],
-        tx=optimizer,
-        image_stats=variables.get('image_stats'),
-        batch_stats=variables.get("batch_stats"))
+    if config.model_style == "FRN-Swish":
+        # build train state
+        state = TrainState.create(
+            apply_fn=model.apply,
+            params=variables['params'],
+            tx=optimizer,
+            image_stats=variables['image_stats'])
+    elif config.model_style == "BN-ReLU":
+        # build train state
+        state = TrainStateBatch.create(
+            apply_fn=model.apply,
+            params=variables['params'],
+            tx=optimizer,
+            image_stats=variables['image_stats'],
+            batch_stats=variables["batch_stats"])
 
     return state
 
@@ -105,6 +117,24 @@ class SGHMCState(NamedTuple):
 
 
 class TrainState(train_state.TrainState):
+    image_stats: Any
+    # dynamic_scale: dynamic_scale_lib.DynamicScale
+
+    def apply_gradients(self, *, grads, **kwargs):
+        updates, new_opt_state = self.tx.update(
+            gradients=grads,
+            state=self.opt_state,
+            params=self.params,
+            temperature=kwargs.pop('temperature', 1.0))
+        new_params = optax.apply_updates(self.params, updates)
+        return self.replace(
+            step=self.step + 1,
+            params=new_params,
+            opt_state=new_opt_state,
+            **kwargs)
+
+
+class TrainStateBatch(train_state.TrainState):
     image_stats: Any
     batch_stats: Any
     # dynamic_scale: dynamic_scale_lib.DynamicScale
@@ -255,13 +285,21 @@ def launch(config, print_fn):
         learning_rate=scheduler,
         alpha=(1.0 - config.optim_momentum))
 
-    # build train state
-    state = TrainState.create(
-        apply_fn=model.apply,
-        params=variables['params'],
-        tx=optimizer,
-        image_stats=variables.get('image_stats'),
-        batch_stats=variables.get("batch_stats"))
+    if config.model_style == "FRN-Swish":
+        # build train state
+        state = TrainState.create(
+            apply_fn=model.apply,
+            params=variables['params'],
+            tx=optimizer,
+            image_stats=variables['image_stats'])
+    elif config.model_style == "BN-ReLU":
+        # build train state
+        state = TrainStateBatch.create(
+            apply_fn=model.apply,
+            params=variables['params'],
+            tx=optimizer,
+            image_stats=variables['image_stats'],
+            batch_stats=variables["batch_stats"])
 
     if config.ckpt:
         sgd_config = EasyDict(ckpt["config"])
@@ -271,16 +309,17 @@ def launch(config, print_fn):
             ckpt_dir=config.ckpt, target=ckpt
         )
         sgd_state = ckpt["model"]
-
-        if sgd_state.batch_stats is not None:
+        if config.model_style == "FRN-Swish":
+            state = state.replace(
+                params=sgd_state.params,
+                image_stats=sgd_state.image_stats)
+        elif config.model_style == "BN-ReLU":
             state = state.replace(
                 params=sgd_state.params,
                 image_stats=sgd_state.image_stats,
                 batch_stats=sgd_state.batch_stats)
         else:
-            state = state.replace(
-                params=sgd_state.params,
-                image_stats=sgd_state.image_stats)
+            raise Exception("Invalid model style")
         del ckpt
         del sgd_state
         config.save = os.path.join(config.ckpt, "sghmc")
@@ -289,20 +328,28 @@ def launch(config, print_fn):
     # Optimization
     # ---------------------------------------------------------------------- #
     def step_trn(state, batch, config, scheduler, num_data, temperature):
-        def loss_fn(params):
-            params_dict = dict(params)
-            mutable = ["intermediates"]
-            if state.image_stats is not None:
-                params_dict["image_stats"] = state.image_stats
-            if state.batch_stats is not None:
-                params_dict["batch_stats"] = state.batch_stats
-                mutable.append("batch_stats")
 
-            _, new_model_state = state.apply_fn(
-                params_dict, batch['images'],
-                rngs=None,
-                mutable=mutable,
-                use_runnining_average=False)
+        # define loss function
+        def loss_fn(params):
+
+            if config.model_style == "FRN-Swish":
+                # forward pass
+                _, new_model_state = state.apply_fn({
+                    'params': params,
+                    'image_stats': state.image_stats,
+                }, batch['images'],
+                    rngs=None,
+                    mutable='intermediates')
+            elif config.model_style == "BN-ReLU":
+                # forward pass
+                _, new_model_state = state.apply_fn({
+                    'params': params,
+                    'image_stats': state.image_stats,
+                    'batch_stats': state.batch_stats,
+                }, batch['images'],
+                    rngs=None,
+                    mutable=['intermediates', "batch_stats"],
+                    use_runnining_average=False)
 
             # compute neg_log_likelihood
             # [B, K,]
@@ -347,30 +394,38 @@ def launch(config, print_fn):
         metrics['lr'] = scheduler(state.step)
         metrics['temperature'] = temperature(state.step)
 
-        if new_model_state.get("batch_stats") is not None:
+        if config.model_style == "FRN-Swish":
+            # update train state
+            new_state = state.apply_gradients(
+                grads=grads, temperature=temperature(state.step))
+        elif config.model_style == "BN-ReLU":
             # update train state
             new_state = state.apply_gradients(
                 grads=grads, temperature=temperature(state.step),
                 batch_stats=new_model_state["batch_stats"])
-        else:
-            # update train state
-            new_state = state.apply_gradients(
-                grads=grads, temperature=temperature(state.step))
         return new_state, metrics
 
     def step_val(state, batch):
 
-        params_dict = dict(params=state.params)
-        if state.image_stats is not None:
-            params_dict["image_stats"] = state.image_stats
-        if state.batch_stats is not None:
-            params_dict["batch_stats"] = state.batch_stats
+        if config.model_style == "FRN-Swish":
+            # forward pass
+            _, new_model_state = state.apply_fn({
+                'params': state.params,
+                'image_stats': state.image_stats,
+            }, batch['images'],
+                rngs=None,
+                mutable='intermediates')
 
-        _, new_model_state = state.apply_fn(
-            params_dict, batch['images'],
-            rngs=None,
-            mutable='intermediates',
-            use_running_average=True)
+        elif config.model_style == "BN-ReLU":
+            # forward pass
+            _, new_model_state = state.apply_fn({
+                'params': state.params,
+                'image_stats': state.image_stats,
+                'batch_stats': state.batch_stats,
+            }, batch['images'],
+                rngs=None,
+                mutable='intermediates',
+                use_running_average=True)
 
         # compute metrics
         predictions = jax.nn.log_softmax(
@@ -463,7 +518,7 @@ def launch(config, print_fn):
             log_str += ', '.join(f'{k} {v: .3e}' for k,
                                  v in trn_summarized.items())
 
-            if state.batch_stats is not None:
+            if config.model_style == "BN-ReLU":
                 # synchronize batch normalization statistics
                 state = state.replace(
                     batch_stats=cross_replica_mean(state.batch_stats))
@@ -545,7 +600,7 @@ def launch(config, print_fn):
                 #     fp.write(serialization.to_bytes(_state))
                 save_state = jax_utils.unreplicate(state)
                 ckpt = dict(model=save_state, config=vars(
-                    config), best_acc=test_acc)
+                    config), best_acc=acc)
                 orbax_checkpointer = orbax.checkpoint.PyTreeCheckpointer()
                 checkpoints.save_checkpoint(ckpt_dir=config.save,
                                             target=ckpt,

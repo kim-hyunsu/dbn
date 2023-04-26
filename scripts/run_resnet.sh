@@ -8,11 +8,42 @@
 # mv dump/stdout32 eval/feature_logit/example32/stdout32
 # mv dump/tfout32 eval/feature_logit/example32/tfout32
 
-SUFFIX="resfeature_2e-3_2e-2_"
-python dsb.py --logdir="eval/feature_logit/example"$SUFFIX --lr_schedule="constant" --optim_ne=1000 --dataset="cifar10_logit" --features_dir='features' --beta1=2e-3 --beta2=2e-2 --network='resnet' --version='v1.0'    1>dump/stdout$SUFFIX 2>dump/tfout$SUFFIX
+# logit
+# SUFFIX="logit_2e-3_2e-2"
+# python dsb.py --logdir="eval/feature_logit/example"$SUFFIX --lr_schedule="constant" --optim_ne=1000 --dataset="cifar10_logit" --features_dir='features' --beta1=2e-3 --beta2=2e-2 --network='resnet' --version='v1.0'    1>dump/stdout$SUFFIX 2>dump/tfout$SUFFIX
+# mv dump/stdout$SUFFIX eval/feature_logit/example$SUFFIX/stdout$SUFFIX
+# mv dump/tfout$SUFFIX eval/feature_logit/example$SUFFIX/tfout$SUFFIX
+
+# SUFFIX="logit_2e-2_2e-1"
+# python dsb.py --logdir="eval/feature_logit/example"$SUFFIX --lr_schedule="constant" --optim_ne=100 --dataset="cifar10_logit" --features_dir='features' --beta1=2e-2 --beta2=2e-1 --network='resnet' --version='v1.0'    1>dump/stdout$SUFFIX 2>dump/tfout$SUFFIX
+# mv dump/stdout$SUFFIX eval/feature_logit/example$SUFFIX/stdout$SUFFIX
+# mv dump/tfout$SUFFIX eval/feature_logit/example$SUFFIX/tfout$SUFFIX
+
+SUFFIX="logit_2e-1_5e-1"
+python dsb.py --logdir="eval/feature_logit/example"$SUFFIX --lr_schedule="constant" --optim_ne=100 --dataset="cifar10_logit" --features_dir='features' --beta1=2e-1 --beta2=5e-1 --network='resnet' --version='v1.0'    1>dump/stdout$SUFFIX 2>dump/tfout$SUFFIX
 mv dump/stdout$SUFFIX eval/feature_logit/example$SUFFIX/stdout$SUFFIX
 mv dump/tfout$SUFFIX eval/feature_logit/example$SUFFIX/tfout$SUFFIX
 
+# feature
+# SUFFIX="last_2e-3_2e-2"
+# python dsb.py --logdir="eval/feature_last/example"$SUFFIX --lr_schedule="constant" --optim_ne=100 --dataset="cifar10_feature" --features_dir='features_last' --beta1=2e-3 --beta2=2e-2 --network='resnet' --version='v1.0'    1>dump/stdout$SUFFIX 2>dump/tfout$SUFFIX
+# mv dump/stdout$SUFFIX eval/feature_last/example$SUFFIX/stdout$SUFFIX
+# mv dump/tfout$SUFFIX eval/feature_last/example$SUFFIX/tfout$SUFFIX
+
+# SUFFIX="last_2e-2_2e-1"
+# python dsb.py --logdir="eval/feature_last/example"$SUFFIX --lr_schedule="constant" --optim_ne=100 --dataset="cifar10_feature" --features_dir='features_last' --beta1=2e-2 --beta2=2e-1 --network='resnet' --version='v1.0'    1>dump/stdout$SUFFIX 2>dump/tfout$SUFFIX
+# mv dump/stdout$SUFFIX eval/feature_last/example$SUFFIX/stdout$SUFFIX
+# mv dump/tfout$SUFFIX eval/feature_last/example$SUFFIX/tfout$SUFFIX
+
+# SUFFIX="last_1e-4_2e-2"
+# python dsb.py --logdir="eval/feature_last/example"$SUFFIX --lr_schedule="constant" --optim_ne=100 --dataset="cifar10_feature" --features_dir='features_last' --beta1=1e-4 --beta2=2e-2 --network='resnet' --version='v1.0'    1>dump/stdout$SUFFIX 2>dump/tfout$SUFFIX
+# mv dump/stdout$SUFFIX eval/feature_last/example$SUFFIX/stdout$SUFFIX
+# mv dump/tfout$SUFFIX eval/feature_last/example$SUFFIX/tfout$SUFFIX
+
+SUFFIX="last_2e-1_5e-1"
+python dsb.py --logdir="eval/feature_last/example"$SUFFIX --lr_schedule="constant" --optim_ne=100 --dataset="cifar10_feature" --features_dir='features_last' --beta1=2e-1 --beta2=5e-1 --network='resnet' --version='v1.0'    1>dump/stdout$SUFFIX 2>dump/tfout$SUFFIX
+mv dump/stdout$SUFFIX eval/feature_last/example$SUFFIX/stdout$SUFFIX
+mv dump/tfout$SUFFIX eval/feature_last/example$SUFFIX/tfout$SUFFIX
 
 # SUFFIX="resfeature_2e-2_2e-1_debug2"
 # python dsb.py --logdir="eval/feature_logit/example"$SUFFIX --lr_schedule="constant" --optim_ne=1000 --dataset="cifar10_logit" --features_dir='features' --beta1=2e-2 --beta2=2e-1 --network='resnet' --version='v1.0'    1>dump/stdout$SUFFIX 2>dump/tfout$SUFFIX

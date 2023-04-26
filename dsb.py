@@ -37,6 +37,17 @@ import matplotlib.pyplot as plt
 
 import tensorflow as tf
 
+"""
+  Short readme
+    build_featureloaders
+      Args:
+        config: `args` Argparse instance
+      Return:
+        dataloaders: dictionary with numpy features
+        normalize: Given pretrained normalization coefficients, raw --> normalized logit (feature).
+        unnormalize: Given pretrained unnormalization coefficients, normalized --> raw logit (feature).
+"""
+
 def build_featureloaders(config):
     dir = config.features_dir
     # B: current mode, A: other modes
@@ -235,7 +246,7 @@ class TrainState(train_state.TrainState):
         kwargs["training"] = training
         return x_t, sigma_t, kwargs
 
-    def sample(self, rng, apply, size, x0, stats, guide_w=0.,):
+    def sample(self, rng, apply, size, x0, stats):
         n_samples = x0.shape[0]  # B
         new_size = (n_samples, *size)  # (B, d)
         x_n = x0  # (B, d)
@@ -247,20 +258,9 @@ class TrainState(train_state.TrainState):
             t_n = jnp.array([idx/self.n_T])  # (1,)
             t_n = jnp.tile(t_n, [n_samples])  # (B,)
 
-            x_n = jnp.tile(x_n, [2, 1])  # (2*B, d)
-            t_n = jnp.tile(t_n, [2])  # (2*B,)
-
             h = jnp.where(idx > 1, jax.random.normal(
                 _rng, new_size), jnp.zeros(new_size))  # (B, d)
-            eps = apply(x_n, t_n)  # (2*B, d)
-            eps1 = eps[:n_samples]  # (B, d)
-            eps2 = eps[n_samples:]  # (B, d)
-            eps = (1-guide_w)*eps1 + guide_w*eps2  # (B, d)
-            x_n = x_n[:n_samples]  # (B, d)
-            # x_n = (
-            #     stats["oneover_sqrta"][idx] * (x_n - eps * stats["mab_over_sqrtmab"][idx]) +
-            #     stats["sqrt_beta_t"][idx]   * h
-            # )  # (B, d)
+            eps = apply(x_n, t_n)  # (B, d)
             x_0_eps = x_n - stats["sigma_t"][idx] * eps
             x_n = (
               stats["alpos_weight_t"][idx] * x_0_eps +
@@ -287,10 +287,7 @@ def launch(config, print_fn):
     # build dataloaders
     dataloaders, normalize_logits, unnormalize_logits = build_featureloaders(config)
     config.n_classes = dataloaders["num_classes"]
-    config.ws_test = [0.0, 0.5, 2.0]
 
-    # beta1 = 1e-4
-    # beta2 = 0.02
     beta1 = config.beta1
     beta2 = config.beta2
     dsb_stats = dsb_schedules(beta1, beta2, config.T)
@@ -300,7 +297,7 @@ def launch(config, print_fn):
     elif config.dataset == 'cifar10_feature':
       x_dim = 64
     else:
-      raise NotImplementedError()
+      raise NotImplementedError("dataset should be either cifar10_`{logit, feature`}")
 
     if config.network == 'mlp':
       score_func = MLP(
@@ -315,6 +312,8 @@ def launch(config, print_fn):
           ver=config.version,
           n_feat=config.n_feat,
       )
+    else:
+      raise NotImplementedError("network type should be either mlp or resnet.")
 
     # Visualize all DSB stats
     visualize_dsb_stats(dsb_stats, config)
@@ -363,6 +362,21 @@ def launch(config, print_fn):
         assert len(output.shape) == 2
         loss = jnp.sum((noise-output)**2, axis=1)
         return loss
+
+    # accuracy
+    def accuracy(f_gen, labels, marker):
+        if f_gen.shape[-1] == 10:
+            logits = f_gen
+        else:
+            logits = classifier.apply(
+                {"params": variables_cls["params"]}, f_gen
+            )
+        predictions = jax.nn.log_softmax(logits, axis=-1)
+        acc = evaluate_acc(
+            predictions, labels, log_input=True, reduction="none"
+        )
+        acc = jnp.sum(jnp.where(marker, acc, jnp.zeros_like(acc)))
+        return acc
 
     # training
     def step_train(state, batch, config):
@@ -452,17 +466,22 @@ def launch(config, print_fn):
         logitsB = normalize_logits(logitsB)
         logitsA = normalize_logits(logitsA)
         f_list = []
-        for w_i, w in enumerate(config.ws_test):
-            f_gen = state.sample(
-                state.rng, apply, (x_dim,), logitsB, dsb_stats, guide_w=w)
-            f_gen = unnormalize_logits(f_gen)
-            f_real = unnormalize_logits(logitsA)
-            f_init = unnormalize_logits(logitsB)
+        f_gen = state.sample(
+            state.rng, apply, (x_dim,), logitsB, dsb_stats)
+        f_gen = unnormalize_logits(f_gen)
+        f_real = unnormalize_logits(logitsA)
+        f_init = unnormalize_logits(logitsB)
 
-            f_all = jnp.stack([f_init, f_gen, f_real], axis=-1)
-            f_list.append(f_all)
+        f_all = jnp.stack([f_init, f_gen, f_real], axis=-1)
+        f_list.append(f_all)
 
-        return f_list
+
+        acc = accuracy(f_gen, labels, batch["marker"])
+        count = jnp.sum(batch["marker"])
+        metrics = OrderedDict({"acc": acc, "count": count})
+        metrics = jax.lax.psum(metrics, axis_name='batch')
+
+        return f_list, metrics
 
     cross_replica_mean = jax.pmap(lambda x: jax.lax.pmean(x, 'x'), 'x')
     p_step_train = jax.pmap(
@@ -475,7 +494,7 @@ def launch(config, print_fn):
 
     # proj_coeff_list and orth_coeff_list
     proj_coeff_list, orth_coeff_list = [], []
-    
+
     for epoch_idx, _ in enumerate(range(config.optim_ne), start=1):
         log_str = '[Epoch {:5d}/{:5d}] '.format(epoch_idx, config.optim_ne)
         data_rng, rng = jax.random.split(rng)
@@ -488,7 +507,15 @@ def launch(config, print_fn):
             loss_rng, rng = jax.random.split(rng)
             state = state.replace(rng=jax_utils.replicate(loss_rng))
             state, metrics = p_step_train(state, batch)
+
+            # Get accuracy every k epoch
+            if epoch_idx % 10 == 0:
+                _, acc_metrics = p_step_sample(state, batch)
+                metrics["acc"] = acc_metrics["acc"]
+                assert jnp.all(metrics["count"] == acc_metrics["count"])
+                
             train_metrics.append(metrics)
+
         train_metrics = common_utils.get_metrics(train_metrics)
         trn_summarized = {f'trn/{k}': v for k,
                           v in jax.tree_util.tree_map(lambda e: e.mean(), train_metrics).items()}
@@ -501,16 +528,21 @@ def launch(config, print_fn):
         valid_loader = dataloaders["val_featureloader"](rng=None)
         valid_loader = jax_utils.prefetch_to_device(valid_loader, size=2)
 
-
         for batch_idx, batch in enumerate(valid_loader, start=1):
             # TODO arange feature and input seperately
             loss_rng, rng = jax.random.split(rng)
             state = state.replace(rng=jax_utils.replicate(loss_rng))
             metrics = p_step_valid(state, batch)
+
+            if (epoch_idx+1) % 50 == 0:
+                _, acc_metrics = p_step_sample(state, batch)
+                metrics["acc"] = acc_metrics["acc"]
+                assert jnp.all(metrics["count"] == acc_metrics["count"])
+
             valid_metrics.append(metrics)
 
             if batch_idx == 1:
-                z_list = p_step_sample(state, batch)
+                z_list, _ = p_step_sample(state, batch)
                 for i, z_all in enumerate(z_list):
                     image_array = z_all[0][0]
                     image_array_float = image_array
@@ -518,7 +550,7 @@ def launch(config, print_fn):
                     image_array = np.array(image_array)
                     image_array = pixelize(image_array)
                     image = Image.fromarray(image_array)
-                    image.save(os.path.join(config.logdir, f"dsb_w{config.ws_test[i]}.png"))
+                    image.save(os.path.join(config.logdir, f"dsb.png"))
                     if i == 0:
                       np.set_printoptions(precision=3)
                       print_fn(f"Epoch {epoch_idx}")
@@ -534,16 +566,24 @@ def launch(config, print_fn):
                 # projection mean: if zero, the generated vector moved to the direction of target vector from the source vector.
                 #                  if higher, moved less / if lower (below zero), moved more.
                 proj_coeff = jnp.sum(src_to_tgt * gen_to_tgt, axis=1) / jnp.sum(src_to_tgt * src_to_tgt, axis=1)
-                proj_vec = proj_coeff[:, None] * gen_to_tgt
+                proj_vec = proj_coeff[:, None] * src_to_tgt
                 proj_mean = jnp.mean(proj_coeff)
                 # orthogonal mean: if zero, the generated vector is completely in the interpolation line.
                 #                  if higher, the generated vector is apart from this.
-                orth_vec = src_to_tgt - proj_vec
+                orth_vec = gen_to_tgt - proj_vec
                 orth_coeff = jnp.linalg.norm(orth_vec, axis=1) / jnp.linalg.norm(src_to_tgt, axis=1)
                 orth_mean = jnp.mean(orth_coeff)
 
                 proj_coeff_list.append(proj_mean)
                 orth_coeff_list.append(orth_mean)
+
+            # Get accuracy every k epoch
+            if epoch_idx % 10 == 0:
+                _, acc_metrics = p_step_sample(state, batch)
+                metrics["acc"] = acc_metrics["acc"]
+                # metrics["acc_ref"] = acc_metrics["acc_ref"]
+                # metrics["acc_exact"] = acc_metrics["acc_exact"]
+                assert jnp.all(metrics["count"] == acc_metrics["count"])
 
         # Plot projetive/orthogonal coefficients
         epoch_list = np.arange(1, epoch_idx + 1, dtype=float)
@@ -603,6 +643,7 @@ def main():
 
     parser = defaults.default_argument_parser()
 
+    # Network optimization
     parser.add_argument('--optim_ne', default=200, type=int,
                         help='the number of training epochs (default: 200)')
     parser.add_argument('--optim_lr', default=1e-4, type=float,
@@ -612,37 +653,40 @@ def main():
     parser.add_argument('--optim_weight_decay', default=0.0001, type=float,
                         help='weight decay coefficient (default: 0.0001)')
 
+    # File I/O
     parser.add_argument('--save', default=None, type=str,
                         help='save the *.log and *.ckpt files if specified (default: False)')
+    parser.add_argument("--logdir", default='eval', type=str,
+                        help='Directory of saved logs and figures.')
     parser.add_argument('--seed', default=None, type=int,
                         help='random seed for training (default: None)')
     parser.add_argument('--precision', default='fp32', type=str,
                         choices=['fp16', 'fp32'])
-    parser.add_argument("--T", default=400, type=int)
-    parser.add_argument("--n_feat", default=64, type=int)
+    parser.add_argument("--compute_statistics", default=False, type=bool,
+                        help='Compute feature statistics.')
 
-    parser.add_argument("--logdir", default='eval', type=str,
-                        help='Directory of saved logs and figures.')
+    # Generic learning hyperparameters
+    parser.add_argument("--dataset", default="cifar10_logit", type=str,
+                        help='name of dataset')
     parser.add_argument("--lr_schedule", default='cosine', type=str,
-                        choices=['cosine', 'constant'])
+                        choices=['cosine', 'constant'])   
+    parser.add_argument("--n_feat", default=64, type=int) 
     
+    # Diffusion (bridge) learning hyperparameters
+    parser.add_argument("--method", default="i2sb", type=str,
+                        help='name of diffusion-based method, default is I2SB.')
     parser.add_argument("--beta1", default=1.5e-4, type=float,
                         help='beta1 (minimum beta) for DSB')
     parser.add_argument("--beta2", default=1.5e-3, type=float,
                         help='beta2 (maximum beta) for DSB')
-
-    parser.add_argument("--dataset", default="cifar10_logit", type=str,
-                        help='name of dataset')
-    parser.add_argument("--method", default="i2sb", type=str,
-                        help='name of diffusion-based method, default is I2SB.')
-    parser.add_argument("--compute_statistics", default=False, type=bool,
-                        help='Compute feature statistics.')
+    parser.add_argument("--T", default=400, type=int)
     parser.add_argument("--features_dir", default="features_last", type=str)
     parser.add_argument("--version", default="v1", type=str)
     parser.add_argument("--network", default="resnet", type=str)
 
     args = parser.parse_args()
 
+    # If seed argument is unspecified
     if args.seed is None:
         args.seed = (
             os.getpid()
@@ -650,14 +694,13 @@ def main():
             + int.from_bytes(os.urandom(2), 'big')
         )
 
+    # savedir and logdir
     if args.save is not None:
         args.save = os.path.abspath(args.save)
-        if os.path.exists(args.save):
-            raise AssertionError(f'already existing args.save = {args.save}')
-        os.makedirs(args.save, exist_ok=True)
-
+        tf.io.gfile.mkdir(os.path.join(args.save))
     tf.io.gfile.mkdir(os.path.join(args.logdir))
 
+    # print_fn is stdout or file I/O.
     print_fn = partial(print, flush=True)
     if args.save:
         def print_fn(s):
@@ -665,6 +708,13 @@ def main():
                 fp.write(s + '\n')
             print(s, flush=True)
 
+    # Configuration
+    """
+      (1) Environment
+      (2) Argparse arguments
+      (3) Detected devices
+      (4) 
+    """
     log_str = tabulate([
         ('sys.platform', sys.platform),
         ('Python', sys.version.replace('\n', '')),
@@ -693,23 +743,7 @@ def main():
             '[%Y-%m-%d %H:%M:%S] ') + log_str
         print_fn(log_str)
 
-    # verify dataset list
-    dataset_list = [
-        "cifar10_logit",
-        "cifar10_feature"
-    ]
-    assert args.dataset in dataset_list, f"{args.dataset} is not a valid dataset."
-    log_str = f'Using dataset {args.dataset}'
-    print_fn(log_str)
-
-    method_list = [
-        "i2sb",
-        "cfm"
-    ]
-    assert args.method in method_list, f"{args.method} is not a valid method."
-    log_str = f"Using diffusion-based methoud {args.method}"
-    print_fn(log_str)
-
+    # Run.
     launch(args, print_fn)
 
 

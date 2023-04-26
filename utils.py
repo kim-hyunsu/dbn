@@ -28,7 +28,7 @@ def model_list(data_name, model_style):
             "./checkpoints/frn_sd11",
             "./checkpoints/frn_sd13",
             "./checkpoints/frn_sd17",
-            "./checkpoints/frn_sd19",
+            # "./checkpoints/frn_sd19",
         ]
     else:
         raise Exception("Invalid data_name and model_style.")
@@ -214,3 +214,16 @@ jprint = lambda *args: ...
 if debug:
     print("**** DEBUG MODE ****")
     jprint = jprint_fn
+
+
+def get_info_in_dir(dir):
+    if "mixupplus" in dir:
+        sep = "mixupplus"
+    else:
+        sep = "mixup"
+    alpha = float(
+        dir.split(sep)[0].split("_")[-1]) if sep in dir else -1
+    repeats = int(
+        dir.split(sep)[1].split("_")[0]) if sep in dir else 1
+
+    return alpha, repeats

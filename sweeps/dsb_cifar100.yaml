@@ -24,7 +24,7 @@ parameters:
   beta2:
     value: 0.02
   features_dir:
-    value: features100
+    value: features100_fixed
   droprate:
     values: [0.,0.1,0.2,0.3,0.4,0.5]
   ema_decay:

@@ -33,7 +33,7 @@ from collections import OrderedDict
 from PIL import Image
 from tqdm import tqdm
 from models.resnet import FlaxResNetClassifier
-from utils import pixelize, normalize_logits, unnormalize_logits, jprint, model_list, logit_dir_list, feature_dir_list
+from utils import pixelize, normalize_logits, unnormalize_logits, jprint, model_list, logit_dir_list, feature_dir_list, get_info_in_dir
 from tqdm import tqdm
 
 
@@ -153,10 +153,7 @@ def build_featureloaders(config, rng=None):
         trn_labels, val_labels = trn_labels[:40960], trn_labels[40960:]
         num_classes = 100
 
-    if "mixup" in config.features_dir:
-        repeats = int(config.features_dir.split("mixup")[1].split("_")[0])
-    else:
-        repeats = 1
+    _, repeats = get_info_in_dir(config.features_dir)
     trn_labels = jnp.tile(trn_labels, [n_samples_each_Bmode*repeats])
     val_labels = jnp.tile(val_labels, [n_samples_each_Bmode])
     tst_labels = jnp.tile(tst_labels, [n_samples_each_Bmode])
@@ -262,9 +259,9 @@ def build_featureloaders(config, rng=None):
         return logits, lambdas
 
     if config.get_stats:
-        # >------------------------------------------------------------------
-        # > Compute statistics (mean, std)
-        # >------------------------------------------------------------------
+        # ------------------------------------------------------------------
+        #  Compute statistics (mean, std)
+        # ------------------------------------------------------------------
         count = 0
         sum = 0
         for batch in dataloaders["trn_featureloader"](rng=None):
@@ -426,7 +423,7 @@ def launch(config, print_fn):
             ckpt_dir=os.path.join(ckpt_dir, "sghmc"),
             target=None
         )
-        variables_cls["params"]["Dense_0"] = ckpt["model"]["params"]["Dense_0"]
+        variables_cls["params"]["head"] = ckpt["model"]["params"]["Dense_0"]
         variables_cls = freeze(variables_cls)
         del ckpt
 
@@ -866,13 +863,13 @@ def main():
 
     parser = defaults.default_argument_parser()
 
-    parser.add_argument('--optim_ne', default=300, type=int,
+    parser.add_argument('--optim_ne', default=350, type=int,
                         help='the number of training epochs (default: 200)')
-    parser.add_argument('--optim_lr', default=1e-3, type=float,
+    parser.add_argument('--optim_lr', default=5e-4, type=float,
                         help='base learning rate (default: 1e-4)')
     parser.add_argument('--optim_momentum', default=0.9, type=float,
                         help='momentum coefficient (default: 0.9)')
-    parser.add_argument('--optim_weight_decay', default=1e-5, type=float,
+    parser.add_argument('--optim_weight_decay', default=5e-4, type=float,
                         help='weight decay coefficient (default: 0.0001)')
     parser.add_argument('--save', default=None, type=str,
                         help='save the *.log and *.ckpt files if specified (default: False)')
@@ -882,7 +879,7 @@ def main():
                         choices=['fp16', 'fp32'])
     parser.add_argument("--T", default=50, type=int)
     parser.add_argument("--n_feat", default=256, type=int)
-    parser.add_argument("--beta1", default=1e-3, type=float)
+    parser.add_argument("--beta1", default=5e-4, type=float)
     parser.add_argument("--beta2", default=0.02, type=float)
     parser.add_argument("--features_dir", default="features_fixed", type=str)
     parser.add_argument("--version", default="v1.0", type=str)
@@ -893,8 +890,8 @@ def main():
     parser.add_argument("--n_Amodes", default=1, type=int)
     parser.add_argument("--n_samples_each_mode", default=1, type=int)
     parser.add_argument("--take_valid", action="store_true")
-    parser.add_argument("--droprate", default=0., type=float)
-    parser.add_argument("--ema_decay", default=1., type=float)
+    parser.add_argument("--droprate", default=0.2, type=float)
+    parser.add_argument("--ema_decay", default=0.999, type=float)
 
     args = parser.parse_args()
 

@@ -25,7 +25,7 @@ def default_argument_parser():
     parser.add_argument('--model_style', default='FRN-Swish', type=str,
                         choices=["FRN-Swish"])
 
-    parser.add_argument('--optim_bs', default=512, type=int,
+    parser.add_argument('--optim_bs', default=256, type=int,
                         help='mini-batch size (default: 512)')
 
     return parser

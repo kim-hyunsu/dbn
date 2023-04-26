@@ -133,7 +133,8 @@ class FlaxResNet(nn.Module):
 
         # return logits if possible
         if self.num_classes:
-            y = self.fc(features=self.num_classes, dtype=self.dtype)(y)
+            y = self.fc(features=self.num_classes,
+                        dtype=self.dtype, name="head")(y)
             self.sow('intermediates', 'cls.logit', y)
 
         return y

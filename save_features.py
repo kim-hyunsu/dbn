@@ -15,7 +15,7 @@ from easydict import EasyDict
 import defaults_sghmc as defaults
 import os
 import numpy as np
-from utils import normalize, model_list, logit_dir_list, feature_dir_list, jprint
+from utils import get_info_in_dir, normalize, model_list, logit_dir_list, feature_dir_list, jprint
 
 
 def get_ckpt_temp(ckpt_dir):
@@ -225,14 +225,7 @@ if __name__ == "__main__":
     n_samples_each_mode = 30
     n_modes = len(model_list(data_name, model_style))
     dataloaders = build_dataloaders(config)
-    if "mixupplus" in dir:
-        sep = "mixupplus"
-    else:
-        sep = "mixup"
-    alpha = float(
-        dir.split(sep)[0].split("_")[-1]) if sep in dir else -1
-    repeats = int(
-        dir.split(sep)[1].split("_")[0]) if sep in dir else 1
+    alpha, repeats = get_info_in_dir(dir)
 
     def get_logits(state, batch, feature_name="feature.vector"):
         x = batch["images"]

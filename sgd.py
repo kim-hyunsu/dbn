@@ -1,12 +1,13 @@
+from tabnanny import check
 import wandb
 import time
 from tqdm import tqdm
 from giung2.metrics import evaluate_acc, evaluate_nll
-from giung2.models.resnet import FlaxResNet
+# from giung2.models.resnet import FlaxResNet
+from models.resnet import FlaxResNet
 from giung2.models.layers import FilterResponseNorm
 from giung2.data.build import build_dataloaders
 import defaults_sgd as defaults
-from tensorflow.io import gfile
 from flax.training import dynamic_scale as dynamic_scale_lib
 from flax.training import common_utils, train_state, checkpoints
 from flax import jax_utils, serialization
@@ -89,6 +90,28 @@ def launch(config, print_fn):
             momentum=config.optim_momentum)
     elif config.optim == "adam":
         optimizer = optax.adam(learning_rate=scheduler)
+
+    if config.shared_head:
+        from flax.core.frozen_dict import freeze
+        from flax import traverse_util
+        # load trained head
+        params = variables.unfreeze()
+        ckpt = checkpoints.restore_checkpoint(
+            ckpt_dir=config.shared_head,
+            target=None
+        )
+        saved = ckpt["model"]["params"].get("Dense_0")
+        if saved is None:
+            saved = ckpt["model"]["params"]["head"]
+        params["params"]["head"] = saved
+        variables = freeze(params)
+        # freeze head
+        partition_optimizer = {"trainable": optimizer,
+                               "frozen": optax.set_to_zero()}
+        param_partitions = freeze(traverse_util.path_aware_map(
+            lambda path, v: "frozen" if "head" in path else "trainable", variables["params"]))
+        optimizer = optax.multi_transform(
+            partition_optimizer, param_partitions)
 
     # build train state
     state = TrainState.create(
@@ -331,6 +354,7 @@ def main():
     parser.add_argument("--optim", default="sgd", type=str,
                         choices=["sgd", "adam"])
     parser.add_argument("--nowandb", action="store_true")
+    parser.add_argument("--shared_head", default="", type=str)
 
     args = parser.parse_args()
 

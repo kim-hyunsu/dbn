@@ -15,10 +15,11 @@ from easydict import EasyDict
 import defaults_sghmc as defaults
 import os
 import numpy as np
-from utils import get_info_in_dir, normalize, model_list, logit_dir_list, feature_dir_list, jprint
+from utils import expand_to_broadcast, get_info_in_dir, normalize, model_list, jprint
+from utils import logit_dir_list, feature_dir_list, feature2_dir_list
 
 
-def get_ckpt_temp(ckpt_dir):
+def get_ckpt_temp(ckpt_dir, shared_head=False):
     if not ckpt_dir.endswith("sghmc"):
         sghmc_ckpt_dir = os.path.join(ckpt_dir, "sghmc")
     sghmc_ckpt = checkpoints.restore_checkpoint(
@@ -69,8 +70,12 @@ def get_ckpt_temp(ckpt_dir):
     variables = initialize_model(init_rng, model)
 
     if variables.get("batch_stats") is not None:
-        sghmc_state = sghmc.get_sghmc_state(
-            sghmc_config, dataloaders, model, variables)
+        if shared_head:
+            sghmc_state = sghmc.get_sghmc_state(
+                sghmc_config, dataloaders, model, variables)
+        else:
+            sghmc_state = sghmc.get_sghmc_state_legacy(
+                sghmc_config, dataloaders, model, variables)
     else:
         sghmc_state = sghmc_deprecated.get_sghmc_state(
             sghmc_config, dataloaders, model, variables)
@@ -220,10 +225,12 @@ if __name__ == "__main__":
     settings = __import__(f"{dir}.settings", fromlist=[""])
     data_name = settings.data_name
     model_style = settings.model_style
-    config, ckpt, rng = get_ckpt_temp(model_list(data_name, model_style)[0])
+    shared_head = settings.shared_head
+    config, ckpt, rng = get_ckpt_temp(
+        model_list(data_name, model_style, shared_head)[0], shared_head)
     config.optim_bs = 512
     n_samples_each_mode = 30
-    n_modes = len(model_list(data_name, model_style))
+    n_modes = len(model_list(data_name, model_style, shared_head))
     dataloaders = build_dataloaders(config)
     alpha, repeats = get_info_in_dir(dir)
 
@@ -240,7 +247,8 @@ if __name__ == "__main__":
         _, new_model_state = state.apply_fn(
             params_dict, x, rngs=None, mutable=mutable)
         logits = new_model_state["intermediates"][feature_name][0]
-        logits = jnp.where(marker[..., None], logits, jnp.zeros_like(logits))
+        _marker = expand_to_broadcast(marker, logits, axis=1)
+        logits = jnp.where(_marker, logits, jnp.zeros_like(logits))
         return logits
 
     if dir in logit_dir_list:
@@ -248,6 +256,9 @@ if __name__ == "__main__":
             partial(get_logits, feature_name="cls.logit"), axis_name="batch")
     elif dir in feature_dir_list:
         p_get_logits = jax.pmap(get_logits, axis_name="batch")
+    elif dir in feature2_dir_list:
+        p_get_logits = jax.pmap(
+            partial(get_logits, feature_name="feature.layer3"))
     else:
         raise Exception("Invalid directory for saving features")
 
@@ -263,95 +274,114 @@ if __name__ == "__main__":
         p_mixup_data = jax.pmap(
             partial(mixup_data, alpha=alpha), axis_name="batch")
 
+    shape = None
     data_rng, rng = jax.random.split(rng)
     for mode_idx in range(n_modes):
         for i in tqdm(range(n_samples_each_mode)):
-            feature_path = f"{dir}/train_features_M{mode_idx}S{i}.npy"
-            lambda_path = f"{dir}/train_lambdas_M{mode_idx}S{i}.npy"
-            if os.path.exists(feature_path):
-                continue
 
-            model_dir = model_list(data_name, model_style)[mode_idx]
+            model_dir = model_list(
+                data_name, model_style, shared_head)[mode_idx]
             classifier_state, _ = load_classifer_state(model_dir, i+1, ckpt)
             classifier_state = jax_utils.replicate(classifier_state)
             # train set
-            logits_list = []
-            lambdas_list = []
-            for rep in range(repeats):
-                train_rng = jax.random.fold_in(rng, rep)
-                _, mixup_rng = jax.random.split(train_rng)
-                train_loader = dataloaders["trn_loader"](rng=None)
-                train_loader = jax_utils.prefetch_to_device(
-                    train_loader, size=2)
-                for batch_idx, batch in enumerate(train_loader, start=1):
-                    b_mixup_rng = jax.random.fold_in(mixup_rng, batch_idx)
-                    batch = p_mixup_data(
-                        jax_utils.replicate(b_mixup_rng), batch)
-                    _logits = p_get_logits(classifier_state, batch)
-                    logits = _logits[batch["marker"] ==
-                                     True].reshape(-1, _logits.shape[-1])
-                    assert len(logits.shape) == 2
-                    lambdas = batch["lambdas"][batch["marker"] == True]
-                    assert len(lambdas.shape) == 1
-                    logits_list.append(logits)
-                    lambdas_list.append(lambdas)
-            logits = jnp.concatenate(logits_list, axis=0)
-            lambdas = jnp.concatenate(lambdas_list, axis=0)
-            with open(feature_path, "wb") as f:
-                logits = np.array(logits)
-                np.save(f, logits)
-            with open(lambda_path, "wb") as f:
-                lambdas = np.array(lambdas)
-                np.save(f, lambdas)
-            del logits_list
-            del lambdas_list
+            feature_path = f"{dir}/train_features_M{mode_idx}S{i}.npy"
+            if not os.path.exists(feature_path):
+                lambda_path = f"{dir}/train_lambdas_M{mode_idx}S{i}.npy"
+                logits_list = []
+                lambdas_list = []
+                for rep in range(repeats):
+                    train_rng = jax.random.fold_in(rng, rep)
+                    _, mixup_rng = jax.random.split(train_rng)
+                    train_loader = dataloaders["trn_loader"](rng=None)
+                    train_loader = jax_utils.prefetch_to_device(
+                        train_loader, size=2)
+                    for batch_idx, batch in enumerate(train_loader, start=1):
+                        b_mixup_rng = jax.random.fold_in(mixup_rng, batch_idx)
+                        batch = p_mixup_data(
+                            jax_utils.replicate(b_mixup_rng), batch)
+                        _logits = p_get_logits(classifier_state, batch)
+                        logits = _logits[batch["marker"] == True]
+                        logits = logits.reshape(-1, *_logits.shape[2:])
+                        assert len(logits.shape) == 2 or len(logits.shape) == 4
+                        lambdas = batch["lambdas"][batch["marker"] == True]
+                        assert len(lambdas.shape) == 1
+                        logits_list.append(logits)
+                        lambdas_list.append(lambdas)
+                logits = jnp.concatenate(logits_list, axis=0)
+                shape = shape or logits.shape[1:]
+                if shape:
+                    assert logits.shape[1:] == shape
+                lambdas = jnp.concatenate(lambdas_list, axis=0)
+                with open(feature_path, "wb") as f:
+                    logits = np.array(logits)
+                    np.save(f, logits)
+                with open(lambda_path, "wb") as f:
+                    lambdas = np.array(lambdas)
+                    np.save(f, lambdas)
+                del logits_list
+                del lambdas_list
 
             # valid set
-            valid_loader = dataloaders["val_loader"](rng=None)
-            valid_loader = jax_utils.prefetch_to_device(valid_loader, size=2)
-            logits_list = []
-            # lambdas_list = []
-            for batch_idx, batch in enumerate(valid_loader, start=1):
-                _logits = p_get_logits(classifier_state, batch)
-                logits = _logits[batch["marker"] ==
-                                 True].reshape(-1, _logits.shape[-1])
-                assert len(logits.shape) == 2
-                # lambdas = batch["lambdas"][batch["marker"] == True]
-                # assert len(lambdas.shape) == 1
-                logits_list.append(logits)
-                # lambdas_list.append(lambdas)
-            logits = jnp.concatenate(logits_list, axis=0)
-            # lambdas = jnp.concatenate(lambdas_list, axis=0)
-            with open(f"{dir}/valid_features_M{mode_idx}S{i}.npy", "wb") as f:
-                logits = np.array(logits)
-                np.save(f, logits)
-            # with open(f"{dir}/valid_lambdas_M{mode_idx}S{i}.npy", "wb") as f:
-            #     lambdas = np.array(lambdas)
-            #     np.save(f, lambdas)
-            del logits_list
-            # del lambdas_list
+            feature_path = f"{dir}/valid_features_M{mode_idx}S{i}.npy"
+            if not os.path.exists(feature_path):
+                valid_loader = dataloaders["val_loader"](rng=None)
+                valid_loader = jax_utils.prefetch_to_device(
+                    valid_loader, size=2)
+                logits_list = []
+                # lambdas_list = []
+                for batch_idx, batch in enumerate(valid_loader, start=1):
+                    _logits = p_get_logits(classifier_state, batch)
+                    # logits = _logits[batch["marker"] ==
+                    #                  True].reshape(-1, _logits.shape[-1])
+                    logits = _logits[batch["marker"] == True]
+                    logits = logits.reshape(-1, *_logits.shape[2:])
+                    assert len(logits.shape) == 2 or len(logits.shape) == 4
+                    # lambdas = batch["lambdas"][batch["marker"] == True]
+                    # assert len(lambdas.shape) == 1
+                    logits_list.append(logits)
+                    # lambdas_list.append(lambdas)
+                logits = jnp.concatenate(logits_list, axis=0)
+                shape = shape or logits.shape[1:]
+                if shape:
+                    assert logits.shape[1:] == shape
+                # lambdas = jnp.concatenate(lambdas_list, axis=0)
+                with open(feature_path, "wb") as f:
+                    logits = np.array(logits)
+                    np.save(f, logits)
+                # with open(f"{dir}/valid_lambdas_M{mode_idx}S{i}.npy", "wb") as f:
+                #     lambdas = np.array(lambdas)
+                #     np.save(f, lambdas)
+                del logits_list
+                # del lambdas_list
 
             # test set
-            test_loader = dataloaders["tst_loader"](rng=None)
-            test_loader = jax_utils.prefetch_to_device(test_loader, size=2)
-            logits_list = []
-            # lambdas_list = []
-            for batch_idx, batch in enumerate(test_loader, start=1):
-                _logits = p_get_logits(classifier_state, batch)
-                logits = _logits[batch["marker"] ==
-                                 True].reshape(-1, _logits.shape[-1])
-                assert len(logits.shape) == 2
-                # lambdas = batch["lambdas"][batch["marker"] == True]
-                # assert len(lambdas.shape) == 1
-                logits_list.append(logits)
-                # lambdas_list.append(lambdas)
-            logits = jnp.concatenate(logits_list, axis=0)
-            # lambdas = jnp.concatenate(lambdas_list, axis=0)
-            with open(f"{dir}/test_features_M{mode_idx}S{i}.npy", "wb") as f:
-                logits = np.array(logits)
-                np.save(f, logits)
-            # with open(f"{dir}/test_lambdas_M{mode_idx}S{i}.npy", "wb") as f:
-            #     lambdas = np.array(lambdas)
-            #     np.save(f, lambdas)
-            del logits_list
-            # del lambdas_list
+            feature_path = f"{dir}/test_features_M{mode_idx}S{i}.npy"
+            if not os.path.exists(feature_path):
+                test_loader = dataloaders["tst_loader"](rng=None)
+                test_loader = jax_utils.prefetch_to_device(test_loader, size=2)
+                logits_list = []
+                # lambdas_list = []
+                for batch_idx, batch in enumerate(test_loader, start=1):
+                    _logits = p_get_logits(classifier_state, batch)
+                    # logits = _logits[batch["marker"] ==
+                    #                  True].reshape(-1, _logits.shape[-1])
+                    logits = _logits[batch["marker"] == True]
+                    logits = logits.reshape(-1, *_logits.shape[2:])
+                    assert len(logits.shape) == 2 or len(logits.shape) == 4
+                    # lambdas = batch["lambdas"][batch["marker"] == True]
+                    # assert len(lambdas.shape) == 1
+                    logits_list.append(logits)
+                    # lambdas_list.append(lambdas)
+                logits = jnp.concatenate(logits_list, axis=0)
+                shape = shape or logits.shape[1:]
+                if shape:
+                    assert logits.shape[1:] == shape
+                # lambdas = jnp.concatenate(lambdas_list, axis=0)
+                with open(feature_path, "wb") as f:
+                    logits = np.array(logits)
+                    np.save(f, logits)
+                # with open(f"{dir}/test_lambdas_M{mode_idx}S{i}.npy", "wb") as f:
+                #     lambdas = np.array(lambdas)
+                #     np.save(f, lambdas)
+                del logits_list
+                # del lambdas_list

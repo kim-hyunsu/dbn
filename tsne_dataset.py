@@ -44,7 +44,8 @@ def main():
     settings = __import__(f"{dir}.settings", fromlist=[""])
     data_name = settings.data_name
     model_style = settings.model_style
-    ckpt_list = model_list(data_name, model_style)
+    shared_head = settings.shared_head
+    ckpt_list = model_list(data_name, model_style, shared_head)
     # samples of the first mode (sghmc)
     sghmc_ckpt_dir = os.path.join(ckpt_list[0], "sghmc")
     # sghmc checkpoint

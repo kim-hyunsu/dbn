@@ -1,4 +1,6 @@
 from giung2.metrics import evaluate_acc, evaluate_nll
+from flax.core.frozen_dict import freeze
+from flax import traverse_util
 from giung2.models.layers import FilterResponseNorm
 # from giung2.models.resnet import FlaxResNet
 from models.resnet import FlaxResNet
@@ -13,7 +15,7 @@ import jaxlib
 import jax.numpy as jnp
 import jax
 from collections import OrderedDict
-from typing import Any, NamedTuple
+from typing import Any, NamedTuple, Callable
 from functools import partial
 from tabulate import tabulate
 import datetime
@@ -23,6 +25,7 @@ import sys
 from easydict import EasyDict
 import orbax
 import sgd
+from utils import jprint
 sys.path.append('./')
 
 
@@ -43,6 +46,25 @@ def get_sgd_state(config, dataloaders, model, variables):
     elif config.optim == "adam":
         optimizer = optax.adam(
             learning_rate=scheduler)
+    if config.shared_head:
+        # load trained head
+        params = variables.unfreeze()
+        ckpt = checkpoints.restore_checkpoint(
+            ckpt_dir=config.shared_head,
+            target=None
+        )
+        saved = ckpt["model"]["params"].get("Dense_0")
+        if saved is None:
+            saved = ckpt["model"]["params"]["head"]
+        params["params"]["Dense_0"] = saved
+        variables = freeze(params)
+        # freeze head
+        partition_optimizer = {"trainable": optimizer,
+                               "frozen": optax.set_to_zero()}
+        param_partitions = freeze(traverse_util.path_aware_map(
+            lambda path, v: "frozen" if "Dense_0" in path else "trainable", variables["params"]))
+        optimizer = optax.multi_transform(
+            partition_optimizer, param_partitions)
 
     # build train state
     state = sgd.TrainState.create(
@@ -56,7 +78,7 @@ def get_sgd_state(config, dataloaders, model, variables):
     return state
 
 
-def get_sghmc_state(config, dataloaders, model, variables):
+def get_sghmc_state_legacy(config, dataloaders, model, variables):
     # define optimizer with scheduler
     num_epochs_per_cycle = config.num_epochs_quiet + config.num_epochs_noisy
 
@@ -82,12 +104,12 @@ def get_sghmc_state(config, dataloaders, model, variables):
             iii * num_epochs_per_cycle * dataloaders['trn_steps_per_epoch']
             for iii in range(1, config.num_cycles + 1)
         ])
-    optimizer = sghmc(
+    optimizer = sghmc_legacy(
         learning_rate=scheduler,
         alpha=(1.0 - config.optim_momentum))
 
     # build train state
-    state = TrainState.create(
+    state = TrainStateLegacy.create(
         apply_fn=model.apply,
         params=variables['params'],
         tx=optimizer,
@@ -96,24 +118,121 @@ def get_sghmc_state(config, dataloaders, model, variables):
 
     return state
 
+def get_sghmc_state(config, dataloaders, model, variables):
+
+    # define optimizer with scheduler
+    num_epochs_per_cycle = config.num_epochs_quiet + config.num_epochs_noisy
+
+    temp_schedules =[optax.constant_schedule(0.0),] + sum([[
+            optax.constant_schedule(1.0),
+            optax.constant_schedule(0.0),
+        ] for iii in range(1, config.num_cycles + 1)], [])
+    temp_boundaries = sum([[
+            (iii * num_epochs_per_cycle - config.num_epochs_noisy) *
+            dataloaders['trn_steps_per_epoch'],
+            (iii * num_epochs_per_cycle) * dataloaders['trn_steps_per_epoch'],
+        ] for iii in range(1, config.num_cycles + 1)], [])
+    temperature = optax.join_schedules(
+        schedules=temp_schedules,
+        boundaries=temp_boundaries)
+
+    scheduler = optax.join_schedules(
+        schedules=[
+            optax.cosine_decay_schedule(
+                init_value=config.optim_lr,
+                decay_steps=num_epochs_per_cycle *
+                dataloaders['trn_steps_per_epoch'],
+            ) for _ in range(1, config.num_cycles + 1)
+        ], boundaries=[
+            iii * num_epochs_per_cycle * dataloaders['trn_steps_per_epoch']
+            for iii in range(1, config.num_cycles + 1)
+        ])
+    optimizer = sghmc(
+        learning_rate=scheduler,
+        # alpha=(1.0 - config.optim_momentum))
+        alpha=(1.0 - config.optim_momentum),
+        init_temp=temperature(0))
+
+    if config.shared_head:
+        # load trained head
+        variables = variables.unfreeze()
+        shared_ckpt = checkpoints.restore_checkpoint(
+            ckpt_dir=config.shared_head,
+            target=None
+        )
+        saved = shared_ckpt["model"]["params"].get("Dense_0")
+        if saved is None:
+            saved = shared_ckpt["model"]["params"]["head"]
+        variables["params"]["Dense_0"] = saved
+        variables = freeze(variables)
+        # freeze head
+        partition_optimizer = {"trainable": optimizer,
+                               "frozen": optax.set_to_zero()}
+        param_partitions = freeze(traverse_util.path_aware_map(
+            lambda path, v: "frozen" if "Dense_0" in path else "trainable", variables["params"]))
+        optimizer = optax.multi_transform(
+            partition_optimizer, param_partitions)
+
+    # build train state
+    state = TrainState.create(
+        apply_fn=model.apply,
+        params=variables['params'],
+        tx=optimizer,
+        image_stats=variables.get('image_stats'),
+        batch_stats=variables.get("batch_stats"),
+        temperature=temperature(0),
+        multi_transform=True if config.shared_head else False)
+
+    return state
+
+class SGHMCStateLegacy(NamedTuple):
+    count: jnp.array
+    rng_key: Any
+    momentum: Any
 
 class SGHMCState(NamedTuple):
     count: jnp.array
     rng_key: Any
     momentum: Any
+    temperature: float
 
 
 class TrainState(train_state.TrainState):
     image_stats: Any
     batch_stats: Any
     # dynamic_scale: dynamic_scale_lib.DynamicScale
+    temperature: float = 1.0
+    multi_transform: bool = False
+
+    def apply_gradients(self, *, grads, **kwargs):
+        # TODO
+        trainable_opt_state = self.opt_state.inner_states["trainable"].inner_state
+        trainable_opt_state = trainable_opt_state._replace(
+            temperature=kwargs["temperature"])
+        self.opt_state.inner_states["trainable"] = self.opt_state.inner_states["trainable"]._replace(
+            inner_state=trainable_opt_state)
+        updates, new_opt_state = self.tx.update(
+            updates=grads,
+            state=self.opt_state,
+            params=self.params)
+        new_params = optax.apply_updates(self.params, updates)
+        return self.replace(
+            step=self.step + 1,
+            params=new_params,
+            opt_state=new_opt_state,
+            **kwargs)
+
+class TrainStateLegacy(train_state.TrainState):
+    image_stats: Any
+    batch_stats: Any
+    # dynamic_scale: dynamic_scale_lib.DynamicScale
 
     def apply_gradients(self, *, grads, **kwargs):
         updates, new_opt_state = self.tx.update(
-            gradients=grads,
+            updates=grads,
             state=self.opt_state,
             params=self.params,
-            temperature=kwargs.pop('temperature', 1.0))
+            temperature=kwargs.pop("temperature", 1.0))
         new_params = optax.apply_updates(self.params, updates)
         return self.replace(
             step=self.step + 1,
@@ -122,7 +241,7 @@ class TrainState(train_state.TrainState):
             **kwargs)
 
 
-def sghmc(learning_rate, seed=0, alpha=0.1):
+def sghmc(learning_rate, seed=0, alpha=0.1, init_temp=1.0):
     """
     Optax implementation of the SGHMC and SGLD.
 
@@ -133,6 +252,63 @@ def sghmc(learning_rate, seed=0, alpha=0.1):
     """
     def init_fn(params):
         return SGHMCState(
+            count=jnp.zeros([], jnp.int32),
+            rng_key=jax.random.PRNGKey(seed),
+            # momentum=jax.tree_util.tree_map(jnp.zeros_like, params))
+            momentum=jax.tree_util.tree_map(jnp.zeros_like, params),
+            temperature=init_temp)
+
+    # def update_fn(updates, state, params=None, temperature=1.0):
+    def update_fn(updates, state, params=None):
+        gradients = updates
+        # if params is not None:
+        #     _temperature = params.get("TEMPERATURE")
+        #     if _temperature is not None:
+        #         temperature = _temperature
+        #         params = params.unfreeze()
+        #         del params["TEMPERATURE"]
+        #         params = freeze(params)
+        temperature = state.temperature
+
+        del params
+        lr = learning_rate(state.count)
+
+        # generate standard gaussian noise
+        numvars = len(jax.tree_util.tree_leaves(gradients))
+        treedef = jax.tree_util.tree_structure(gradients)
+        allkeys = jax.random.split(state.rng_key, num=numvars+1)
+        rng_key = allkeys[0]
+        noise = jax.tree_util.tree_map(
+            lambda p, k: jax.random.normal(k, shape=p.shape),
+            gradients, jax.tree_util.tree_unflatten(treedef, allkeys[1:]))
+
+        # compute the dynamics
+        momentum = jax.tree_util.tree_map(
+            lambda m, g, z: (1 - alpha) * m - lr * g + z * jnp.sqrt(
+                2 * alpha * temperature * lr
+            ), state.momentum, gradients, noise)
+        updates = momentum
+
+        return updates, SGHMCState(
+            count=state.count + 1,
+            rng_key=rng_key,
+            # momentum=momentum)
+            momentum=momentum,
+            temperature=temperature)
+
+    return optax.GradientTransformation(init_fn, update_fn)
+
+def sghmc_legacy(learning_rate, seed=0, alpha=0.1):
+    """
+    Optax implementation of the SGHMC and SGLD.
+
+    Args:
+        learning_rate : A fixed global scaling factor.
+        seed (int) : Seed for the pseudo-random generation process (default: 0).
+        alpha (float) : A momentum decay value (default: 0.1)
+    """
+    def init_fn(params):
+        return SGHMCStateLegacy(
             count=jnp.zeros([], jnp.int32),
             rng_key=jax.random.PRNGKey(seed),
             momentum=jax.tree_util.tree_map(jnp.zeros_like, params))
@@ -157,13 +333,12 @@ def sghmc(learning_rate, seed=0, alpha=0.1):
             ), state.momentum, gradients, noise)
         updates = momentum
 
-        return updates, SGHMCState(
+        return updates, SGHMCStateLegacy(
             count=state.count + 1,
             rng_key=rng_key,
             momentum=momentum)
 
     return optax.GradientTransformation(init_fn, update_fn)
-
 
 def launch(config, print_fn):
 
@@ -229,16 +404,18 @@ def launch(config, print_fn):
     # define optimizer with scheduler
     num_epochs_per_cycle = config.num_epochs_quiet + config.num_epochs_noisy
 
-    temperature = optax.join_schedules(
-        schedules=[optax.constant_schedule(0.0),] + sum([[
+    temp_schedules =[optax.constant_schedule(0.0),] + sum([[
             optax.constant_schedule(1.0),
             optax.constant_schedule(0.0),
-        ] for iii in range(1, config.num_cycles + 1)], []),
-        boundaries=sum([[
+        ] for iii in range(1, config.num_cycles + 1)], [])
+    temp_boundaries = sum([[
             (iii * num_epochs_per_cycle - config.num_epochs_noisy) *
             dataloaders['trn_steps_per_epoch'],
             (iii * num_epochs_per_cycle) * dataloaders['trn_steps_per_epoch'],
-        ] for iii in range(1, config.num_cycles + 1)], []))
+        ] for iii in range(1, config.num_cycles + 1)], [])
+    temperature = optax.join_schedules(
+        schedules=temp_schedules,
+        boundaries=temp_boundaries)
 
     scheduler = optax.join_schedules(
         schedules=[
@@ -253,7 +430,43 @@ def launch(config, print_fn):
         ])
     optimizer = sghmc(
         learning_rate=scheduler,
-        alpha=(1.0 - config.optim_momentum))
+        # alpha=(1.0 - config.optim_momentum))
+        alpha=(1.0 - config.optim_momentum),
+        init_temp=temperature(0))
+
+    if config.shared_head:
+        # load trained head
+        variables = variables.unfreeze()
+        shared_ckpt = checkpoints.restore_checkpoint(
+            ckpt_dir=config.shared_head,
+            target=None
+        )
+        saved = shared_ckpt["model"]["params"].get("Dense_0")
+        if saved is None:
+            saved = shared_ckpt["model"]["params"]["head"]
+        variables["params"]["Dense_0"] = saved
+        variables = freeze(variables)
+        # freeze head
+        partition_optimizer = {"trainable": optimizer,
+                               "frozen": optax.set_to_zero()}
+        param_partitions = freeze(traverse_util.path_aware_map(
+            lambda path, v: "frozen" if "Dense_0" in path else "trainable", variables["params"]))
+        optimizer = optax.multi_transform(
+            partition_optimizer, param_partitions)
+        # _optimizer = optax.multi_transform(
+        #     partition_optimizer, param_partitions)
+
+        # def wrapper(updates, state, params, temperature):
+        #     if params is None:
+        #         params = dict()
+        #     else:
+        #         params = params.unfreeze()
+        #     params["TEMPERATURE"] = temperature
+        #     params = freeze(params)
+        #     return _optimizer.update(updates, state, params)
+
+        # # optimizer.update = wrapper
+        # optimizer = _optimizer._replace(update=wrapper)
 
     # build train state
     state = TrainState.create(
@@ -261,12 +474,15 @@ def launch(config, print_fn):
         params=variables['params'],
         tx=optimizer,
         image_stats=variables.get('image_stats'),
-        batch_stats=variables.get("batch_stats"))
+        batch_stats=variables.get("batch_stats"),
+        temperature=temperature(0),
+        multi_transform=True if config.shared_head else False)
 
     if config.ckpt:
         sgd_config = EasyDict(ckpt["config"])
         sgd_state = get_sgd_state(sgd_config, dataloaders, model, variables)
-        ckpt = dict(model=sgd_state, config=dict(), best_acc=ckpt["best_acc"])
+        ckpt = dict(model=sgd_state, config=dict(),
+                    best_acc=ckpt["best_acc"])
         ckpt = checkpoints.restore_checkpoint(
             ckpt_dir=config.ckpt, target=ckpt
         )
@@ -288,7 +504,8 @@ def launch(config, print_fn):
     # ---------------------------------------------------------------------- #
     # Optimization
     # ---------------------------------------------------------------------- #
-    def step_trn(state, batch, config, scheduler, num_data, temperature):
+    # def step_trn(state, batch, config, scheduler, num_data, temperature):
+    def step_trn(state, batch, config, scheduler, num_data):
         def loss_fn(params):
             params_dict = dict(params=params)
             mutable = ["intermediates"]
@@ -345,17 +562,22 @@ def launch(config, print_fn):
         (metrics, new_model_state) = aux[1]
         metrics = jax.lax.pmean(metrics, axis_name='batch')
         metrics['lr'] = scheduler(state.step)
-        metrics['temperature'] = temperature(state.step)
+        # metrics['temperature'] = temperature(state.step)
+        # metrics['temperature'] = state.temp_fn(state.step)
 
+        temp = temperature(state.step)
         if new_model_state.get("batch_stats") is not None:
             # update train state
             new_state = state.apply_gradients(
-                grads=grads, temperature=temperature(state.step),
+                grads=grads, temperature=temp,
+                # grads=grads,
                 batch_stats=new_model_state["batch_stats"])
         else:
             # update train state
             new_state = state.apply_gradients(
-                grads=grads, temperature=temperature(state.step))
+                grads=grads, temperature=temp)
+            # grads=grads)
+        metrics["temperature"] = state.temperature
         return new_state, metrics
 
     def step_val(state, batch):
@@ -389,12 +611,18 @@ def launch(config, print_fn):
         metrics = jax.lax.psum(metrics, axis_name='batch')
         return metrics, jnp.exp(predictions)
 
-    p_step_trn = jax.pmap(partial(step_trn,
-                                  config=config,
-                                  scheduler=scheduler,
-                                  num_data=dataloaders['num_data'],
-                                  temperature=temperature), axis_name='batch')
-    p_step_val = jax.pmap(step_val,                 axis_name='batch')
+    # p_step_trn = jax.pmap(partial(step_trn,
+    #                               config=config,
+    #                               scheduler=scheduler,
+    #                               num_data=dataloaders['num_data'],
+    #                               temperature=temperature), axis_name='batch')
+    p_step_trn = jax.pmap(
+        partial(step_trn,
+                config=config,
+                scheduler=scheduler,
+                num_data=dataloaders['num_data']),
+        axis_name='batch')
+    p_step_val = jax.pmap(step_val, axis_name='batch')
     state = jax_utils.replicate(state)
     rng = jax.random.PRNGKey(config.seed)
 
@@ -439,6 +667,8 @@ def launch(config, print_fn):
     test_acc = tst_summarized['tst/acc'] / \
         tst_summarized['tst/cnt']
     print(f"Starting Accuracy: {test_acc:.3f}")
+
+    init_temp = state.temperature
 
     for cycle_idx, _ in enumerate(range(config.num_cycles), start=1):
 

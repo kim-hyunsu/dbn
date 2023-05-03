@@ -96,20 +96,20 @@ def launch(config, print_fn):
         from flax import traverse_util
         # load trained head
         params = variables.unfreeze()
-        ckpt = checkpoints.restore_checkpoint(
+        shared_ckpt = checkpoints.restore_checkpoint(
             ckpt_dir=config.shared_head,
             target=None
         )
-        saved = ckpt["model"]["params"].get("Dense_0")
+        saved = shared_ckpt["model"]["params"].get("Dense_0")
         if saved is None:
-            saved = ckpt["model"]["params"]["head"]
-        params["params"]["head"] = saved
+            saved = shared_ckpt["model"]["params"]["head"]
+        params["params"]["Dense_0"] = saved
         variables = freeze(params)
         # freeze head
         partition_optimizer = {"trainable": optimizer,
                                "frozen": optax.set_to_zero()}
         param_partitions = freeze(traverse_util.path_aware_map(
-            lambda path, v: "frozen" if "head" in path else "trainable", variables["params"]))
+            lambda path, v: "frozen" if "Dense_0" in path else "trainable", variables["params"]))
         optimizer = optax.multi_transform(
             partition_optimizer, param_partitions)
 
@@ -257,9 +257,18 @@ def launch(config, print_fn):
         trn_metric = []
         trn_loader = dataloaders['dataloader'](rng=data_rng)
         trn_loader = jax_utils.prefetch_to_device(trn_loader, size=2)
+        if config.shared_head:
+            trainable1 = state.params["Conv_0"]
+            frozen1 = state.params["Dense_0"]
         for batch_idx, batch in enumerate(trn_loader, start=1):
             state, metrics = p_step_trn(state, batch)
             trn_metric.append(metrics)
+        if config.shared_head:
+            trainable2 = state.params["Conv_0"]
+            frozen2 = state.params["Dense_0"]
+            assert jnp.any(trainable1["kernel"] != trainable2["kernel"])
+            assert jnp.all(frozen1["kernel"] == frozen2["kernel"])
+            assert jnp.all(frozen1["bias"] == frozen2["bias"])
         trn_metric = common_utils.get_metrics(trn_metric)
         trn_summarized = {f'trn/{k}': v for k,
                           v in jax.tree_util.tree_map(lambda e: e.mean(), trn_metric).items()}

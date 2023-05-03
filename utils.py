@@ -2,23 +2,35 @@ import jax.numpy as jnp
 import defaults_sghmc as defaults
 from jax.experimental.host_callback import call as jcall
 import os
+import wandb
 
 debug = os.environ.get("DEBUG")
 if isinstance(debug, str):
     debug = debug.lower() == "true"
 
 
-def model_list(data_name, model_style):
+def model_list(data_name, model_style, shared_head=False):
     if data_name == "CIFAR100_x32" and model_style == "BN-ReLU":
-        return [
-            "./checkpoints/bn100_sd2",
-            "./checkpoints/bn100_sd3",
-            "./checkpoints/bn100_sd5",
-            "./checkpoints/bn100_sd7",
-            "./checkpoints/bn100_sd11",
-            "./checkpoints/bn100_sd13",
-            "./checkpoints/bn100_sd17",
-        ]
+        if shared_head:
+            return [
+                "./checkpoints/bn100_sd2_shared",
+                "./checkpoints/bn100_sd3_shared",
+                "./checkpoints/bn100_sd5_shared",
+                "./checkpoints/bn100_sd7_shared",
+                "./checkpoints/bn100_sd11_shared",
+                "./checkpoints/bn100_sd13_shared",
+                "./checkpoints/bn100_sd17_shared",
+            ]
+        else:
+            return [
+                "./checkpoints/bn100_sd2",
+                "./checkpoints/bn100_sd3",
+                "./checkpoints/bn100_sd5",
+                "./checkpoints/bn100_sd7",
+                "./checkpoints/bn100_sd11",
+                "./checkpoints/bn100_sd13",
+                "./checkpoints/bn100_sd17",
+            ]
     elif data_name == "CIFAR10_x32" and model_style == "FRN-Swish":
         return [
             "./checkpoints/frn_sd2",
@@ -36,10 +48,14 @@ def model_list(data_name, model_style):
 
 logit_dir_list = ["features", "features_fixed",
                   "features_1mixup10", "features_1mixup10_fixed",
-                  "features_1mixupplus10", "features100", "features100_fixed"]
+                  "features_1mixupplus10", "features100",
+                  "features100_fixed"]
 feature_dir_list = ["features_last", "features_last_fixed",
                     "features_last_1mixup10", "features_last_1mixup10_fixed",
-                    "features_last_1mixupplus10", "features100_last", "features100_last_fixed"]
+                    "features_last_1mixupplus10", "features100_last",
+                    "features100_last_fixed", "features100_last_shared"]
+feature2_dir_list = ["features_last2",
+                     "features100_last2", "features100_last2_shared"]
 
 
 pixel_mean = jnp.array(defaults.PIXEL_MEAN, dtype=jnp.float32)
@@ -137,8 +153,44 @@ logits100_std = jnp.array([4.594066, 4.5431347, 4.8213224, 4.446335, 4.612145, 4
                            4.545, 4.6726613, 4.753336, 4.603716, 4.613296, 4.608823, 4.528189,
                            4.636887, 4.787973, 4.4409943, 4.425962, 4.6991243, 4.8889084, 4.523881,
                            4.961424, 4.0169554])
-features100_mean = jnp.array([])
-features100_std = jnp.array([])
+features100_mean = jnp.array([2.6821797, 2.1209955, 2.6185288, 2.2039928, 2.5547247, 2.039105, 2.471689,
+                              2.1542974, 2.448201, 2.4186301, 1.8662957, 2.9477813, 2.574803, 2.285054,
+                              3.3132896, 2.4924183, 2.9913025, 2.3079033, 2.770711, 2.6581316, 3.005827,
+                              2.333946, 2.369538, 2.6090517, 2.1910558, 2.622727, 2.634054, 2.8062856,
+                              2.5257275, 2.1713817, 2.203236, 2.5777533, 2.497934, 2.4077907, 2.8952234,
+                              2.205071, 2.0052783, 2.5821116, 2.7983317, 2.5822134, 2.8375964, 2.5426798,
+                              3.2819455, 2.6514902, 2.7889977, 2.2587197, 2.6996057, 2.231013, 2.77432,
+                              2.5749366, 2.994471, 2.5471873, 2.4391277, 2.3067093, 2.445581, 2.7716465,
+                              2.4797356, 2.9463704, 2.5247407, 2.1275885, 2.3230627, 2.4860115, 2.684688,
+                              2.6631765, 2.2830436, 1.9128307, 2.5121222, 2.2116106, 2.4730268, 2.571956,
+                              2.4563234, 2.1443346, 2.743497, 2.3312812, 2.6701179, 2.4309192, 2.7292767,
+                              3.275847, 2.5726342, 2.1953897, 3.0846527, 2.5292692, 2.675461, 3.1089344,
+                              2.3018517, 2.5034602, 2.7797172, 2.4456973, 2.3801384, 2.567207, 2.466297,
+                              2.6669574, 2.7068415, 2.7904708, 1.7130059, 2.9451222, 2.728442, 2.3520179,
+                              2.2697518, 2.691776, 2.2916102, 2.7537687, 2.288347, 2.289023, 2.352327,
+                              2.5175297, 2.746692, 2.0606802, 2.2319562, 2.2945952, 2.4492245, 2.3892665,
+                              2.0360563, 2.765004, 2.549863, 2.5857747, 2.539396, 2.451725, 2.6035128,
+                              2.9054475, 2.4890354, 2.4755895, 2.5463412, 2.295964, 2.230622, 2.4225528,
+                              2.9246604, 2.469591])
+features100_std = jnp.array([3.020041, 2.4570334, 2.9119263, 2.7746825, 2.9057117, 2.4719553, 2.6887927,
+                             2.5052245, 2.6453543, 2.58863, 2.3927917, 2.9533594, 2.827711, 2.607628,
+                             3.222933, 2.9110174, 2.9959304, 2.7891705, 2.8733373, 2.7833514, 3.4780564,
+                             2.9139388, 2.6436112, 2.9829261, 2.5115607, 2.9463658, 2.7846432, 3.029591,
+                             2.735362, 2.63363, 2.6311672, 2.7553408, 2.7935128, 2.902289, 2.772286,
+                             2.6675026, 2.4304438, 2.791632, 3.0617483, 3.291521, 3.0083296, 2.8447104,
+                             3.4712183, 3.013435, 2.8616705, 2.7361937, 2.7958577, 2.6078894, 2.9503095,
+                             2.8790193, 3.1457403, 2.9656067, 2.6157653, 2.5814729, 2.8496177, 2.9732368,
+                             2.7237191, 3.2284594, 2.7750266, 2.4855964, 2.5002184, 2.7398465, 3.1016884,
+                             2.8966184, 2.754434, 2.6165552, 2.8638039, 2.6836834, 2.93289, 3.0339184,
+                             2.8196006, 2.5376122, 3.1680272, 2.6272118, 2.8788815, 2.7536018, 3.0701041,
+                             3.1447372, 3.0442953, 2.5624804, 3.3762753, 3.184333, 3.0205302, 3.189589,
+                             2.8517294, 2.680569, 3.1688633, 2.6365554, 2.5802014, 3.0372775, 2.8200786,
+                             3.0894337, 3.1149647, 2.9640992, 2.2949948, 3.1538434, 2.9176462, 2.7468798,
+                             2.925565, 2.8589933, 2.654712, 2.9383888, 2.4788759, 2.6049254, 2.7213943,
+                             2.837745, 2.8747663, 2.5761907, 2.648859, 2.56473, 2.8235097, 2.6415193,
+                             2.5395846, 2.8077776, 2.9778378, 2.8533604, 2.7862434, 2.6098804, 3.0832982,
+                             3.192695, 2.7096376, 3.0188687, 2.9677248, 2.6474357, 2.6405864, 2.6109276,
+                             2.9536164, 2.8505518])
 
 
 def normalize(x):
@@ -165,6 +217,9 @@ def _get_meanstd(features_dir):
     elif features_dir == "features_last":
         mean = features_mean
         std = features_std
+    elif features_dir in ["features_last2"]:
+        mean = features_mean[None, None, ...]
+        std = features_std[None, None, ...]
     elif features_dir in [
             "features_last_fixed",
             "features_last_1mixup10",
@@ -175,9 +230,14 @@ def _get_meanstd(features_dir):
     elif features_dir in ["features100", "features100_fixed"]:
         mean = logits100_mean
         std = logits100_std
-    elif features_dir in ["features100_last", "features100_last_fixed"]:
+    elif features_dir in ["features100_last", "features100_last_fixed", "features100_last_shared"]:
         mean = features100_mean
         std = features100_std
+    elif features_dir in ["features100_last2", "features100_last2_shared"]:
+        mean = features100_mean[None, None, ...]
+        std = features100_std[None, None, ...]
+    else:
+        raise Exception("Calculate corresponding statistics")
     return mean, std
 
 
@@ -227,3 +287,45 @@ def get_info_in_dir(dir):
         dir.split(sep)[1].split("_")[0]) if sep in dir else 1
 
     return alpha, repeats
+
+
+class WandbLogger():
+    def __init__(self):
+        self.summary = dict()
+        self.logs = dict()
+
+        self.to_summary = [
+            "trn/acc_ref", "trn/nll_ref", "trn/ens_acc_ref", "trn/ens_nll_ref", "trn/kld_ref", "trn/rkld_ref",
+            "val/acc_ref", "val/nll_ref", "val/ens_acc_ref", "val/ens_nll_ref", "val/kld_ref", "val/rkld_ref",
+            "tst/acc_ref", "tst/nll_ref", "tst/ens_acc_ref", "tst/ens_nll_ref", "tst/kld_ref", "tst/rkld_ref",
+            "tst/acc", "tst/nll",
+            "tst/ens_acc", "tst/ens_nll",
+            "tst/loss", "tst/kld", "tst/rkld", "tst/skld", "tst/rkld"
+            "tst/sec", "val/sec", "trn/sec"
+        ]
+
+    def log(self, object):
+        for k in self.to_summary:
+            value = object.get(k)
+            if value is None:
+                continue
+            self.summary[k] = value
+            del object[k]
+        for k, v in object.items():
+            self.logs[k] = v
+
+    def flush(self):
+        for k, v in self.summary.items():
+            wandb.run.summary[k] = v
+        wandb.log(self.logs)
+        self.summary = dict()
+        self.logs = dict()
+
+
+def expand_to_broadcast(input, target, axis):
+    len_in = len(input.shape)
+    len_tar = len(target.shape)
+    assert len_tar >= len_in
+    expand = len_tar - len_in
+    expand = list(range(axis, axis+expand))
+    return jnp.expand_dims(input, axis=expand)

@@ -23,6 +23,22 @@ class FlaxResNetClassifier(nn.Module):
         return self.fc(features=self.num_classes, dtype=self.dtype)(x)
 
 
+class FlaxResNetClassifier2(nn.Module):
+    """
+    For transfering only the second last layer of the ResNet
+    """
+    num_classes: int = None
+    dtype: Any = jnp.float32
+    fc: nn.Module = functools.partial(nn.Dense, use_bias=True,
+                                      kernel_init=jax.nn.initializers.he_normal(),
+                                      bias_init=jax.nn.initializers.zeros)
+
+    @nn.compact
+    def __call__(self, x, **kwargs):
+        x = jnp.mean(x, axis=(1, 2))
+        return self.fc(features=self.num_classes, dtype=self.dtype)(x)
+
+
 class FlaxResNet(nn.Module):
     depth:        int = 20
     widen_factor: float = 1.
@@ -133,8 +149,7 @@ class FlaxResNet(nn.Module):
 
         # return logits if possible
         if self.num_classes:
-            y = self.fc(features=self.num_classes,
-                        dtype=self.dtype, name="head")(y)
+            y = self.fc(features=self.num_classes, dtype=self.dtype)(y)
             self.sow('intermediates', 'cls.logit', y)
 
         return y

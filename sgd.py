@@ -24,6 +24,8 @@ from tabulate import tabulate
 import datetime
 import os
 import sys
+
+from utils import WandbLogger
 sys.path.append('./')
 
 
@@ -152,8 +154,20 @@ def launch(config, print_fn):
                 jnp.where(batch['marker'], loss, jnp.zeros_like(loss))
             ) / jnp.sum(batch['marker'])
 
+            # accuracy
+            predictions = jax.nn.log_softmax(logits, axis=-1)
+            acc = evaluate_acc(
+                predictions, batch['labels'], log_input=True, reduction='none')          # [B,]
+            nll = evaluate_nll(
+                predictions, batch['labels'], log_input=True, reduction='none')          # [B,]
+
+            # refine and return metrics
+            acc = jnp.sum(jnp.where(batch['marker'], acc, jnp.zeros_like(acc)))
+            nll = jnp.sum(jnp.where(batch['marker'], nll, jnp.zeros_like(nll)))
+            cnt = jnp.sum(batch['marker'])
             # log metrics
-            metrics = OrderedDict({'loss': loss})
+            metrics = OrderedDict(
+                {'loss': loss, "acc": acc/cnt, "nll": nll/cnt})
             return loss, (metrics, new_model_state)
 
         # compute losses and gradients
@@ -247,6 +261,7 @@ def launch(config, print_fn):
     wandb.define_metric("val/acc", summary="max")
     wandb.run.summary["params"] = sum(
         x.size for x in jax.tree_util.tree_leaves(variables["params"]))
+    wl = WandbLogger()
 
     for epoch_idx, _ in enumerate(tqdm(range(config.optim_ne)), start=1):
         rng, data_rng = jax.random.split(rng)
@@ -272,6 +287,7 @@ def launch(config, print_fn):
         trn_metric = common_utils.get_metrics(trn_metric)
         trn_summarized = {f'trn/{k}': v for k,
                           v in jax.tree_util.tree_map(lambda e: e.mean(), trn_metric).items()}
+        wl.log(trn_summarized)
 
         if state.batch_stats is not None:
             # synchronize batch normalization statistics
@@ -295,7 +311,7 @@ def launch(config, print_fn):
         val_summarized['val/sec'] /= val_summarized['val/cnt']
         del val_summarized['val/cnt']
         val_summarized.update(trn_summarized)
-        wandb.log(val_summarized)
+        wl.log(val_summarized)
 
         # ---------------------------------------------------------------------- #
         # Save
@@ -315,10 +331,7 @@ def launch(config, print_fn):
             test_nll = tst_summarized['tst/nll'] / tst_summarized['tst/cnt']
             test_sec = tst_summarized['tst/sec'] / tst_summarized['tst/cnt']
             del tst_summarized["tst/cnt"]
-            wandb.run.summary["tst/acc"] = test_acc
-            wandb.run.summary["tst/nll"] = test_nll
-            wandb.run.summary["tst/sec"] = test_sec
-
+            wl.log(tst_summarized)
             best_acc = val_summarized['val/acc']
 
             if config.save:
@@ -331,6 +344,8 @@ def launch(config, print_fn):
                                             step=epoch_idx,
                                             overwrite=True,
                                             orbax_checkpointer=orbax_checkpointer)
+        wl.flush()
+
         # wait until computations are done
         jax.random.normal(jax.random.PRNGKey(0), ()).block_until_ready()
         if jnp.isnan(trn_summarized['trn/loss']):
@@ -364,6 +379,7 @@ def main():
                         choices=["sgd", "adam"])
     parser.add_argument("--nowandb", action="store_true")
     parser.add_argument("--shared_head", default="", type=str)
+    parser.add_argument("--label_smooth", action="store_true")
 
     args = parser.parse_args()
 

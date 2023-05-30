@@ -1,11 +1,36 @@
 from functools import partial
 import math
-from typing import Any, Tuple, Callable, Sequence
+from typing import Any, Tuple, Callable, Sequence, Union
 import flax.linen as nn
 import jax.numpy as jnp
 import jax
 
+from utils import expand_to_broadcast
+
 # revised from https://github.dev/JTT94/diffusion_schrodinger_bridge/tree/main/bridge/models/basic/basic.py
+
+
+class CorrectionModel(nn.Module):
+    layers: int
+
+    dense: nn.Module = partial(
+        nn.Dense,
+        bias_init=jax.nn.initializers.zeros)
+    dense2: nn.Module = nn.Dense
+    swish: Callable = nn.swish
+
+    @nn.compact
+    def __call__(self, x, **kwargs):
+        x_dim = x.shape[-1]
+        if self.layers <= 1:
+            def kernel_init(key, shape, dtype): return jnp.eye(
+                x_dim, dtype=dtype)
+            x = self.dense(x_dim, kernel_init=kernel_init)(x)
+        else:
+            for _ in range(self.layers-1):
+                x = self.swish(self.dense(x_dim)(x))
+            x = self.dense(x_dim)(x)
+        return x
 
 
 class MLPBlock(nn.Module):
@@ -154,15 +179,23 @@ def dsb_schedules(beta1, beta2, T):
 
 
 class EmbedFC(nn.Module):
-    input_dim: int
+    input_dim: Union[int, Sequence]
     emb_dim: int
     dense1: nn.Module = nn.Dense
     dense2: nn.Module = nn.Dense
     gelu: Callable = partial(nn.gelu, approximate=False)
+    conv: nn.Module = nn.Conv
 
     @nn.compact
     def __call__(self, x, **kwargs):
-        x = x.reshape(-1, self.input_dim)
+        input_dim = self.input_dim
+        if isinstance(self.input_dim, Tuple):
+            H, W, C = self.input_dim
+            x = self.conv(C, (5, 5))(x)
+            x = self.conv(C, (5, 5))(x)
+            B, H1, W1, C1 = x.shape
+            input_dim = H1*W1*C1
+        x = x.reshape(-1, input_dim)
         x = self.dense1(self.emb_dim)(x)
         x = self.gelu(x)
         out = self.dense2(self.emb_dim)(x)
@@ -248,7 +281,8 @@ class FeatureUnet(nn.Module):
     ver: str
     n_feat: int = 256
     droprate: float = 0
-    context: int = 0
+    context: Union[int, Sequence] = 0
+    conflict: bool = False
 
     # networks
     init_block: nn.Module = partial(ResidualBlock, is_res=True)
@@ -261,6 +295,8 @@ class FeatureUnet(nn.Module):
     timeembed2: nn.Module = EmbedFC
     ctxembed1: nn.Module = EmbedFC
     ctxembed2: nn.Module = EmbedFC
+    cflembed1: nn.Module = EmbedFC
+    cflembed2: nn.Module = EmbedFC
     layernorm1: nn.Module = nn.LayerNorm
     relu: Callable = nn.relu
     tanh: Callable = nn.tanh
@@ -286,6 +322,12 @@ class FeatureUnet(nn.Module):
             return self._call_v1_4(x, t, **kwargs)
         elif self.ver == "v1.5":
             return self._call_v1_5(x, t, **kwargs)
+        elif self.ver == "v1.6":
+            return self._call_v1_6(x, t, **kwargs)
+        elif self.ver == "v1.7":
+            return self._call_v1_7(x, t, **kwargs)
+        elif self.ver == "v1.8":
+            return self._call_v1_8(x, t, **kwargs)
         else:
             raise Exception("Invalid FeatureUnet Version")
 
@@ -293,7 +335,7 @@ class FeatureUnet(nn.Module):
         training = kwargs["training"]
 
         x = self.init_block(
-            self.in_channels, self.n_feat
+            x.shape[-1], self.n_feat
         )(x, **kwargs)  # (B,n_feat)
         x = self.dropout(self.droprate/2, deterministic=not training)(x)
         down1 = self.down1(
@@ -336,12 +378,16 @@ class FeatureUnet(nn.Module):
         ])
 
         up1 = up0(hiddenvec)  # (B,n_feat)
+        up1_input = cemb1*up1+temb1
+        feat_input = self.n_feat*2
         up2 = self.up1(
-            self.n_feat*2, self.n_feat
-        )(cemb1*up1+temb1, skip=down2, **kwargs)  # (B,n_feat)
+            feat_input, self.n_feat
+        )(up1_input, skip=down2, **kwargs)  # (B,n_feat)
+        up2_input = cemb2*up2+temb2
+        feat_input = self.n_feat*2
         up3 = self.up2(
-            self.n_feat*2, self.n_feat
-        )(cemb2*up2+temb2, skip=down1, **kwargs)  # (B, n_feat)
+            feat_input, self.n_feat
+        )(up2_input, skip=down1, **kwargs)  # (B, n_feat)
 
         out_fn = nn.Sequential([
             self.dense1(self.n_feat),
@@ -575,6 +621,161 @@ class FeatureUnet(nn.Module):
         up3 = self.up2(
             self.n_feat*2 if not self.context else 3*self.n_feat, self.n_feat
         )(input_up2, skip=down1, **kwargs)  # (B, n_feat)
+
+        out_fn = nn.Sequential([
+            self.dense1(self.n_feat),
+            self.layernorm2(),
+            self.gelu,
+            self.dense2(self.in_channels)
+        ])  # (B,in_ch)
+
+        out = out_fn(jnp.concatenate([up3, x], axis=-1))
+
+        return out
+
+    def _call_v1_6(self, x, t, **kwargs):
+        training = kwargs["training"]
+
+        x = self.init_block(
+            self.in_channels, self.n_feat
+        )(x, **kwargs)  # (B,n_feat)
+        x = self.dropout(self.droprate/2, deterministic=not training)(x)
+        down1 = self.down1(
+            self.n_feat, self.n_feat
+        )(x, **kwargs)  # (B,n_feat)
+        down1 = self.dropout(self.droprate, deterministic=not training)(down1)
+        down2 = self.down2(
+            self.n_feat, self.n_feat
+        )(down1, **kwargs)  # (B,n_feat)
+        down2 = self.dropout(self.droprate, deterministic=not training)(down2)
+        hiddenvec = self.down3(
+            self.n_feat
+        )(down2)  # (B,n_feat)
+        hiddenvec = self.gelu(hiddenvec)
+        hiddenvec = self.dropout(
+            self.droprate, deterministic=not training)(hiddenvec)
+
+        if self.conflict:
+            cf = kwargs["cfl"]
+            temb1 = self.timeembed1(
+                2, self.n_feat//2 if self.context else self.n_feat
+            )(jnp.stack([t, cf], axis=-1))  # (B,n_feat)
+            temb2 = self.timeembed2(
+                2, self.n_feat//2 if self.context else self.n_feat
+            )(jnp.stack([t, cf], axis=-1))  # (B,n_feat)
+        else:
+            temb1 = self.timeembed1(
+                1, self.n_feat//2 if self.context else self.n_feat
+            )(t)  # (B,n_feat)
+            temb2 = self.timeembed2(
+                1, self.n_feat//2 if self.context else self.n_feat
+            )(t)  # (B,n_feat)
+
+        cemb1 = 1
+        cemb2 = 1
+        if self.context:
+            c = kwargs["ctx"]
+            cemb1 = self.ctxembed1(
+                self.context, self.n_feat//2
+            )(c)
+            cemb2 = self.ctxembed2(
+                self.context, self.n_feat//2
+            )(c)
+            emb1 = jnp.concatenate([temb1, cemb1], axis=-1)
+            emb2 = jnp.concatenate([temb2, cemb2], axis=-1)
+        else:
+            emb1 = temb1
+            emb2 = temb2
+
+        up0 = nn.Sequential([
+            self.up0(self.n_feat),
+            self.layernorm1(),
+            self.gelu
+        ])
+
+        up1 = up0(hiddenvec)  # (B,n_feat)
+        up2 = self.up1(
+            self.n_feat*2, self.n_feat
+        )(emb1*up1, skip=down2, **kwargs)  # (B,n_feat)
+        up3 = self.up2(
+            self.n_feat*2, self.n_feat
+        )(emb2*up2, skip=down1, **kwargs)  # (B, n_feat)
+
+        out_fn = nn.Sequential([
+            self.dense1(self.n_feat),
+            self.layernorm2(),
+            self.gelu,
+            self.dense2(self.in_channels)
+        ])  # (B,in_ch)
+
+        out = out_fn(jnp.concatenate([up3, x], axis=-1))
+
+        return out
+
+    def _call_v1_7(self, x, t, **kwargs):
+        if self.conflict:
+            cf = kwargs["cfl"]-0.5
+            cf = expand_to_broadcast(cf, x, axis=1)
+            x = jnp.concatenate([x,cf], axis=-1)
+        return self._call_v1_0(x, t, **kwargs)
+
+    def _call_v1_8(self, x, t, **kwargs):
+        training = kwargs["training"]
+
+        t = expand_to_broadcast(t, x, axis=1)
+        x = jnp.concatenate([x, t], axis=-1)
+        if self.conflict:
+            cf = kwargs["cfl"]-0.5
+            cf = expand_to_broadcast(cf, x, axis=1)
+            x = jnp.concatenate([x,cf], axis=-1)
+            
+        x = self.init_block(
+            x.shape[-1], self.n_feat
+        )(x, **kwargs)  # (B,n_feat)
+        x = self.dropout(self.droprate/2, deterministic=not training)(x)
+        down1 = self.down1(
+            self.n_feat, self.n_feat
+        )(x, **kwargs)  # (B,n_feat)
+        down1 = self.dropout(self.droprate, deterministic=not training)(down1)
+        down2 = self.down2(
+            self.n_feat, self.n_feat
+        )(down1, **kwargs)  # (B,n_feat)
+        down2 = self.dropout(self.droprate, deterministic=not training)(down2)
+        hiddenvec = self.down3(
+            self.n_feat
+        )(down2)  # (B,n_feat)
+        hiddenvec = self.gelu(hiddenvec)
+        hiddenvec = self.dropout(
+            self.droprate, deterministic=not training)(hiddenvec)
+
+        cemb1 = 1
+        cemb2 = 1
+        if self.context:
+            c = kwargs["ctx"]
+            cemb1 = self.ctxembed1(
+                self.context, self.n_feat
+            )(c)
+            cemb2 = self.ctxembed2(
+                self.context, self.n_feat
+            )(c)
+
+        up0 = nn.Sequential([
+            self.up0(self.n_feat),
+            self.layernorm1(),
+            self.gelu
+        ])
+
+        up1 = up0(hiddenvec)  # (B,n_feat)
+        up1_input = cemb1*up1
+        feat_input = self.n_feat*2
+        up2 = self.up1(
+            feat_input, self.n_feat
+        )(up1_input, skip=down2, **kwargs)  # (B,n_feat)
+        up2_input = cemb2*up2
+        feat_input = self.n_feat*2
+        up3 = self.up2(
+            feat_input, self.n_feat
+        )(up2_input, skip=down1, **kwargs)  # (B, n_feat)
 
         out_fn = nn.Sequential([
             self.dense1(self.n_feat),

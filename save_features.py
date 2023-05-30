@@ -1,3 +1,4 @@
+from configparser import Interpolation
 from tqdm import tqdm
 import argparse
 from flax import jax_utils
@@ -17,6 +18,7 @@ import os
 import numpy as np
 from utils import expand_to_broadcast, get_info_in_dir, normalize, model_list, jprint
 from utils import logit_dir_list, feature_dir_list, feature2_dir_list
+from flax.training import common_utils
 
 
 def get_ckpt_temp(ckpt_dir, shared_head=False):
@@ -81,7 +83,6 @@ def get_ckpt_temp(ckpt_dir, shared_head=False):
             sghmc_config, dataloaders, model, variables)
 
     sghmc_ckpt["model"] = sghmc_state
-    # sghmc_ckpt["ckpt_dir"] = sghmc_ckpt_dir
     return sghmc_config, sghmc_ckpt, rng
 
 
@@ -168,24 +169,35 @@ class Bank():
         return new
 
 
-def mixup_data(rng, batch, alpha=1.0):
+def mixup_data(rng, batch, alpha=1.0, interpolation=True):
     x = batch["images"]
     assert len(x.shape) == 4  # no parallel dimension
 
     beta_rng, perm_rng = jax.random.split(rng)
     lam = jnp.where(alpha > 0, jax.random.beta(beta_rng, alpha, alpha), 1)
 
-    arange = jnp.arange(0, x.shape[0])
-    index = jax.random.permutation(perm_rng, arange)
-    index = jnp.where(x.shape[0] == jnp.sum(batch["marker"]), index, arange)
+    def mix():
+        arange = jnp.arange(0, x.shape[0])
+        index = jax.random.permutation(perm_rng, arange)
+        index = jnp.where(x.shape[0] == jnp.sum(batch["marker"]), index, arange)
 
-    mixed_x = lam*x+(1-lam)*x[index, ...]
-    batch["images"] = mixed_x
+        mixed_x = jnp.where(
+            interpolation,
+            lam*x+(1-lam)*x[index, ...],
+            (2-lam)*x-(1-lam)*x[index, ...])
+        return mixed_x
+
+    batch["images"] = jnp.where(
+        alpha<=0,
+        batch["images"],
+        mix()
+    )
     batch["lambdas"] = jnp.tile(lam, reps=[x.shape[0]])
     return batch
 
 
-def mixup_inclass(rng, batch, bank, alpha=1.0):
+
+def mixup_inclass(rng, batch, bank, alpha=1.0, interpolation=True):
     rng = jax_utils.unreplicate(rng)
     shapes = dict(
         images=batch["images"].shape,
@@ -204,7 +216,10 @@ def mixup_inclass(rng, batch, bank, alpha=1.0):
     lam = jnp.where(alpha > 0, jax.random.beta(beta_rng, alpha, alpha), 1)
     ingredient = bank.withdraw(perm_rng, batch)
 
-    mixed_x = lam*x + (1-lam)*ingredient
+    mixed_x = jnp.where(
+        interpolation,
+        lam*x + (1-lam)*ingredient,
+        (2-lam)*x-(1-lam)*ingredient)
     batch["images"] = mixed_x.reshape(*shapes["images"])
     batch["lambdas"] = jnp.tile(
         lam, reps=[x.shape[0]]).reshape(*shapes["labels"])
@@ -268,11 +283,47 @@ if __name__ == "__main__":
         num_classes = 10
 
     bank = Bank(num_classes)
+    if "ext" in dir:
+        mixup_data = partial(mixup_data, interpolation=False)
+        mixup_inclass = partial(mixup_inclass, interpolation=False)
+
     if "mixupplus" in dir:
         p_mixup_data = partial(mixup_inclass, bank=bank, alpha=alpha)
     else:
-        p_mixup_data = jax.pmap(
-            partial(mixup_data, alpha=alpha), axis_name="batch")
+        if "rand" in dir:
+            p_mixup_data = jax.pmap(
+                mixup_data,axis_name="batch")
+        else:
+            p_mixup_data = jax.pmap(
+                partial(mixup_data, alpha=alpha),axis_name="batch")
+    
+    @partial(jax.pmap, axis_name="batch")
+    def adv_attack(state, batch):
+        def loss_fn(x):
+            params_dict = dict(params=state.params)
+            mutable = ["intermediates"]
+            if state.image_stats is not None:
+                params_dict["image_stats"] = state.image_stats
+            if hasattr(state, "batch_stats") and state.batch_stats is not None:
+                params_dict["batch_stats"] = state.batch_stats
+                mutable.append("batch_stats")
+            _, new_model_state = state.apply_fn(
+                params_dict, x, rngs=None, mutable=mutable)
+            logits = new_model_state['intermediates']['cls.logit'][0]
+            target = common_utils.onehot(
+                batch['labels'], num_classes=logits.shape[-1])  # [B, K,]
+            loss = -jnp.sum(target * jax.nn.log_softmax(logits,
+                            axis=-1), axis=-1)      # [B,]
+            loss = jnp.sum(
+                jnp.where(batch['marker'], loss, jnp.zeros_like(loss))
+            ) / jnp.sum(batch['marker'])
+            return loss
+        x = batch["images"]
+        eps = jnp.sign(jax.grad(loss_fn)(x)) # Sign of gradient of the loss function
+        adv_lmda = 1. / 255 # level of adversarial attack
+        x_adv = x + eps * adv_lmda
+        batch["images"] = x_adv
+        return batch
 
     shape = None
     data_rng, rng = jax.random.split(rng)
@@ -292,13 +343,27 @@ if __name__ == "__main__":
                 for rep in range(repeats):
                     train_rng = jax.random.fold_in(rng, rep)
                     _, mixup_rng = jax.random.split(train_rng)
-                    train_loader = dataloaders["trn_loader"](rng=None)
+                    if "valid" in dir:
+                        train_loader = dataloaders["val_loader"](rng=None)
+                    else:
+                        train_loader = dataloaders["trn_loader"](rng=None)
                     train_loader = jax_utils.prefetch_to_device(
                         train_loader, size=2)
                     for batch_idx, batch in enumerate(train_loader, start=1):
                         b_mixup_rng = jax.random.fold_in(mixup_rng, batch_idx)
-                        batch = p_mixup_data(
-                            jax_utils.replicate(b_mixup_rng), batch)
+                        if rep == 0:
+                            ps, bs = batch["marker"].shape
+                            batch["lambdas"] = jnp.tile(1, reps=[ps,bs])
+                        else:
+                            if "rand" in dir:
+                                _alpha = jax.random.uniform(
+                                    b_mixup_rng,(),minval=0,maxval=alpha)
+                                _alpha = jax_utils.replicate(_alpha)
+                                batch = p_mixup_data(
+                                    jax_utils.replicate(b_mixup_rng), batch, _alpha)
+                            else:
+                                batch = p_mixup_data(
+                                    jax_utils.replicate(b_mixup_rng), batch)
                         _logits = p_get_logits(classifier_state, batch)
                         logits = _logits[batch["marker"] == True]
                         logits = logits.reshape(-1, *_logits.shape[2:])
@@ -320,6 +385,54 @@ if __name__ == "__main__":
                     np.save(f, lambdas)
                 del logits_list
                 del lambdas_list
+            else:
+                advfeature_path = f"{dir}/train_advfeatures_M{mode_idx}S{i}.npy"
+                logits_list = []
+                for rep in range(repeats):
+                    # rngs
+                    train_rng = jax.random.fold_in(rng, rep)
+                    _, mixup_rng = jax.random.split(train_rng)
+                    # choose type of loader
+                    if "valid" in dir:
+                        train_loader = dataloaders["val_loader"](rng=None)
+                    else:
+                        train_loader = dataloaders["trn_loader"](rng=None)
+                    # prefetching
+                    train_loader = jax_utils.prefetch_to_device(
+                        train_loader, size=2)
+                    # sample images
+                    for batch_idx, batch in enumerate(train_loader, start=1):
+                        b_mixup_rng = jax.random.fold_in(mixup_rng, batch_idx)
+                        # mixup
+                        if rep == 0:
+                            ps, bs = batch["marker"].shape
+                            batch["lambdas"] = jnp.tile(1, reps=[ps,bs])
+                        else:
+                            if "rand" in dir:
+                                _alpha = jax.random.uniform(
+                                    b_mixup_rng,(),minval=0,maxval=alpha)
+                                _alpha = jax_utils.replicate(_alpha)
+                                batch = p_mixup_data(
+                                    jax_utils.replicate(b_mixup_rng), batch, _alpha)
+                            else:
+                                batch = p_mixup_data(
+                                    jax_utils.replicate(b_mixup_rng), batch)
+                        batch = adv_attack(classifier_state, batch)
+                        # get logits
+                        _logits = p_get_logits(classifier_state, batch)
+                        logits = _logits[batch["marker"] == True]
+                        logits = logits.reshape(-1, *_logits.shape[2:])
+                        assert len(logits.shape) == 2 or len(logits.shape) == 4
+                        logits_list.append(logits)
+                logits = jnp.concatenate(logits_list, axis=0)
+                shape = shape or logits.shape[1:]
+                if shape:
+                    assert logits.shape[1:] == shape
+                with open(advfeature_path, "wb") as f:
+                    logits = np.array(logits)
+                    np.save(f, logits)
+                del logits_list
+
 
             # valid set
             feature_path = f"{dir}/valid_features_M{mode_idx}S{i}.npy"
@@ -328,31 +441,41 @@ if __name__ == "__main__":
                 valid_loader = jax_utils.prefetch_to_device(
                     valid_loader, size=2)
                 logits_list = []
-                # lambdas_list = []
                 for batch_idx, batch in enumerate(valid_loader, start=1):
                     _logits = p_get_logits(classifier_state, batch)
-                    # logits = _logits[batch["marker"] ==
-                    #                  True].reshape(-1, _logits.shape[-1])
                     logits = _logits[batch["marker"] == True]
                     logits = logits.reshape(-1, *_logits.shape[2:])
                     assert len(logits.shape) == 2 or len(logits.shape) == 4
-                    # lambdas = batch["lambdas"][batch["marker"] == True]
-                    # assert len(lambdas.shape) == 1
                     logits_list.append(logits)
-                    # lambdas_list.append(lambdas)
                 logits = jnp.concatenate(logits_list, axis=0)
                 shape = shape or logits.shape[1:]
                 if shape:
                     assert logits.shape[1:] == shape
-                # lambdas = jnp.concatenate(lambdas_list, axis=0)
                 with open(feature_path, "wb") as f:
                     logits = np.array(logits)
                     np.save(f, logits)
-                # with open(f"{dir}/valid_lambdas_M{mode_idx}S{i}.npy", "wb") as f:
-                #     lambdas = np.array(lambdas)
-                #     np.save(f, lambdas)
                 del logits_list
-                # del lambdas_list
+            else:
+                advfeature_path = f"{dir}/valid_advfeatures_M{mode_idx}S{i}.npy"
+                valid_loader = dataloaders["val_loader"](rng=None)
+                valid_loader = jax_utils.prefetch_to_device(
+                    valid_loader, size=2)
+                logits_list = []
+                for batch_idx, batch in enumerate(valid_loader, start=1):
+                    batch = adv_attack(classifier_state, batch)
+                    _logits = p_get_logits(classifier_state, batch)
+                    logits = _logits[batch["marker"] == True]
+                    logits = logits.reshape(-1, *_logits.shape[2:])
+                    assert len(logits.shape) == 2 or len(logits.shape) == 4
+                    logits_list.append(logits)
+                logits = jnp.concatenate(logits_list, axis=0)
+                shape = shape or logits.shape[1:]
+                if shape:
+                    assert logits.shape[1:] == shape
+                with open(advfeature_path, "wb") as f:
+                    logits = np.array(logits)
+                    np.save(f, logits)
+                del logits_list
 
             # test set
             feature_path = f"{dir}/test_features_M{mode_idx}S{i}.npy"
@@ -360,28 +483,37 @@ if __name__ == "__main__":
                 test_loader = dataloaders["tst_loader"](rng=None)
                 test_loader = jax_utils.prefetch_to_device(test_loader, size=2)
                 logits_list = []
-                # lambdas_list = []
                 for batch_idx, batch in enumerate(test_loader, start=1):
                     _logits = p_get_logits(classifier_state, batch)
-                    # logits = _logits[batch["marker"] ==
-                    #                  True].reshape(-1, _logits.shape[-1])
                     logits = _logits[batch["marker"] == True]
                     logits = logits.reshape(-1, *_logits.shape[2:])
                     assert len(logits.shape) == 2 or len(logits.shape) == 4
-                    # lambdas = batch["lambdas"][batch["marker"] == True]
-                    # assert len(lambdas.shape) == 1
                     logits_list.append(logits)
-                    # lambdas_list.append(lambdas)
                 logits = jnp.concatenate(logits_list, axis=0)
                 shape = shape or logits.shape[1:]
                 if shape:
                     assert logits.shape[1:] == shape
-                # lambdas = jnp.concatenate(lambdas_list, axis=0)
                 with open(feature_path, "wb") as f:
                     logits = np.array(logits)
                     np.save(f, logits)
-                # with open(f"{dir}/test_lambdas_M{mode_idx}S{i}.npy", "wb") as f:
-                #     lambdas = np.array(lambdas)
-                #     np.save(f, lambdas)
                 del logits_list
-                # del lambdas_list
+            else:
+                advfeature_path = f"{dir}/test_advfeatures_M{mode_idx}S{i}.npy"
+                test_loader = dataloaders["tst_loader"](rng=None)
+                test_loader = jax_utils.prefetch_to_device(test_loader, size=2)
+                logits_list = []
+                for batch_idx, batch in enumerate(test_loader, start=1):
+                    batch = adv_attack(classifier_state, batch)
+                    _logits = p_get_logits(classifier_state, batch)
+                    logits = _logits[batch["marker"] == True]
+                    logits = logits.reshape(-1, *_logits.shape[2:])
+                    assert len(logits.shape) == 2 or len(logits.shape) == 4
+                    logits_list.append(logits)
+                logits = jnp.concatenate(logits_list, axis=0)
+                shape = shape or logits.shape[1:]
+                if shape:
+                    assert logits.shape[1:] == shape
+                with open(advfeature_path, "wb") as f:
+                    logits = np.array(logits)
+                    np.save(f, logits)
+                del logits_list

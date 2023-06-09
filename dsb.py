@@ -104,89 +104,101 @@ def build_featureloaders(config, rng=None):
     test_Asupples_list = []
     test_Bsupples_list = []
     test_lambdas_list = []
-    for mode_idx in range(1+n_Amodes):  # total 1+n_Amodes
-        if mode_idx == 0:  # p_B
-            for i in tqdm(range(n_samples_each_Bmode)):
-                # logits
-                train_logits = load_arrays(
-                    dir, "train", "features", mode_idx, i)
-                valid_logits = load_arrays(
-                    dir, "valid", "features", mode_idx, i)
-                test_logits = load_arrays(
-                    dir, "test", "features", mode_idx, i)
-                train_Blogits_list.append(train_logits)
-                valid_Blogits_list.append(valid_logits)
-                test_Blogits_list.append(test_logits)
-                # lambdas
-                train_lambdas = load_arrays(
-                    dir, "train", "lambdas", mode_idx, i, train_logits.shape[0])
-                valid_lambdas = load_arrays(
-                    dir, "valid", "lambdas", mode_idx, i, valid_logits.shape[0])
-                test_lambdas = load_arrays(
-                    dir, "test", "lambdas", mode_idx, i, test_logits.shape[0])
-                train_lambdas_list.append(train_lambdas)
-                valid_lambdas_list.append(valid_lambdas)
-                test_lambdas_list.append(test_lambdas)
-                # lambdas (sync between features and contexts)
-                train_lambdas = load_arrays(
-                    f_dir, "train", "lambdas", mode_idx, i, train_logits.shape[0])
-                train_lambdas_checker2.append(train_lambdas)
-                # features (for context)
-                train_features = load_arrays(
-                    f_dir, "train", "features", mode_idx, i, train_logits.shape[0])
-                valid_features = load_arrays(
-                    f_dir, "valid", "features", mode_idx, i, valid_logits.shape[0])
-                test_features = load_arrays(
-                    f_dir, "test", "features", mode_idx, i, test_logits.shape[0])
-                train_Bfeatures_list.append(train_features)
-                valid_Bfeatures_list.append(valid_features)
-                test_Bfeatures_list.append(test_features)
-                # features for adversarial images
-                train_supples = load_arrays(
-                    dir, "train", "advfeatures", mode_idx, i)
-                valid_supples = load_arrays(
-                    dir, "valid", "advfeatures", mode_idx, i)
-                test_supples = load_arrays(
-                    dir, "test", "advfeatures", mode_idx, i)
-                train_Bsupples_list.append(train_supples)
-                valid_Bsupples_list.append(valid_supples)
-                test_Bsupples_list.append(test_supples)
-        else:  # p_A (mixture of modes)
-            for i in tqdm(range(n_samples_each_Amode)):
-                # logits
-                train_logits = load_arrays(
-                    dir, "train", "features", mode_idx, i)
-                valid_logits = load_arrays(
-                    dir, "valid", "features", mode_idx, i)
-                test_logits = load_arrays(
-                    dir, "test", "features", mode_idx, i)
-                train_Alogits_list.append(train_logits)
-                valid_Alogits_list.append(valid_logits)
-                test_Alogits_list.append(test_logits)
-                # lambdas (for sync)
-                train_lambdas = load_arrays(
-                    dir, "train", "lambdas", mode_idx, i, train_logits.shape[0])
-                train_lambdas_checker.append(train_lambdas)
-                # features (for context)
-                train_features = load_arrays(
-                    f_dir, "train", "features", mode_idx, i, train_logits.shape[0])
-                valid_features = load_arrays(
-                    f_dir, "valid", "features", mode_idx, i, valid_logits.shape[0])
-                test_features = load_arrays(
-                    f_dir, "test", "features", mode_idx, i, test_logits.shape[0])
-                train_Afeatures_list.append(train_features)
-                valid_Afeatures_list.append(valid_features)
-                test_Afeatures_list.append(test_features)
-                # features for adversarial images
-                train_supples = load_arrays(
-                    dir, "train", "advfeatures", mode_idx, i)
-                valid_supples = load_arrays(
-                    dir, "valid", "advfeatures", mode_idx, i)
-                test_supples = load_arrays(
-                    dir, "test", "advfeatures", mode_idx, i)
-                train_Asupples_list.append(train_supples)
-                valid_Asupples_list.append(valid_supples)
-                test_Asupples_list.append(test_supples)
+
+    def putinB(mode_idx, i):
+        # logits
+        train_logits = load_arrays(
+            dir, "train", "features", mode_idx, i)
+        valid_logits = load_arrays(
+            dir, "valid", "features", mode_idx, i)
+        test_logits = load_arrays(
+            dir, "test", "features", mode_idx, i)
+        train_Blogits_list.append(train_logits)
+        valid_Blogits_list.append(valid_logits)
+        test_Blogits_list.append(test_logits)
+        # lambdas
+        train_lambdas = load_arrays(
+            dir, "train", "lambdas", mode_idx, i, train_logits.shape[0])
+        valid_lambdas = load_arrays(
+            dir, "valid", "lambdas", mode_idx, i, valid_logits.shape[0])
+        test_lambdas = load_arrays(
+            dir, "test", "lambdas", mode_idx, i, test_logits.shape[0])
+        train_lambdas_list.append(train_lambdas)
+        valid_lambdas_list.append(valid_lambdas)
+        test_lambdas_list.append(test_lambdas)
+        # lambdas (sync between features and contexts)
+        train_lambdas = load_arrays(
+            f_dir, "train", "lambdas", mode_idx, i, train_logits.shape[0])
+        train_lambdas_checker2.append(train_lambdas)
+        # features (for context)
+        train_features = load_arrays(
+            f_dir, "train", "features", mode_idx, i, train_logits.shape[0])
+        valid_features = load_arrays(
+            f_dir, "valid", "features", mode_idx, i, valid_logits.shape[0])
+        test_features = load_arrays(
+            f_dir, "test", "features", mode_idx, i, test_logits.shape[0])
+        train_Bfeatures_list.append(train_features)
+        valid_Bfeatures_list.append(valid_features)
+        test_Bfeatures_list.append(test_features)
+        # features for adversarial images
+        train_supples = load_arrays(
+            dir, "train", "advfeatures", mode_idx, i)
+        valid_supples = load_arrays(
+            dir, "valid", "advfeatures", mode_idx, i)
+        test_supples = load_arrays(
+            dir, "test", "advfeatures", mode_idx, i)
+        train_Bsupples_list.append(train_supples)
+        valid_Bsupples_list.append(valid_supples)
+        test_Bsupples_list.append(test_supples)
+
+    def putinA(mode_idx, i):
+        # logits
+        train_logits = load_arrays(
+            dir, "train", "features", mode_idx, i)
+        valid_logits = load_arrays(
+            dir, "valid", "features", mode_idx, i)
+        test_logits = load_arrays(
+            dir, "test", "features", mode_idx, i)
+        train_Alogits_list.append(train_logits)
+        valid_Alogits_list.append(valid_logits)
+        test_Alogits_list.append(test_logits)
+        # lambdas (for sync)
+        train_lambdas = load_arrays(
+            dir, "train", "lambdas", mode_idx, i, train_logits.shape[0])
+        train_lambdas_checker.append(train_lambdas)
+        # features (for context)
+        train_features = load_arrays(
+            f_dir, "train", "features", mode_idx, i, train_logits.shape[0])
+        valid_features = load_arrays(
+            f_dir, "valid", "features", mode_idx, i, valid_logits.shape[0])
+        test_features = load_arrays(
+            f_dir, "test", "features", mode_idx, i, test_logits.shape[0])
+        train_Afeatures_list.append(train_features)
+        valid_Afeatures_list.append(valid_features)
+        test_Afeatures_list.append(test_features)
+        # features for adversarial images
+        train_supples = load_arrays(
+            dir, "train", "advfeatures", mode_idx, i)
+        valid_supples = load_arrays(
+            dir, "valid", "advfeatures", mode_idx, i)
+        test_supples = load_arrays(
+            dir, "test", "advfeatures", mode_idx, i)
+        train_Asupples_list.append(train_supples)
+        valid_Asupples_list.append(valid_supples)
+        test_Asupples_list.append(test_supples)
+
+    if config.pm060704 > 0:
+        mode_idx = 0
+        putinB(mode_idx, 0)
+        putinA(mode_idx, config.pm060704)
+    else:
+        for mode_idx in range(1+n_Amodes):  # total 1+n_Amodes
+            if mode_idx == 0:  # p_B
+                for i in tqdm(range(n_samples_each_Bmode)):
+                    putinB(mode_idx, i)
+            else:  # p_A (mixture of modes)
+                for i in tqdm(range(n_samples_each_Amode)):
+                    putinA(mode_idx, i)
 
     train_logitsA = np.concatenate(train_Alogits_list, axis=0)
     train_logitsA = jnp.array(train_logitsA)
@@ -1391,9 +1403,17 @@ def launch(config, print_fn):
                 p_B = jax.nn.softmax(unnorm_logitsB, axis=-1)
                 mask = jnp.argmax(p_A, axis=-1) != jnp.argmax(p_B, axis=-1)
                 mask = expand_to_broadcast(mask, diff, axis=1)
+            elif config.pm053105:
+                p_A = jax.nn.softmax(unnorm_logitsA, axis=-1)
+                p_B = jax.nn.softmax(unnorm_logitsB, axis=-1)
+                mask = jnp.argmax(p_A, axis=-1) == jnp.argmax(p_B, axis=-1)
+                mask = expand_to_broadcast(mask, diff, axis=1)
             loss = mse_loss(epsilon, diff, lamb=lamb, mask=mask)
             x0eps = logits_t - _sigma_t*epsilon
-            unnorm_x0eps = unnormalize(x0eps[..., :x_dim//2])
+            if config.supple:
+                unnorm_x0eps = unnormalize(x0eps[..., :x_dim//2])
+            else:
+                unnorm_x0eps = unnormalize(x0eps)
             celoss = collect_rglr(
                 unnorm_x0eps, unnorm_logitsA, unnorm_logitsB, labels, batch, cparams)
             celoss /= sigma_t**2
@@ -1497,8 +1517,10 @@ def launch(config, print_fn):
         ema_params, ema_cparams = state.ema_params
         context = f_normalize(batch["contexts"]) if config.context else None
         conflicts = batch["conflicts"] if config.conflict else None
-        supplesB = normalize(batch["supplesB"]) if config.supple else None
-        supplesA = normalize(batch["supplesA"]) if config.supple else None
+        _supplesB = batch["supplesB"] if config.supple else None
+        _supplesA = batch["supplesA"] if config.supple else None
+        supplesB = normalize(_supplesB) if config.supple else None
+        supplesA = normalize(_supplesA) if config.supple else None
 
         def apply(x_n, t_n, ctx, cfl):
             params_dict = dict(params=ema_params)
@@ -1527,7 +1549,10 @@ def launch(config, print_fn):
                 state.rng, apply, logitsB, context, conflicts, dsb_stats)
             sec = time.time()-begin
             if config.supple:
-                f_gen_all = f_gen_all[..., :x_dim//2]
+                f_gen_all, a_gen_all = f_gen_all[...,
+                                                 :x_dim//2], f_gen_all[..., x_dim//2:]
+                a_gen_all = jax.vmap(unnormalize)(a_gen_all)
+                a_gen = a_gen_all[-1]
             f_gen_all = jax.vmap(unnormalize)(f_gen_all)
             f_gen = f_gen_all[-1]
         elif config.sample_ensemble > 1:
@@ -1545,7 +1570,10 @@ def launch(config, print_fn):
             f_gen_all = jnp.reshape(
                 f_gen_all, (repeats, -1, *logitsB.shape[1:]))
             if config.supple:
-                f_gen_all = f_gen_all[..., :x_dim//2]
+                f_gen_all, a_gen_all = f_gen_all[...,
+                                                 :x_dim//2], f_gen_all[..., x_dim//2:]
+                a_gen_all = jax.vmap(unnormalize)(a_gen_all)
+                a_gen = a_gen_all.mean(0)
             f_gen_all = jax.vmap(unnormalize)(f_gen_all)
             f_gen = f_gen_all.mean(0)
         else:
@@ -1554,10 +1582,13 @@ def launch(config, print_fn):
                 state.rng, apply, logitsB, context, conflicts, dsb_stats)
             sec = time.time()-begin
             if config.supple:
-                f_gen = f_gen[..., :x_dim//2]
+                f_gen, a_gen = f_gen[..., :x_dim//2], f_gen[..., x_dim//2:]
+                a_gen = unnormalize(a_gen)
             f_gen = unnormalize(f_gen)
         f_real = _logitsA
         f_init = _logitsB
+        a_real = _supplesA
+        a_init = _supplesB
         if config.conflict:
             # product of expert
             f_gen = f_gen.reshape(2, -1, *f_gen.shape[1:]).mean(0)
@@ -1634,8 +1665,12 @@ def launch(config, print_fn):
         C = get_logits(f_gen, "C", ema_cparams)
         A = get_logits(f_real, "A", ema_cparams)
         B = get_logits(f_init, "B", ema_cparams)
+        aC = get_logits(a_gen, "C", ema_cparams) if config.supple else None
+        aA = get_logits(a_real, "A", ema_cparams) if config.supple else None
+        aB = get_logits(a_init, "B", ema_cparams) if config.supple else None
+        supple_example = (aC, aA, aB, labels) if config.supple else None
 
-        return f_all, metrics, (A, B, C, labels)
+        return f_all, metrics, (A, B, C, labels), supple_example
 
     def step_acc_ref(state, batch):
         _logitsB = batch["images"]  # the current mode
@@ -1695,6 +1730,69 @@ def launch(config, print_fn):
             image_array = pixelize(image_array)
             image = Image.fromarray(image_array)
             image.save(train_image_name if train else valid_image_name)
+
+    def save_advcls(examples, sexamples, name, epoch_idx):
+        A, B, C, labels = examples
+        aA, aB, aC, _ = sexamples
+        assert len(labels.shape) == 2
+        A = A.reshape(-1, *A.shape[2:])
+        B = B.reshape(-1, *B.shape[2:])
+        C = C.reshape(-1, *C.shape[2:])
+        labels = labels.reshape(-1, *labels.shape[2:])
+        aA = aA.reshape(-1, *aA.shape[2:])
+        aB = aB.reshape(-1, *aB.shape[2:])
+        aC = aC.reshape(-1, *aC.shape[2:])
+
+        def top5(arr):
+            top = jnp.argmax(arr, axis=-1)
+            mask = common_utils.onehot(top, arr.shape[-1])
+            arr = -mask*1e10+(1-mask)*arr
+            mask = jnp.asarray(mask, dtype=bool)
+            for i in range(1, 5):
+                top = jnp.argmax(arr, axis=-1)
+                mask2 = common_utils.onehot(top, arr.shape[-1])
+                arr = -mask2*1e10+(1-mask2)*arr
+                mask = jnp.logical_or(mask, mask2)
+            return mask
+        # index of batch that was correct in B but not in A
+        Apred = jax.nn.log_softmax(A, axis=-1)
+        Acorrect = evaluate_acc(
+            Apred, labels, log_input=True, reduction="none")
+        Bpred = jax.nn.log_softmax(B, axis=-1)
+        Bcorrect = evaluate_acc(
+            Bpred, labels, log_input=True, reduction="none")
+        Acorrect = jnp.asarray(Acorrect, dtype=bool)
+        Bcorrect = jnp.asarray(Bcorrect, dtype=bool)
+        save_maskA = jnp.logical_and(Acorrect, ~Bcorrect)
+        save_maskB = jnp.logical_and(~Acorrect, Bcorrect)
+        save_maskAB = jnp.logical_and(Acorrect, Bcorrect)
+        save_mask_ = jnp.logical_and(~Acorrect, ~Bcorrect)
+
+        aApred = jax.nn.log_softmax(aA, axis=-1)
+        aBpred = jax.nn.log_softmax(aB, axis=-1)
+        aCpred = jax.nn.log_softmax(aC, axis=-1)
+
+        def adv_plot(save_mask, dis):
+            if jnp.any(save_mask):
+                save_labelA = top5(Apred[save_mask][0])
+                save_labelB = top5(Bpred[save_mask][0])
+                save_label = jnp.logical_or(save_labelA, save_labelB)
+                Cpred = jax.nn.log_softmax(C, axis=-1)
+                _A = jnp.exp(Apred[save_mask][0][save_label])
+                _B = jnp.exp(Bpred[save_mask][0][save_label])
+                _C = jnp.exp(Cpred[save_mask][0][save_label])
+                _labels = labels[save_mask][0]
+                _aA = jnp.exp(aApred[save_mask][0][save_label])
+                _aB = jnp.exp(aBpred[save_mask][0][save_label])
+                _aC = jnp.exp(aCpred[save_mask][0][save_label])
+                cls_plot(_A, _B, _C, save_label, _labels,
+                         name+dis, epoch_idx)
+                cls_plot(_aA, _aB, _aC, save_label, _labels,
+                         name+"-div"+dis, epoch_idx)
+        adv_plot(save_maskA, "B")
+        adv_plot(save_maskB, "A")
+        adv_plot(save_maskAB, "AB")
+        adv_plot(save_mask_, "_")
 
     def save_cls(A, B, C, labels, name, epoch_idx):
         assert len(labels.shape) == 2
@@ -1773,7 +1871,7 @@ def launch(config, print_fn):
         for batch_idx, batch in enumerate(test_loader, start=1):
             rng = jax.random.fold_in(rng, batch_idx)
             state = state.replace(rng=jax_utils.replicate(rng))
-            _, _, examples = p_step_sample(state, batch)
+            _, _, examples, _ = p_step_sample(state, batch)
             A, B, C, labels = examples
             time_stamp = datetime.datetime.now().strftime('%Y%m%d%H%M%S')
             path = getattr(
@@ -1830,7 +1928,7 @@ def launch(config, print_fn):
                     save_samples(state, batch, epoch_idx, train=True)
             else:
                 if (epoch_idx+1) % 50 == 0:
-                    _, acc_metrics, _ = p_step_sample(state, batch)
+                    _, acc_metrics, _, _ = p_step_sample(state, batch)
                     metrics.update(acc_metrics)
 
             train_metrics.append(metrics)
@@ -1876,7 +1974,7 @@ def launch(config, print_fn):
                     save_samples(state, batch, epoch_idx, train=False)
             else:
                 if (epoch_idx+1) % 1 == 0:
-                    _, acc_metrics, _ = p_step_sample(state, batch)
+                    _, acc_metrics, _, _ = p_step_sample(state, batch)
                     metrics.update(acc_metrics)
                     assert jnp.all(metrics["count"] == acc_metrics["count"])
 
@@ -1912,15 +2010,18 @@ def launch(config, print_fn):
             for batch_idx, batch in enumerate(test_loader, start=1):
                 rng = jax.random.fold_in(rng, batch_idx)
                 state = state.replace(rng=jax_utils.replicate(rng))
-                _, metrics, examples = p_step_sample(state, batch)
+                _, metrics, examples, sexamples = p_step_sample(state, batch)
                 if best_acc == 0:
                     acc_ref_metrics = p_step_acc_ref(state, batch)
                     metrics.update(acc_ref_metrics)
                 if batch_idx == 1:
                     save_examples = examples
                 if config.save_cls:
-                    A, B, C, labels = examples
-                    save_cls(A, B, C, labels, path, epoch_idx)
+                    if not config.supple:
+                        A, B, C, labels = examples
+                        save_cls(A, B, C, labels, path, epoch_idx)
+                    else:
+                        save_advcls(examples, sexamples, path, epoch_idx)
                 test_metrics.append(metrics)
             test_metrics = common_utils.get_metrics(test_metrics)
             tst_summarized = {
@@ -2048,6 +2149,10 @@ def main():
     parser.add_argument("--conflict", action="store_true")
     # save classification plots from restored model
     parser.add_argument("--save_cls2", action="store_true")
+    # enhance loss where A inference does not conflicts with B (opposite to pm051101)
+    parser.add_argument("--pm053105", action="store_true")
+    # dsb between two modes close to each other
+    parser.add_argument("--pm060704", default=15, type=int)
     # ---------------------------------------------------------------------------------------
     # diffusion
     # ---------------------------------------------------------------------------------------

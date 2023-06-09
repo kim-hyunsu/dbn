@@ -22,7 +22,7 @@ def cls_plot(A, B, C, labels, y, verbose, epoch=None, div="test"):
     fig, ax = plt.subplots(ncols=1, nrows=nrows, figsize=(
         6, 2*(1.6 * nrows + 0.3)), squeeze=False)
 
-    if acc is not None:
+    if epoch is not None:
         ax[0, 0].set_title(
             f"pred of <{label_names[y]}> in {div} set at {epoch}")
     else:

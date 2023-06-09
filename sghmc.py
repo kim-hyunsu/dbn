@@ -147,11 +147,16 @@ def get_sghmc_state(config, dataloaders, model, variables):
             iii * num_epochs_per_cycle * dataloaders['trn_steps_per_epoch']
             for iii in range(1, config.num_cycles + 1)
         ])
-    optimizer = sghmc(
-        learning_rate=scheduler,
-        # alpha=(1.0 - config.optim_momentum))
-        alpha=(1.0 - config.optim_momentum),
-        init_temp=temperature(0))
+    if config.shared_head:
+        optimizer = sghmc(
+            learning_rate=scheduler,
+            # alpha=(1.0 - config.optim_momentum))
+            alpha=(1.0 - config.optim_momentum),
+            init_temp=temperature(0))
+    else:
+        optimizer = sghmc_legacy(
+            learning_rate=scheduler,
+            alpha=(1.0 - config.optim_momentum))
 
     if config.shared_head:
         # load trained head
@@ -174,14 +179,23 @@ def get_sghmc_state(config, dataloaders, model, variables):
             partition_optimizer, param_partitions)
 
     # build train state
-    state = TrainState.create(
-        apply_fn=model.apply,
-        params=variables['params'],
-        tx=optimizer,
-        image_stats=variables.get('image_stats'),
-        batch_stats=variables.get("batch_stats"),
-        temperature=temperature(0),
-        multi_transform=True if config.shared_head else False)
+    if config.shared_head:
+        state = TrainState.create(
+            apply_fn=model.apply,
+            params=variables['params'],
+            tx=optimizer,
+            image_stats=variables.get('image_stats'),
+            batch_stats=variables.get("batch_stats"),
+            temperature=temperature(0),
+            multi_transform=True)
+    else:
+        state = TrainStateLegacy.create(
+            apply_fn=model.apply,
+            params=variables['params'],
+            tx=optimizer,
+            image_stats=variables.get('image_stats'),
+            batch_stats=variables.get("batch_stats")
+        )
 
     return state
 
@@ -229,7 +243,7 @@ class TrainStateLegacy(train_state.TrainState):
 
     def apply_gradients(self, *, grads, **kwargs):
         updates, new_opt_state = self.tx.update(
-            updates=grads,
+            gradients=grads,
             state=self.opt_state,
             params=self.params,
             temperature=kwargs.pop("temperature", 1.0))
@@ -428,11 +442,16 @@ def launch(config, print_fn):
             iii * num_epochs_per_cycle * dataloaders['trn_steps_per_epoch']
             for iii in range(1, config.num_cycles + 1)
         ])
-    optimizer = sghmc(
-        learning_rate=scheduler,
-        # alpha=(1.0 - config.optim_momentum))
-        alpha=(1.0 - config.optim_momentum),
-        init_temp=temperature(0))
+    if config.shared_head:
+        optimizer = sghmc(
+            learning_rate=scheduler,
+            # alpha=(1.0 - config.optim_momentum))
+            alpha=(1.0 - config.optim_momentum),
+            init_temp=temperature(0))
+    else:
+        optimizer = sghmc_legacy(
+            learning_rate=scheduler,
+            alpha=(1.0 - config.optim_momentum))
 
     if config.shared_head:
         # load trained head
@@ -469,14 +488,23 @@ def launch(config, print_fn):
         # optimizer = _optimizer._replace(update=wrapper)
 
     # build train state
-    state = TrainState.create(
-        apply_fn=model.apply,
-        params=variables['params'],
-        tx=optimizer,
-        image_stats=variables.get('image_stats'),
-        batch_stats=variables.get("batch_stats"),
-        temperature=temperature(0),
-        multi_transform=True if config.shared_head else False)
+    if config.shared_head:
+        state = TrainState.create(
+            apply_fn=model.apply,
+            params=variables['params'],
+            tx=optimizer,
+            image_stats=variables.get('image_stats'),
+            batch_stats=variables.get("batch_stats"),
+            temperature=temperature(0),
+            multi_transform=True)
+    else:
+        state = TrainStateLegacy.create(
+            apply_fn=model.apply,
+            params=variables['params'],
+            tx=optimizer,
+            image_stats=variables.get('image_stats'),
+            batch_stats=variables.get("batch_stats")
+        )
 
     if config.ckpt:
         sgd_config = EasyDict(ckpt["config"])
@@ -577,7 +605,8 @@ def launch(config, print_fn):
             new_state = state.apply_gradients(
                 grads=grads, temperature=temp)
             # grads=grads)
-        metrics["temperature"] = state.temperature
+        if config.shared_head:
+            metrics["temperature"] = state.temperature
         return new_state, metrics
 
     def step_val(state, batch):
@@ -668,7 +697,6 @@ def launch(config, print_fn):
         tst_summarized['tst/cnt']
     print(f"Starting Accuracy: {test_acc:.3f}")
 
-    init_temp = state.temperature
 
     for cycle_idx, _ in enumerate(range(config.num_cycles), start=1):
 

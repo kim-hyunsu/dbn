@@ -179,7 +179,8 @@ def mixup_data(rng, batch, alpha=1.0, interpolation=True):
     def mix():
         arange = jnp.arange(0, x.shape[0])
         index = jax.random.permutation(perm_rng, arange)
-        index = jnp.where(x.shape[0] == jnp.sum(batch["marker"]), index, arange)
+        index = jnp.where(x.shape[0] == jnp.sum(
+            batch["marker"]), index, arange)
 
         mixed_x = jnp.where(
             interpolation,
@@ -188,13 +189,12 @@ def mixup_data(rng, batch, alpha=1.0, interpolation=True):
         return mixed_x
 
     batch["images"] = jnp.where(
-        alpha<=0,
+        alpha <= 0,
         batch["images"],
         mix()
     )
     batch["lambdas"] = jnp.tile(lam, reps=[x.shape[0]])
     return batch
-
 
 
 def mixup_inclass(rng, batch, bank, alpha=1.0, interpolation=True):
@@ -292,14 +292,14 @@ if __name__ == "__main__":
     else:
         if "rand" in dir:
             p_mixup_data = jax.pmap(
-                mixup_data,axis_name="batch")
+                mixup_data, axis_name="batch")
         else:
             p_mixup_data = jax.pmap(
-                partial(mixup_data, alpha=alpha),axis_name="batch")
-    
+                partial(mixup_data, alpha=alpha), axis_name="batch")
+
     @partial(jax.pmap, axis_name="batch")
-    def adv_attack(state, batch):
-        def loss_fn(x):
+    def adv_attack(state, batch, rng):
+        def pred(x):
             params_dict = dict(params=state.params)
             mutable = ["intermediates"]
             if state.image_stats is not None:
@@ -310,17 +310,42 @@ if __name__ == "__main__":
             _, new_model_state = state.apply_fn(
                 params_dict, x, rngs=None, mutable=mutable)
             logits = new_model_state['intermediates']['cls.logit'][0]
+            return logits
+
+        def loss_fn(x, labels):
+            logits = pred(x)
             target = common_utils.onehot(
-                batch['labels'], num_classes=logits.shape[-1])  # [B, K,]
+                labels, num_classes=logits.shape[-1])  # [B, K,]
             loss = -jnp.sum(target * jax.nn.log_softmax(logits,
                             axis=-1), axis=-1)      # [B,]
             loss = jnp.sum(
                 jnp.where(batch['marker'], loss, jnp.zeros_like(loss))
             ) / jnp.sum(batch['marker'])
             return loss
+
+        def ods_fn(x, w):
+            p = jax.nn.softmax(pred(x))
+            return jnp.sum(w*p)
         x = batch["images"]
-        eps = jnp.sign(jax.grad(loss_fn)(x)) # Sign of gradient of the loss function
-        adv_lmda = 1. / 255 # level of adversarial attack
+        ####### version1 ##########
+        # labels = batch["labels"]
+        ####### version2 ##########
+        # labels = jnp.argmax(pred(x))
+        ###########################
+        # Sign of gradient of the loss function
+        ######## version1,2 #######
+        # eps = jnp.sign(jax.grad(loss_fn)(x, labels))
+        ######## version3 #########
+        B = x.shape[0]
+        d = num_classes
+        w = jax.random.bernoulli(rng, 0.5, (B, d))
+        eps = jax.grad(ods_fn)(x, w)
+        eps = eps / \
+            jnp.sqrt(jnp.sum(eps**2, axis=[1, 2, 3], keepdims=True))
+        ######## version4 #########
+        # eps = jax.random.normal(rng, x.shape) * 255 / (32*32*3)
+        ############################
+        adv_lmda = 1. / 255  # level of adversarial attack
         x_adv = x + eps * adv_lmda
         batch["images"] = x_adv
         return batch
@@ -353,11 +378,11 @@ if __name__ == "__main__":
                         b_mixup_rng = jax.random.fold_in(mixup_rng, batch_idx)
                         if rep == 0:
                             ps, bs = batch["marker"].shape
-                            batch["lambdas"] = jnp.tile(1, reps=[ps,bs])
+                            batch["lambdas"] = jnp.tile(1, reps=[ps, bs])
                         else:
                             if "rand" in dir:
                                 _alpha = jax.random.uniform(
-                                    b_mixup_rng,(),minval=0,maxval=alpha)
+                                    b_mixup_rng, (), minval=0, maxval=alpha)
                                 _alpha = jax_utils.replicate(_alpha)
                                 batch = p_mixup_data(
                                     jax_utils.replicate(b_mixup_rng), batch, _alpha)
@@ -406,18 +431,19 @@ if __name__ == "__main__":
                         # mixup
                         if rep == 0:
                             ps, bs = batch["marker"].shape
-                            batch["lambdas"] = jnp.tile(1, reps=[ps,bs])
+                            batch["lambdas"] = jnp.tile(1, reps=[ps, bs])
                         else:
                             if "rand" in dir:
                                 _alpha = jax.random.uniform(
-                                    b_mixup_rng,(),minval=0,maxval=alpha)
+                                    b_mixup_rng, (), minval=0, maxval=alpha)
                                 _alpha = jax_utils.replicate(_alpha)
                                 batch = p_mixup_data(
                                     jax_utils.replicate(b_mixup_rng), batch, _alpha)
                             else:
                                 batch = p_mixup_data(
                                     jax_utils.replicate(b_mixup_rng), batch)
-                        batch = adv_attack(classifier_state, batch)
+                        batch = adv_attack(
+                            classifier_state, batch, jax_utils.replicate(b_mixup_rng))
                         # get logits
                         _logits = p_get_logits(classifier_state, batch)
                         logits = _logits[batch["marker"] == True]
@@ -432,7 +458,6 @@ if __name__ == "__main__":
                     logits = np.array(logits)
                     np.save(f, logits)
                 del logits_list
-
 
             # valid set
             feature_path = f"{dir}/valid_features_M{mode_idx}S{i}.npy"
@@ -462,7 +487,9 @@ if __name__ == "__main__":
                     valid_loader, size=2)
                 logits_list = []
                 for batch_idx, batch in enumerate(valid_loader, start=1):
-                    batch = adv_attack(classifier_state, batch)
+                    valid_rng = jax.random.fold_in(rng, batch_idx)
+                    valid_rng = jax_utils.replicate(valid_rng)
+                    batch = adv_attack(classifier_state, batch, valid_rng)
                     _logits = p_get_logits(classifier_state, batch)
                     logits = _logits[batch["marker"] == True]
                     logits = logits.reshape(-1, *_logits.shape[2:])
@@ -503,7 +530,9 @@ if __name__ == "__main__":
                 test_loader = jax_utils.prefetch_to_device(test_loader, size=2)
                 logits_list = []
                 for batch_idx, batch in enumerate(test_loader, start=1):
-                    batch = adv_attack(classifier_state, batch)
+                    test_rng = jax.random.fold_in(rng, batch_idx)
+                    test_rng = jax_utils.replicate(test_rng)
+                    batch = adv_attack(classifier_state, batch, test_rng)
                     _logits = p_get_logits(classifier_state, batch)
                     logits = _logits[batch["marker"] == True]
                     logits = logits.reshape(-1, *_logits.shape[2:])

@@ -148,6 +148,10 @@ def launch(config, print_fn):
             logits = new_model_state['intermediates']['cls.logit'][0]
             target = common_utils.onehot(
                 batch['labels'], num_classes=logits.shape[-1])  # [B, K,]
+            if config.label_smooth > 0:
+                alpha = config.label_smooth
+                n_cls = logits.shape[-1]
+                target = target*(1-alpha) + alpha/n_cls
             loss = -jnp.sum(target * jax.nn.log_softmax(logits,
                             axis=-1), axis=-1)      # [B,]
             loss = jnp.sum(
@@ -327,9 +331,9 @@ def launch(config, print_fn):
             tst_metric = common_utils.get_metrics(tst_metric)
             tst_summarized = {
                 f'tst/{k}': v for k, v in jax.tree_util.tree_map(lambda e: e.sum(), tst_metric).items()}
-            test_acc = tst_summarized['tst/acc'] / tst_summarized['tst/cnt']
-            test_nll = tst_summarized['tst/nll'] / tst_summarized['tst/cnt']
-            test_sec = tst_summarized['tst/sec'] / tst_summarized['tst/cnt']
+            tst_summarized['tst/acc'] /= tst_summarized['tst/cnt']
+            tst_summarized['tst/nll'] /= tst_summarized['tst/cnt']
+            tst_summarized['tst/sec'] /= tst_summarized['tst/cnt']
             del tst_summarized["tst/cnt"]
             wl.log(tst_summarized)
             best_acc = val_summarized['val/acc']
@@ -379,9 +383,16 @@ def main():
                         choices=["sgd", "adam"])
     parser.add_argument("--nowandb", action="store_true")
     parser.add_argument("--shared_head", default="", type=str)
-    parser.add_argument("--label_smooth", action="store_true")
+    parser.add_argument("--label_smooth", default=0, type=float)
+    parser.add_argument("--config", default=None, type=str)
 
     args = parser.parse_args()
+    if args.config is not None:
+        import yaml
+        with open(args.config) as f:
+            config = yaml.safe_load(f)
+        for k, v in config.items():
+            setattr(args, k, v)
 
     if args.seed < 0:
         args.seed = (

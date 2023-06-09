@@ -11,62 +11,6 @@ debug = os.environ.get("DEBUG")
 if isinstance(debug, str):
     debug = debug.lower() == "true"
 
-
-def model_list(data_name, model_style, shared_head=False):
-    if data_name == "CIFAR100_x32" and model_style == "BN-ReLU":
-        if shared_head:
-            return [
-                "./checkpoints/bn100_sd2_shared",
-                "./checkpoints/bn100_sd3_shared",
-                "./checkpoints/bn100_sd5_shared",
-                "./checkpoints/bn100_sd7_shared",
-                "./checkpoints/bn100_sd11_shared",
-                "./checkpoints/bn100_sd13_shared",
-                "./checkpoints/bn100_sd17_shared",
-            ]
-        else:
-            return [
-                "./checkpoints/bn100_sd2",
-                "./checkpoints/bn100_sd3",
-                "./checkpoints/bn100_sd5",
-                "./checkpoints/bn100_sd7",
-                "./checkpoints/bn100_sd11",
-                "./checkpoints/bn100_sd13",
-                "./checkpoints/bn100_sd17",
-            ]
-    elif data_name == "CIFAR10_x32" and model_style == "FRN-Swish":
-        return [
-            "./checkpoints/frn_sd2",
-            "./checkpoints/frn_sd3",
-            "./checkpoints/frn_sd5",
-            "./checkpoints/frn_sd7",
-            "./checkpoints/frn_sd11",
-            "./checkpoints/frn_sd13",
-            "./checkpoints/frn_sd17",
-            # "./checkpoints/frn_sd19",
-        ]
-    else:
-        raise Exception("Invalid data_name and model_style.")
-
-
-logit_dir_list = ["features", "features_fixed",
-                  "features_1mixup10", "features_1mixup10_fixed",
-                  "features_1mixupplus10", "features100",
-                  "features100_fixed", "features100_shared",
-                  "features100_1mixup10", "features100_1mixupplus10",
-                  "features100_1mixupext10", "features100_1mixupplusext10",
-                  "features100_0p4mixup10_fixed", "features100_0p4mixup10_rand",
-                  "features100_0p4mixup10", "features100_0p4mixup10_valid"]
-feature_dir_list = ["features_last", "features_last_fixed",
-                    "features_last_1mixup10", "features_last_1mixup10_fixed",
-                    "features_last_1mixupplus10", "features100_last",
-                    "features100_last_1mixup10", "features100_last_0p4mixup10",
-                    "features100_last_0p4mixup10_fixed", "features100_last_0p4mixup10_rand",
-                    "features100_last_fixed", "features100_last_shared"]
-feature2_dir_list = ["features_last2",
-                     "features100_last2", "features100_last2_shared"]
-
-
 pixel_mean = jnp.array(defaults.PIXEL_MEAN, dtype=jnp.float32)
 pixel_std = jnp.array(defaults.PIXEL_STD, dtype=jnp.float32)
 
@@ -78,6 +22,10 @@ logits_fixed_mean = jnp.array(
     [-0.31134173, -0.25409052, 0.03164461, 0.6108086, -0.7115754, 0.45521107, -0.05110987, -0.17799538, -0.7254453, 0.8062728])
 logits_fixed_std = jnp.array(
     [6.245104, 6.566702, 6.3997235, 5.580838, 6.454161, 6.315527, 5.996594, 6.4479523, 6.5356264, 6.2433324])
+logits_smooth_mean = jnp.array([
+    1.0167354,-0.6048022,   1.3812016  , 1.1861428 , 0.41711354,  0.6843606,0.12473508 , 0.20884748, -0.6354314 ,  0.30543354])
+logits_smooth_std = jnp.array([
+    2.9246716,4.6175737,2.9916914,3.044312 ,3.7991865,3.5999544,3.4893486,3.8933403,3.799254 ,4.065405 ])
 features_mean = jnp.array(
     [0.18330994, 0.7001978, 0.6445457, 0.7460846, 0.50943, 0.62959504,
      0.64421076, 0.864699, 0.90026885, 1.0193346, 0.5198741, 0.6827253,
@@ -126,6 +74,27 @@ features_fixed_std = jnp.array(
      0.7616899, 0.26205933, 0.58135045, 0.42836696, 0.59881216, 0.6225946,
      0.5618599, 0.16933021, 0.7180478, 0.57931596, 0.62415534, 0.27320555,
      0.6263999, 0.5018518, 0.56142384, 0.35803506])
+features_smooth_mean = jnp.array([2.2591686,1.6846231,2.4262881,1.8620274,2.5296724,1.7403471,2.1779778,
+ 2.397413 ,1.6612936,2.1530817,1.8401841,1.8240654,2.054809 ,2.099684,
+ 2.103704 ,2.150928 ,1.8618845,2.1831872,1.8943466,2.2140658,2.1225722,
+ 2.1992414,1.7928971,2.6273873,1.1930034,1.5750698,2.3884864,2.394339,
+ 2.2787273,2.2732646,1.8455626,1.5083206,1.8373212,1.8319095,1.2800753,
+ 2.0343556,1.7147509,2.0220613,2.5702703,2.412537 ,2.0320156,1.733261,
+ 2.2042649,2.0588052,2.1886444,2.0548208,2.2332573,1.8787292,1.7449883,
+ 1.3538883,2.196829 ,1.5567267,1.66049  ,1.6265544,2.199724 ,2.4128587,
+ 1.6366208,1.4242903,1.7274755,1.8444502,1.5184199,2.1950843,1.4311628,
+ 2.1932156])
+features_smooth_std = jnp.array([0.94868135,0.6022823 ,0.94064116,0.91724193,1.0014375 ,0.6991272,
+ 0.734294  ,1.9525324 ,0.77374303,0.8054996 ,0.60202974,0.7682523,
+ 1.0824217 ,1.0532749 ,1.0070893 ,0.71122473,1.0078379 ,0.9384319,
+ 0.783794  ,1.0543379 ,0.9645058 ,0.8237384 ,0.892413  ,1.4607546,
+ 0.48913634,0.6910001 ,0.7946616 ,0.8736424 ,1.0135208 ,1.1901033,
+ 0.85582936,0.7762151 ,0.98204595,0.98938817,0.773156  ,0.9948165,
+ 0.8303378 ,1.2158434 ,1.7871115 ,1.1158894 ,0.84670997,0.9412111,
+ 1.052403  ,1.00306   ,0.864706  ,0.737708  ,0.9060585 ,0.8076786,
+ 0.95391244,0.68137455,1.6059061 ,0.6699924 ,0.6911579 ,0.5560083,
+ 1.1337692 ,0.97876066,0.87733203,0.9236515 ,0.6251136 ,0.95945084,
+ 0.7923356 ,1.0319482 ,0.5455782 ,0.92253876])
 logits_1mixup10_mean = jnp.array([])
 logits_1mixup10_std = jnp.array([])
 features_1mixup10_mean = jnp.array([])
@@ -212,6 +181,74 @@ def unnormalize(x):
     # return x+pixel_mean
 
 
+def model_list(data_name, model_style, shared_head=False):
+    if data_name == "CIFAR100_x32" and model_style == "BN-ReLU":
+        if shared_head:
+            return [
+                "./checkpoints/bn100_sd2_shared",
+                "./checkpoints/bn100_sd3_shared",
+                "./checkpoints/bn100_sd5_shared",
+                "./checkpoints/bn100_sd7_shared",
+                "./checkpoints/bn100_sd11_shared",
+                "./checkpoints/bn100_sd13_shared",
+                "./checkpoints/bn100_sd17_shared",
+            ]
+        else:
+            return [
+                "./checkpoints/bn100_sd2",
+                "./checkpoints/bn100_sd3",
+                "./checkpoints/bn100_sd5",
+                "./checkpoints/bn100_sd7",
+                "./checkpoints/bn100_sd11",
+                "./checkpoints/bn100_sd13",
+                "./checkpoints/bn100_sd17",
+            ]
+    elif data_name == "CIFAR10_x32" and model_style == "FRN-Swish":
+        return [
+            "./checkpoints/frn_sd2",
+            "./checkpoints/frn_sd3",
+            "./checkpoints/frn_sd5",
+            "./checkpoints/frn_sd7",
+            "./checkpoints/frn_sd11",
+            "./checkpoints/frn_sd13",
+            "./checkpoints/frn_sd17",
+            # "./checkpoints/frn_sd19",
+        ]
+    elif data_name == "CIFAR10_x32" and model_style == "BN-ReLU":
+        return [
+            # "./checkpoints/bn_sd2_smooth",
+            "./checkpoints/bn_sd3_smooth",
+            "./checkpoints/bn_sd5_smooth",
+            "./checkpoints/bn_sd7_smooth",
+        ]
+    else:
+        raise Exception("Invalid data_name and model_style.")
+
+
+logit_dir_list = ["features", "features_fixed",
+                  "features_1mixup10", "features_1mixup10_fixed",
+                  "features_1mixupplus10",
+                  "features_smooth",
+                  "features100",
+                  "features100_ods", "features100_noise",
+                  "features100_2ods",
+                  "features100_fixed", "features100_shared",
+                  "features100_1mixup10", "features100_1mixupplus10",
+                  "features100_1mixupext10", "features100_1mixupplusext10",
+                  "features100_0p4mixup10_fixed", "features100_0p4mixup10_rand",
+                  "features100_0p4mixup10", "features100_0p4mixup10_valid"]
+feature_dir_list = ["features_last", "features_last_fixed",
+                    "features_last_1mixup10", "features_last_1mixup10_fixed",
+                    "features_last_1mixupplus10",
+                    "features_last_smooth",
+                    "features100_last",
+                    "features100_last_1mixup10", "features100_last_0p4mixup10",
+                    "features100_last_0p4mixup10_fixed", "features100_last_0p4mixup10_rand",
+                    "features100_last_fixed", "features100_last_shared"]
+feature2_dir_list = ["features_last2",
+                     "features100_last2", "features100_last2_shared"]
+
+
 def _get_meanstd(features_dir):
     if features_dir == "features":
         mean = logits_mean
@@ -223,9 +260,15 @@ def _get_meanstd(features_dir):
             "features_1mixupplus10"]:
         mean = logits_fixed_mean
         std = logits_fixed_std
+    elif features_dir in ["features_smooth"]:
+        mean = logits_smooth_mean
+        std = logits_smooth_std
     elif features_dir == "features_last":
         mean = features_mean
         std = features_std
+    elif features_dir in ["features_last_smooth"]:
+        mean = features_smooth_mean
+        std = features_smooth_std
     elif features_dir in ["features_last2"]:
         mean = features_mean[None, None, ...]
         std = features_std[None, None, ...]
@@ -238,6 +281,9 @@ def _get_meanstd(features_dir):
         std = features_fixed_std
     elif features_dir in [
         "features100",
+        "features100_ods",
+        "features100_2ods",
+        "features100_noise",
         "features100_fixed",
         "features100_shared",
         "features100_0p4mixup10",

@@ -8,7 +8,6 @@ from giung2.data.build import build_dataloaders
 import defaults_sghmc as defaults
 from flax.training import common_utils, train_state, checkpoints
 from flax import jax_utils
-from flax.training import dynamic_scale as dynamic_scale_lib
 import flax
 import optax
 import jaxlib
@@ -24,58 +23,9 @@ import os
 import sys
 from easydict import EasyDict
 import orbax
-import sgd
 from utils import jprint
+from sgd_trainstate import get_sgd_state
 sys.path.append('./')
-
-
-def get_sgd_state(config, dataloaders, model, variables):
-    # define dynamic_scale
-    dynamic_scale = None
-    if config.precision == 'fp16' and jax.local_devices()[0].platform == 'gpu':
-        dynamic_scale = dynamic_scale_lib.DynamicScale()
-
-    # define optimizer with scheduler
-    scheduler = optax.cosine_decay_schedule(
-        init_value=config.optim_lr,
-        decay_steps=config.optim_ne * dataloaders['trn_steps_per_epoch'])
-    if config.optim == "sgd":
-        optimizer = optax.sgd(
-            learning_rate=scheduler,
-            momentum=config.optim_momentum)
-    elif config.optim == "adam":
-        optimizer = optax.adam(
-            learning_rate=scheduler)
-    if config.shared_head:
-        # load trained head
-        params = variables.unfreeze()
-        ckpt = checkpoints.restore_checkpoint(
-            ckpt_dir=config.shared_head,
-            target=None
-        )
-        saved = ckpt["model"]["params"].get("Dense_0")
-        if saved is None:
-            saved = ckpt["model"]["params"]["head"]
-        params["params"]["Dense_0"] = saved
-        variables = freeze(params)
-        # freeze head
-        partition_optimizer = {"trainable": optimizer,
-                               "frozen": optax.set_to_zero()}
-        param_partitions = freeze(traverse_util.path_aware_map(
-            lambda path, v: "frozen" if "Dense_0" in path else "trainable", variables["params"]))
-        optimizer = optax.multi_transform(
-            partition_optimizer, param_partitions)
-
-    # build train state
-    state = sgd.TrainState.create(
-        apply_fn=model.apply,
-        params=variables['params'],
-        tx=optimizer,
-        image_stats=variables.get('image_stats'),
-        batch_stats=variables.get('batch_stats'),
-        dynamic_scale=dynamic_scale)
-
-    return state
 
 
 def get_sghmc_state_legacy(config, dataloaders, model, variables):
@@ -118,20 +68,21 @@ def get_sghmc_state_legacy(config, dataloaders, model, variables):
 
     return state
 
+
 def get_sghmc_state(config, dataloaders, model, variables):
 
     # define optimizer with scheduler
     num_epochs_per_cycle = config.num_epochs_quiet + config.num_epochs_noisy
 
-    temp_schedules =[optax.constant_schedule(0.0),] + sum([[
-            optax.constant_schedule(1.0),
-            optax.constant_schedule(0.0),
-        ] for iii in range(1, config.num_cycles + 1)], [])
+    temp_schedules = [optax.constant_schedule(0.0),] + sum([[
+        optax.constant_schedule(1.0),
+        optax.constant_schedule(0.0),
+    ] for iii in range(1, config.num_cycles + 1)], [])
     temp_boundaries = sum([[
-            (iii * num_epochs_per_cycle - config.num_epochs_noisy) *
-            dataloaders['trn_steps_per_epoch'],
-            (iii * num_epochs_per_cycle) * dataloaders['trn_steps_per_epoch'],
-        ] for iii in range(1, config.num_cycles + 1)], [])
+        (iii * num_epochs_per_cycle - config.num_epochs_noisy) *
+        dataloaders['trn_steps_per_epoch'],
+        (iii * num_epochs_per_cycle) * dataloaders['trn_steps_per_epoch'],
+    ] for iii in range(1, config.num_cycles + 1)], [])
     temperature = optax.join_schedules(
         schedules=temp_schedules,
         boundaries=temp_boundaries)
@@ -199,10 +150,12 @@ def get_sghmc_state(config, dataloaders, model, variables):
 
     return state
 
+
 class SGHMCStateLegacy(NamedTuple):
     count: jnp.array
     rng_key: Any
     momentum: Any
+
 
 class SGHMCState(NamedTuple):
     count: jnp.array
@@ -235,6 +188,7 @@ class TrainState(train_state.TrainState):
             params=new_params,
             opt_state=new_opt_state,
             **kwargs)
+
 
 class TrainStateLegacy(train_state.TrainState):
     image_stats: Any
@@ -312,6 +266,7 @@ def sghmc(learning_rate, seed=0, alpha=0.1, init_temp=1.0):
 
     return optax.GradientTransformation(init_fn, update_fn)
 
+
 def sghmc_legacy(learning_rate, seed=0, alpha=0.1):
     """
     Optax implementation of the SGHMC and SGLD.
@@ -353,6 +308,7 @@ def sghmc_legacy(learning_rate, seed=0, alpha=0.1):
             momentum=momentum)
 
     return optax.GradientTransformation(init_fn, update_fn)
+
 
 def launch(config, print_fn):
 
@@ -418,15 +374,15 @@ def launch(config, print_fn):
     # define optimizer with scheduler
     num_epochs_per_cycle = config.num_epochs_quiet + config.num_epochs_noisy
 
-    temp_schedules =[optax.constant_schedule(0.0),] + sum([[
-            optax.constant_schedule(1.0),
-            optax.constant_schedule(0.0),
-        ] for iii in range(1, config.num_cycles + 1)], [])
+    temp_schedules = [optax.constant_schedule(0.0),] + sum([[
+        optax.constant_schedule(1.0),
+        optax.constant_schedule(0.0),
+    ] for iii in range(1, config.num_cycles + 1)], [])
     temp_boundaries = sum([[
-            (iii * num_epochs_per_cycle - config.num_epochs_noisy) *
-            dataloaders['trn_steps_per_epoch'],
-            (iii * num_epochs_per_cycle) * dataloaders['trn_steps_per_epoch'],
-        ] for iii in range(1, config.num_cycles + 1)], [])
+        (iii * num_epochs_per_cycle - config.num_epochs_noisy) *
+        dataloaders['trn_steps_per_epoch'],
+        (iii * num_epochs_per_cycle) * dataloaders['trn_steps_per_epoch'],
+    ] for iii in range(1, config.num_cycles + 1)], [])
     temperature = optax.join_schedules(
         schedules=temp_schedules,
         boundaries=temp_boundaries)
@@ -696,7 +652,6 @@ def launch(config, print_fn):
     test_acc = tst_summarized['tst/acc'] / \
         tst_summarized['tst/cnt']
     print(f"Starting Accuracy: {test_acc:.3f}")
-
 
     for cycle_idx, _ in enumerate(range(config.num_cycles), start=1):
 

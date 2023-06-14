@@ -1,0 +1,48 @@
+project: dsb-bnn
+name: "cifar100 L2-MSE regularization w/o start_rglr"
+program: dsb.py
+method: bayes
+metric:
+  name: tst/ens_acc
+  goal: maximize
+parameters:
+  data_name:
+    value: CIFAR100_x32
+  optim_ne:
+    values: [300,400,500]
+  optim_lr:
+    values: [0.001,0.0005,0.0001, 0.00005]
+  optim_weight_decay:
+    values: [0,0.00001,0.0001,0.001,0.01,0.1]
+  optim_bs:
+    values: [128,256,512]
+  T:
+    values: [5, 10, 20, 50]
+  optim_bs:
+    values: [64,128,256,512]
+  n_feat:
+    values: [128,256]
+  context:
+    value: True
+  droprate:
+    values: [0.,0.1,0.2,0.3]
+  ema_decay:
+    values: [1.,0.99995,0.9999,0.9995, 0.999]
+  version:
+    value: v1.0
+  corrector:
+    values: [0, 1]
+  beta2:
+    values: [0.0001, 0.001, 0.01, 0.02, 0.1]
+  rglr_list:
+    value: l2mse
+  gamma:
+    values: [0.00001, 0.00002, 0.00005, 0.0001, 0.0002, 0.0005, 0.001]
+
+  
+command:
+  - ${env}
+  - ${interpreter}
+  - ${program}
+  - ${args_no_boolean_flags}
+  

@@ -1,4 +1,3 @@
-from configparser import Interpolation
 from tqdm import tqdm
 import argparse
 from flax import jax_utils
@@ -17,13 +16,16 @@ import defaults_sghmc as defaults
 import os
 import numpy as np
 from utils import expand_to_broadcast, get_info_in_dir, normalize, model_list, jprint
-from utils import logit_dir_list, feature_dir_list, feature2_dir_list
+from utils import logit_dir_list, feature_dir_list, feature2_dir_list, feature3_dir_list
 from flax.training import common_utils
+import sgd_trainstate
 
 
-def get_ckpt_temp(ckpt_dir, shared_head=False):
-    if not ckpt_dir.endswith("sghmc"):
+def get_ckpt_temp(ckpt_dir, shared_head=False, sgd=False):
+    if not sgd:
         sghmc_ckpt_dir = os.path.join(ckpt_dir, "sghmc")
+    else:
+        sghmc_ckpt_dir = ckpt_dir
     sghmc_ckpt = checkpoints.restore_checkpoint(
         ckpt_dir=sghmc_ckpt_dir, target=None)
     sghmc_config = EasyDict(sghmc_ckpt["config"])
@@ -71,28 +73,39 @@ def get_ckpt_temp(ckpt_dir, shared_head=False):
         return init({'params': key}, jnp.ones(dataloaders['image_shape'], model_dtype))
     variables = initialize_model(init_rng, model)
 
-    if variables.get("batch_stats") is not None:
-        if shared_head:
-            sghmc_state = sghmc.get_sghmc_state(
-                sghmc_config, dataloaders, model, variables)
+    if not sgd:
+        if variables.get("batch_stats") is not None:
+            if shared_head:
+                sghmc_state = sghmc.get_sghmc_state(
+                    sghmc_config, dataloaders, model, variables)
+            else:
+                sghmc_state = sghmc.get_sghmc_state_legacy(
+                    sghmc_config, dataloaders, model, variables)
         else:
-            sghmc_state = sghmc.get_sghmc_state_legacy(
+            sghmc_state = sghmc_deprecated.get_sghmc_state(
                 sghmc_config, dataloaders, model, variables)
     else:
-        sghmc_state = sghmc_deprecated.get_sghmc_state(
+        sghmc_state = sgd_trainstate.get_sgd_state(
             sghmc_config, dataloaders, model, variables)
 
     sghmc_ckpt["model"] = sghmc_state
     return sghmc_config, sghmc_ckpt, rng
 
 
-def load_classifer_state(model_dir, sample_idx, template):
+def load_classifer_state(model_dir, sample_idx, template, sgd=False):
     sghmc_ckpt_dir = model_dir
-    if not sghmc_ckpt_dir.endswith("sghmc"):
+    if not sgd:
         sghmc_ckpt_dir = os.path.join(sghmc_ckpt_dir, "sghmc")
-    sghmc_ckpt = checkpoints.restore_checkpoint(
-        ckpt_dir=sghmc_ckpt_dir, target=template, step=sample_idx
-    )
+        sghmc_ckpt = checkpoints.restore_checkpoint(
+            ckpt_dir=sghmc_ckpt_dir, target=template, step=sample_idx
+        )
+    else:
+        if sample_idx > 1:
+            return None, None
+        else:
+            sghmc_ckpt = checkpoints.restore_checkpoint(
+                ckpt_dir=sghmc_ckpt_dir, target=template
+            )
     state = sghmc_ckpt["model"]
     return state, sghmc_ckpt
 
@@ -241,11 +254,14 @@ if __name__ == "__main__":
     data_name = settings.data_name
     model_style = settings.model_style
     shared_head = settings.shared_head
+    sgd_state = getattr(settings, "sgd_state", False)
+    model_dir_list = model_list(data_name, model_style, shared_head, sgd_state)
     config, ckpt, rng = get_ckpt_temp(
-        model_list(data_name, model_style, shared_head)[0], shared_head)
+        model_dir_list[0], shared_head, sgd_state)
+    state_for_rng = sgd_trainstate.TrainState2TrainStateRNG(ckpt["model"])
     config.optim_bs = 512
     n_samples_each_mode = 30
-    n_modes = len(model_list(data_name, model_style, shared_head))
+    n_modes = len(model_dir_list)
     dataloaders = build_dataloaders(config)
     alpha, repeats = get_info_in_dir(dir)
 
@@ -274,6 +290,9 @@ if __name__ == "__main__":
     elif dir in feature2_dir_list:
         p_get_logits = jax.pmap(
             partial(get_logits, feature_name="feature.layer3"))
+    elif dir in feature3_dir_list:
+        p_get_logits = jax.pmap(
+            partial(get_logits, feature_name="feature.layer3stride2"))
     else:
         raise Exception("Invalid directory for saving features")
 
@@ -352,12 +371,19 @@ if __name__ == "__main__":
 
     shape = None
     data_rng, rng = jax.random.split(rng)
+    temp = ckpt["model"]
     for mode_idx in range(n_modes):
         for i in tqdm(range(n_samples_each_mode)):
 
-            model_dir = model_list(
-                data_name, model_style, shared_head)[mode_idx]
-            classifier_state, _ = load_classifer_state(model_dir, i+1, ckpt)
+            model_dir = model_dir_list[mode_idx]
+            if "bezier" in model_dir:
+                ckpt["model"] = state_for_rng
+            else:
+                ckpt["model"] = temp
+            classifier_state, _ = load_classifer_state(
+                model_dir, i+1, ckpt, sgd_state)
+            if classifier_state is None:
+                continue
             classifier_state = jax_utils.replicate(classifier_state)
             # train set
             feature_path = f"{dir}/train_features_M{mode_idx}S{i}.npy"

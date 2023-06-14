@@ -1,4 +1,5 @@
-from tabnanny import check
+import numpy as np
+from sgd_trainstate import TrainState, TrainStateRNG, get_sgd_state
 import wandb
 import time
 from tqdm import tqdm
@@ -10,7 +11,7 @@ from giung2.data.build import build_dataloaders
 import defaults_sgd as defaults
 from flax.training import dynamic_scale as dynamic_scale_lib
 from flax.training import common_utils, train_state, checkpoints
-from flax import jax_utils, serialization
+from flax import jax_utils
 import flax
 import orbax
 import optax
@@ -18,24 +19,22 @@ import jaxlib
 import jax.numpy as jnp
 import jax
 from collections import OrderedDict
-from typing import Any, NamedTuple
+from typing import Any
 from functools import partial
 from tabulate import tabulate
 import datetime
 import os
 import sys
+from flax.core.frozen_dict import freeze
+from flax import traverse_util
 
 from utils import WandbLogger
 sys.path.append('./')
-
-
-class TrainState(train_state.TrainState):
-    image_stats: Any
-    batch_stats: Any
-    dynamic_scale: dynamic_scale_lib.DynamicScale
+np.random.seed(0)
 
 
 def launch(config, print_fn):
+    rng = jax.random.PRNGKey(config.seed)
 
     # specify precision
     model_dtype = jnp.float32
@@ -75,7 +74,8 @@ def launch(config, print_fn):
         def init(*args):
             return model.init(*args)
         return init({'params': key}, jnp.ones(dataloaders['image_shape'], model.dtype))
-    variables = initialize_model(jax.random.PRNGKey(config.seed), model)
+    _, init_rng = jax.random.split(rng)
+    variables = initialize_model(init_rng, model)
 
     # define dynamic_scale
     dynamic_scale = None
@@ -94,8 +94,6 @@ def launch(config, print_fn):
         optimizer = optax.adam(learning_rate=scheduler)
 
     if config.shared_head:
-        from flax.core.frozen_dict import freeze
-        from flax import traverse_util
         # load trained head
         params = variables.unfreeze()
         shared_ckpt = checkpoints.restore_checkpoint(
@@ -116,19 +114,57 @@ def launch(config, print_fn):
             partition_optimizer, param_partitions)
 
     # build train state
-    state = TrainState.create(
-        apply_fn=model.apply,
-        params=variables['params'],
-        tx=optimizer,
-        image_stats=variables.get('image_stats'),
-        batch_stats=variables.get('batch_stats'),
-        dynamic_scale=dynamic_scale)
+    if not config.bezier:
+        state = TrainState.create(
+            apply_fn=model.apply,
+            params=variables['params'],
+            tx=optimizer,
+            image_stats=variables.get('image_stats'),
+            batch_stats=variables.get('batch_stats'),
+            dynamic_scale=dynamic_scale)
+    else:
+        _, state_rng = jax.random.split(rng)
+        state = TrainStateRNG.create(
+            apply_fn=model.apply,
+            params=variables['params'],
+            tx=optimizer,
+            image_stats=variables.get('image_stats'),
+            batch_stats=variables.get('batch_stats'),
+            rng=state_rng,
+            dynamic_scale=dynamic_scale)
 
+    if config.bezier:
+        sgd_state = get_sgd_state(config, dataloaders, model, variables)
+        ckpt = dict(model=sgd_state, config=dict(), best_acc=jnp.empty(()))
+        ckpt = checkpoints.restore_checkpoint(
+            ckpt_dir=config.theta0, target=ckpt
+        )
+        theta0 = ckpt["model"].params
+        ckpt = checkpoints.restore_checkpoint(
+            ckpt_dir=config.theta0, target=ckpt
+        )
+        theta1 = ckpt["model"].params
+
+        @jax.jit
+        def theta_be(theta, r):
+            return jax.tree_util.tree_map(
+                lambda w0, w_be, w1: (1-r)*(1-r)*w0+2*r*(1-r)*w_be+r*r*w1,
+                theta0,
+                theta,
+                theta1
+            )
     # ---------------------------------------------------------------------- #
     # Optimization
     # ---------------------------------------------------------------------- #
+
     def step_trn(state, batch, config, scheduler):
+        if config.bezier:
+            _, be_rng = jax.random.split(state.rng)
+            r = jax.random.uniform(be_rng, ())
+
         def loss_fn(params):
+            if config.bezier:
+                params = theta_be(params, r)
             params_dict = dict(params=params)
             mutable = ["intermediates"]
             if state.image_stats is not None:
@@ -212,7 +248,10 @@ def launch(config, print_fn):
         return new_state, metrics
 
     def step_val(state, batch):
-        params_dict = dict(params=state.params)
+        params = state.params
+        if config.bezier:
+            params = theta_be(params, 0.5)
+        params_dict = dict(params=params)
         if state.image_stats is not None:
             params_dict["image_stats"] = state.image_stats
         if state.batch_stats is not None:
@@ -227,20 +266,25 @@ def launch(config, print_fn):
         sec = time.time() - begin
 
         # compute metrics
+        logits = new_model_state['intermediates']['cls.logit'][0]
         predictions = jax.nn.log_softmax(
-            new_model_state['intermediates']['cls.logit'][0], axis=-1)  # [B, K,]
+            logits, axis=-1)  # [B, K,]
+        target = common_utils.onehot(
+            batch['labels'], num_classes=logits.shape[-1])  # [B, K,]
+        loss = -jnp.sum(target * predictions, axis=-1)      # [B,]
         acc = evaluate_acc(
             predictions, batch['labels'], log_input=True, reduction='none')          # [B,]
         nll = evaluate_nll(
             predictions, batch['labels'], log_input=True, reduction='none')          # [B,]
 
         # refine and return metrics
+        loss = jnp.sum(jnp.where(batch['marker'], loss, jnp.zeros_like(loss)))
         acc = jnp.sum(jnp.where(batch['marker'], acc, jnp.zeros_like(acc)))
         nll = jnp.sum(jnp.where(batch['marker'], nll, jnp.zeros_like(nll)))
         cnt = jnp.sum(batch['marker'])
 
         metrics = OrderedDict(
-            {'acc': acc, 'nll': nll, 'cnt': cnt, "sec": sec*cnt})
+            {"loss": loss, 'acc': acc, 'nll': nll, 'cnt': cnt, "sec": sec*cnt})
         metrics = jax.lax.psum(metrics, axis_name='batch')
         return metrics
 
@@ -250,8 +294,7 @@ def launch(config, print_fn):
     p_step_val = jax.pmap(step_val,
                           axis_name='batch')
     state = jax_utils.replicate(state)
-    rng = jax.random.PRNGKey(config.seed)
-    best_acc = 0.0
+    best_acc = 0.0 if not config.bezier else float('inf')
     test_acc = 0.0
     test_nll = float('inf')
 
@@ -280,7 +323,9 @@ def launch(config, print_fn):
             trainable1 = state.params["Conv_0"]
             frozen1 = state.params["Dense_0"]
         for batch_idx, batch in enumerate(trn_loader, start=1):
+            batch_rng = jax.random.fold_in(rng, batch_idx)
             state, metrics = p_step_trn(state, batch)
+            state = state.replace(rng=jax_utils.replicate(batch_rng))
             trn_metric.append(metrics)
         if config.shared_head:
             trainable2 = state.params["Conv_0"]
@@ -310,6 +355,7 @@ def launch(config, print_fn):
         val_metric = common_utils.get_metrics(val_metric)
         val_summarized = {f'val/{k}': v for k,
                           v in jax.tree_util.tree_map(lambda e: e.sum(), val_metric).items()}
+        val_summarized['val/loss'] /= val_summarized['val/cnt']
         val_summarized['val/acc'] /= val_summarized['val/cnt']
         val_summarized['val/nll'] /= val_summarized['val/cnt']
         val_summarized['val/sec'] /= val_summarized['val/cnt']
@@ -320,8 +366,12 @@ def launch(config, print_fn):
         # ---------------------------------------------------------------------- #
         # Save
         # ---------------------------------------------------------------------- #
-        if best_acc < val_summarized['val/acc']:
-
+        test_condition = (
+            (best_acc < val_summarized["val/acc"])
+            if not config.bezier
+            else (best_acc > val_summarized["val/loss"])
+        )
+        if test_condition:
             tst_metric = []
             tst_loader = dataloaders['tst_loader'](rng=None)
             tst_loader = jax_utils.prefetch_to_device(tst_loader, size=2)
@@ -331,15 +381,21 @@ def launch(config, print_fn):
             tst_metric = common_utils.get_metrics(tst_metric)
             tst_summarized = {
                 f'tst/{k}': v for k, v in jax.tree_util.tree_map(lambda e: e.sum(), tst_metric).items()}
+            tst_summarized['tst/loss'] /= tst_summarized['tst/cnt']
             tst_summarized['tst/acc'] /= tst_summarized['tst/cnt']
             tst_summarized['tst/nll'] /= tst_summarized['tst/cnt']
             tst_summarized['tst/sec'] /= tst_summarized['tst/cnt']
             del tst_summarized["tst/cnt"]
             wl.log(tst_summarized)
-            best_acc = val_summarized['val/acc']
+            best_acc = (val_summarized['val/acc']
+                        if not config.bezier
+                        else val_summarized["val/loss"])
 
             if config.save:
                 save_state = jax_utils.unreplicate(state)
+                if config.bezier:
+                    save_state = save_state.replace(
+                        params=theta_be(state.params, 0.5))
                 ckpt = dict(model=save_state, config=vars(
                     config), best_acc=best_acc)
                 orbax_checkpointer = orbax.checkpoint.PyTreeCheckpointer()
@@ -385,6 +441,12 @@ def main():
     parser.add_argument("--shared_head", default="", type=str)
     parser.add_argument("--label_smooth", default=0, type=float)
     parser.add_argument("--config", default=None, type=str)
+    # ----------------------------
+    # train bezier curve
+    # ----------------------------
+    parser.add_argument("--bezier", action="store_true")
+    parser.add_argument("--theta0", default="", type=str)
+    parser.add_argument("--theta1", default="", type=str)
 
     args = parser.parse_args()
     if args.config is not None:

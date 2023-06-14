@@ -1,0 +1,10 @@
+data_name: CIFAR10_x32
+model_depth: 20
+model_width: 1
+model_style: BN-ReLU
+model_name: FlaxResNet
+optim_bs: 256
+optim_ne: 200
+optim_lr: 1.0e-3
+optim_weight_decay: 0.0001
+optim: adam

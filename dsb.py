@@ -1,4 +1,3 @@
-from re import M
 import time
 import os
 import math
@@ -30,16 +29,17 @@ import sys
 from data.build import build_dataloaders, _build_dataloader, _build_featureloader
 from giung2.metrics import evaluate_acc, evaluate_nll
 from giung2.models.layers import FilterResponseNorm
-from utils import evaluate_top2acc, evaluate_topNacc
+from utils import evaluate_top2acc, evaluate_topNacc, get_single_batch
 from models.resnet import FlaxResNetClassifier, FlaxResNetClassifier2, FlaxResNetClassifier3
-from models.bridge import CorrectionModel, FeatureUnet, dsb_schedules, MLP
-from models.i2sb import UNetModel
+from models.bridge import CorrectionModel, FeatureUnet, LatentFeatureUnet, dsb_schedules, MLP
+from models.i2sb import TinyUNetModel, UNetModel, MidUNetModel
 from collections import OrderedDict
 from PIL import Image
 from tqdm import tqdm
 from utils import WandbLogger, pixelize, normalize_logits, unnormalize_logits
 from utils import model_list, logit_dir_list, feature_dir_list, feature2_dir_list, feature3_dir_list
-from utils import get_info_in_dir, jprint, expand_to_broadcast, FeatureBank
+from utils import get_info_in_dir, jprint, expand_to_broadcast, FeatureBank, get_probs, get_logprobs
+from utils import batch_mul, batch_add, get_ens_logits, get_avg_logits
 from tqdm import tqdm
 from functools import partial
 import defaults_sgd
@@ -49,7 +49,7 @@ def build_featureloaders(config, rng=None):
     def load_arrays(dir, div, prop, mode_idx, i, length=None):
         path = f"{dir}/{div}_{prop}_M{mode_idx}S{i}.npy"
         if not os.path.exists(path):
-            print(f"WARNING: {path} doesn't exists")
+            print(f"WARNING: {path} doesn't exist")
             return jnp.ones((length,))
         with open(path, "rb") as f:
             logits = np.load(f)
@@ -59,20 +59,6 @@ def build_featureloaders(config, rng=None):
         f_dir = dir.split("_")[0]
         f_dir = dir.replace(f_dir, f"{f_dir}_last")
         return f_dir
-
-    def get_ens_logits(logits, mean_axis=0):
-        logitmean = jnp.mean(logits[mean_axis], axis=-1)[:, None]
-        ens_prob = 0
-        for l in logits:
-            ens_prob += jax.nn.softmax(l, axis=-1)
-        ens_prob /= len(logits)
-        ens_logprob = jnp.log(ens_prob)
-        ens_logprob_mean = jnp.mean(ens_logprob, axis=-1)[:, None]
-        ens_logits = ens_logprob-ens_logprob_mean+logitmean
-        return ens_logits
-
-    def get_avg_logits(logits):
-        return sum(logits)/len(logits)
 
     dir = config.features_dir
     f_dir = get_context_dir(dir)
@@ -134,25 +120,27 @@ def build_featureloaders(config, rng=None):
             f_dir, "train", "lambdas", mode_idx, i, train_logits.shape[0])
         train_lambdas_checker2.append(train_lambdas)
         # features (for context)
-        train_features = load_arrays(
-            f_dir, "train", "features", mode_idx, i, train_logits.shape[0])
-        valid_features = load_arrays(
-            f_dir, "valid", "features", mode_idx, i, valid_logits.shape[0])
-        test_features = load_arrays(
-            f_dir, "test", "features", mode_idx, i, test_logits.shape[0])
-        train_Bfeatures_list.append(train_features)
-        valid_Bfeatures_list.append(valid_features)
-        test_Bfeatures_list.append(test_features)
+        if config.context:
+            train_features = load_arrays(
+                f_dir, "train", "features", mode_idx, i, train_logits.shape[0])
+            valid_features = load_arrays(
+                f_dir, "valid", "features", mode_idx, i, valid_logits.shape[0])
+            test_features = load_arrays(
+                f_dir, "test", "features", mode_idx, i, test_logits.shape[0])
+            train_Bfeatures_list.append(train_features)
+            valid_Bfeatures_list.append(valid_features)
+            test_Bfeatures_list.append(test_features)
         # features for adversarial images
-        train_supples = load_arrays(
-            dir, "train", "advfeatures", mode_idx, i, train_logits.shape[0])
-        valid_supples = load_arrays(
-            dir, "valid", "advfeatures", mode_idx, i, valid_logits.shape[0])
-        test_supples = load_arrays(
-            dir, "test", "advfeatures", mode_idx, i, test_logits.shape[0])
-        train_Bsupples_list.append(train_supples)
-        valid_Bsupples_list.append(valid_supples)
-        test_Bsupples_list.append(test_supples)
+        if config.supple:
+            train_supples = load_arrays(
+                dir, "train", "advfeatures", mode_idx, i, train_logits.shape[0])
+            valid_supples = load_arrays(
+                dir, "valid", "advfeatures", mode_idx, i, valid_logits.shape[0])
+            test_supples = load_arrays(
+                dir, "test", "advfeatures", mode_idx, i, test_logits.shape[0])
+            train_Bsupples_list.append(train_supples)
+            valid_Bsupples_list.append(valid_supples)
+            test_Bsupples_list.append(test_supples)
 
     def putinA(mode_idx, i):
         # logits
@@ -170,29 +158,43 @@ def build_featureloaders(config, rng=None):
             dir, "train", "lambdas", mode_idx, i, train_logits.shape[0])
         train_lambdas_checker.append(train_lambdas)
         # features (for context)
-        train_features = load_arrays(
-            f_dir, "train", "features", mode_idx, i, train_logits.shape[0])
-        valid_features = load_arrays(
-            f_dir, "valid", "features", mode_idx, i, valid_logits.shape[0])
-        test_features = load_arrays(
-            f_dir, "test", "features", mode_idx, i, test_logits.shape[0])
-        train_Afeatures_list.append(train_features)
-        valid_Afeatures_list.append(valid_features)
-        test_Afeatures_list.append(test_features)
+        if config.context:
+            train_features = load_arrays(
+                f_dir, "train", "features", mode_idx, i, train_logits.shape[0])
+            valid_features = load_arrays(
+                f_dir, "valid", "features", mode_idx, i, valid_logits.shape[0])
+            test_features = load_arrays(
+                f_dir, "test", "features", mode_idx, i, test_logits.shape[0])
+            train_Afeatures_list.append(train_features)
+            valid_Afeatures_list.append(valid_features)
+            test_Afeatures_list.append(test_features)
         # features for adversarial images
-        train_supples = load_arrays(
-            dir, "train", "advfeatures", mode_idx, i, train_logits.shape[0])
-        valid_supples = load_arrays(
-            dir, "valid", "advfeatures", mode_idx, i, valid_logits.shape[0])
-        test_supples = load_arrays(
-            dir, "test", "advfeatures", mode_idx, i, test_logits.shape[0])
-        train_Asupples_list.append(train_supples)
-        valid_Asupples_list.append(valid_supples)
-        test_Asupples_list.append(test_supples)
+        if config.supple:
+            train_supples = load_arrays(
+                dir, "train", "advfeatures", mode_idx, i, train_logits.shape[0])
+            valid_supples = load_arrays(
+                dir, "valid", "advfeatures", mode_idx, i, valid_logits.shape[0])
+            test_supples = load_arrays(
+                dir, "test", "advfeatures", mode_idx, i, test_logits.shape[0])
+            train_Asupples_list.append(train_supples)
+            valid_Asupples_list.append(valid_supples)
+            test_Asupples_list.append(test_supples)
 
-    if config.bezier:
-        putinB(0, 0)  # B
+    if config.bezier or config.stos:
+        putinB(0, 0)  # mode
         putinA(1, 0)  # bezier
+    elif config.sdistill or config.stos:
+        putinB(0, 0)  # distilled
+        putinA(1, 0)  # either A or B
+    elif config.distill:
+        putinB(0, 0)  # distilled
+        putinA(1, 0)  # mode 0
+        putinA(2, 0)  # mode 1
+        train_lambdas_checker = train_lambdas_checker[:1]
+        if config.context:
+            train_Afeatures_list = train_Afeatures_list[:1]
+            valid_Afeatures_list = valid_Afeatures_list[:1]
+            test_Afeatures_list = test_Afeatures_list[:1]
     elif config.pm060704 > 0:
         mode_idx = 0
         putinB(mode_idx, 0)
@@ -214,19 +216,23 @@ def build_featureloaders(config, rng=None):
     train_logitsB = jnp.array(train_logitsB)
     del train_Blogits_list
 
-    train_featuresA = np.concatenate(train_Afeatures_list, axis=0)
+    train_featuresA = np.concatenate(
+        train_Afeatures_list, axis=0) if config.context else train_Afeatures_list
     train_featuresA = jnp.array(train_featuresA)
     del train_Afeatures_list
 
-    train_featuresB = np.concatenate(train_Bfeatures_list, axis=0)
+    train_featuresB = np.concatenate(
+        train_Bfeatures_list, axis=0) if config.context else train_Bfeatures_list
     train_featuresB = jnp.array(train_featuresB)
     del train_Bfeatures_list
 
-    train_supplesA = np.concatenate(train_Asupples_list, axis=0)
+    train_supplesA = np.concatenate(
+        train_Asupples_list, axis=0) if config.supple else train_Asupples_list
     train_supplesA = jnp.array(train_supplesA)
     del train_Asupples_list
 
-    train_supplesB = np.concatenate(train_Bsupples_list, axis=0)
+    train_supplesB = np.concatenate(
+        train_Bsupples_list, axis=0) if config.supple else train_Bsupples_list
     train_supplesB = jnp.array(train_supplesB)
     del train_Bsupples_list
 
@@ -238,19 +244,23 @@ def build_featureloaders(config, rng=None):
     valid_logitsB = jnp.array(valid_logitsB)
     del valid_Blogits_list
 
-    valid_featuresA = np.concatenate(valid_Afeatures_list, axis=0)
+    valid_featuresA = np.concatenate(
+        valid_Afeatures_list, axis=0) if config.context else valid_Afeatures_list
     valid_featuresA = jnp.array(valid_featuresA)
     del valid_Afeatures_list
 
-    valid_featuresB = np.concatenate(valid_Bfeatures_list, axis=0)
+    valid_featuresB = np.concatenate(
+        valid_Bfeatures_list, axis=0) if config.context else valid_Bfeatures_list
     valid_featuresB = jnp.array(valid_featuresB)
     del valid_Bfeatures_list
 
-    valid_supplesA = np.concatenate(valid_Asupples_list, axis=0)
+    valid_supplesA = np.concatenate(
+        valid_Asupples_list, axis=0) if config.supple else valid_Asupples_list
     valid_supplesA = jnp.array(valid_supplesA)
     del valid_Asupples_list
 
-    valid_supplesB = np.concatenate(valid_Bsupples_list, axis=0)
+    valid_supplesB = np.concatenate(
+        valid_Bsupples_list, axis=0) if config.supple else valid_Bsupples_list
     valid_supplesB = jnp.array(valid_supplesB)
     del valid_Bsupples_list
 
@@ -262,19 +272,23 @@ def build_featureloaders(config, rng=None):
     test_logitsB = jnp.array(test_logitsB)
     del test_Blogits_list
 
-    test_featuresA = np.concatenate(test_Afeatures_list, axis=0)
+    test_featuresA = np.concatenate(
+        test_Afeatures_list, axis=0) if config.context else test_Afeatures_list
     test_featuresA = jnp.array(test_featuresA)
     del test_Afeatures_list
 
-    test_featuresB = np.concatenate(test_Bfeatures_list, axis=0)
+    test_featuresB = np.concatenate(
+        test_Bfeatures_list, axis=0) if config.context else test_Bfeatures_list
     test_featuresB = jnp.array(test_featuresB)
     del test_Bfeatures_list
 
-    test_supplesA = np.concatenate(test_Asupples_list, axis=0)
+    test_supplesA = np.concatenate(
+        test_Asupples_list, axis=0) if config.supple else test_Asupples_list
     test_supplesA = jnp.array(test_supplesA)
     del test_Asupples_list
 
-    test_supplesB = np.concatenate(test_Bsupples_list, axis=0)
+    test_supplesB = np.concatenate(
+        test_Bsupples_list, axis=0) if config.supple else test_Bsupples_list
     test_supplesB = jnp.array(test_supplesB)
     del test_Bsupples_list
 
@@ -289,7 +303,8 @@ def build_featureloaders(config, rng=None):
 
     train_lambdas_checker2 = np.concatenate(train_lambdas_checker2, axis=0)
     train_lambdas_checker2 = jnp.array(train_lambdas_checker2)
-    assert jnp.all(train_lambdas_checker2 == train_lambdas)
+    if config.context:
+        assert jnp.all(train_lambdas_checker2 == train_lambdas)
     del train_lambdas_checker2
 
     valid_lambdas = np.concatenate(valid_lambdas_list, axis=0)
@@ -317,7 +332,17 @@ def build_featureloaders(config, rng=None):
     val_labels = jnp.tile(val_labels, [n_samples_each_Bmode])
     tst_labels = jnp.tile(tst_labels, [n_samples_each_Bmode])
 
-    if config.am051101:
+    if config.distill:
+        train_logitsA = get_ens_logits(jnp.split(train_logitsA, 2, axis=0))
+        valid_logitsA = get_ens_logits(jnp.split(valid_logitsA, 2, axis=0))
+        test_logitsA = get_ens_logits(jnp.split(test_logitsA, 2, axis=0))
+        if config.supple:
+            train_supplesA = get_ens_logits(
+                jnp.split(train_supplesA, 2, axis=0))
+            valid_supplesA = get_ens_logits(
+                jnp.split(valid_supplesA, 2, axis=0))
+            test_supplesA = get_ens_logits(jnp.split(test_supplesA, 2, axis=0))
+    elif config.am051101:
         train_logitsA = get_avg_logits([train_logitsB, train_logitsA])
         valid_logitsA = get_avg_logits([valid_logitsB, valid_logitsA])
         test_logitsA = get_avg_logits([test_logitsB, test_logitsA])
@@ -505,6 +530,35 @@ def build_featureloaders(config, rng=None):
     test_tfpn, test_tfpn_count = get_tfpn(
         test_logitsB, test_logitsA, tst_labels)
 
+    if config.prob_input:
+        (
+            train_logitsB,
+            train_logitsA,
+            train_supplesB,
+            train_supplesA,
+            valid_logitsB,
+            valid_logitsA,
+            valid_supplesB,
+            valid_supplesA,
+            test_logitsB,
+            test_logitsA,
+            test_supplesB,
+            test_supplesA
+        ) = (get_probs(ele) for ele in (
+            train_logitsB,
+            train_logitsA,
+            train_supplesB,
+            train_supplesA,
+            valid_logitsB,
+            valid_logitsA,
+            valid_supplesB,
+            valid_supplesA,
+            test_logitsB,
+            test_logitsA,
+            test_supplesB,
+            test_supplesA
+        ))
+
     dataloaders = dict(
         train_length=len(train_logitsA),
         valid_length=len(valid_logitsA),
@@ -595,7 +649,14 @@ def build_featureloaders(config, rng=None):
         shuffle=False,
         transform=None
     )
-    if config.nonorm:
+    if config.prob_input:
+        def normalize(x): return x
+        def unnormalize(x): return jnp.clip(x, 1e-8, 1-1e-8)
+        f_normalize = partial(
+            normalize_logits,  features_dir=f_dir) if config.context else None
+        f_unnormalize = partial(
+            unnormalize_logits,  features_dir=f_dir) if config.context else None
+    elif config.nonorm:
         def normalize(x): return x
         def unnormalize(x): return x
         def f_normalize(x): return x
@@ -608,19 +669,21 @@ def build_featureloaders(config, rng=None):
         f_unnormalize = partial(
             unnormalize_logits,  features_dir=f_dir) if config.context else None
 
-    if config.get_stats:
+    if config.get_stats != "":
         # ------------------------------------------------------------------
         #  Compute statistics (mean, std)
         # ------------------------------------------------------------------
         count = 0
         _sum = 0
-        for batch in dataloaders["tst_featureloader"](rng=None):
-            logitsB = batch["images"]
-            logitsA = batch["labels"]
-            # 0: pmap dimension, 1: batch dimension
-            _sum += jnp.sum(logitsB, [0, 1])+jnp.sum(logitsA, [0, 1])
-            count += 2*batch["marker"].sum()
-        for batch in dataloaders["trn_featureloader"](rng=None):
+        if config.get_stats == "train":
+            loader = "trn_featureloader"
+        elif config.get_stats == "valid":
+            loader = "val_featureloader"
+        elif config.get_stats == "test":
+            loader = "tst_featureloader"
+        else:
+            raise Exception()
+        for batch in dataloaders[loader](rng=None):
             logitsB = batch["images"]
             logitsA = batch["labels"]
             # 0: pmap dimension, 1: batch dimension
@@ -628,17 +691,7 @@ def build_featureloaders(config, rng=None):
             count += 2*batch["marker"].sum()
         mean = _sum/count
         _sum = 0
-        for batch in dataloaders["tst_featureloader"](rng=None):
-            logitsB = batch["images"]
-            logitsA = batch["labels"]
-            marker = expand_to_broadcast(batch["marker"], logitsB, axis=2)
-            mseB = jnp.where(marker, (logitsB-mean)**2,
-                             jnp.zeros_like(logitsB))
-            mseA = jnp.where(marker, (logitsA-mean)**2,
-                             jnp.zeros_like(logitsA))
-            _sum += jnp.sum(mseB, axis=[0, 1])
-            _sum += jnp.sum(mseA, axis=[0, 1])
-        for batch in dataloaders["trn_featureloader"](rng=None):
+        for batch in dataloaders[loader](rng=None):
             logitsB = batch["images"]
             logitsA = batch["labels"]
             marker = expand_to_broadcast(batch["marker"], logitsB, axis=2)
@@ -651,9 +704,9 @@ def build_featureloaders(config, rng=None):
         var = _sum/count
         std = jnp.sqrt(var)
         print("dims", mean.shape)
-        print("mean", ",".join(list(mean)))
-        print("std", ",".join(list(std)))
-        assert False, "Statistics are Calculated"
+        print("mean", ",".join(str(e) for e in mean))
+        print("std", ",".join(str(e) for e in std))
+        assert False, f"{config.get_stats} statistics are Calculated"
 
     def get_rate(div):
         if div == "train":
@@ -669,8 +722,12 @@ def build_featureloaders(config, rng=None):
         for batch in loader:
             logitsB = batch["images"]
             logitsA = batch["labels"]
-            predB = jax.nn.log_softmax(logitsB, axis=-1)
-            predA = jax.nn.log_softmax(logitsA, axis=-1)
+            if config.prob_input:
+                predB = jnp.log(logitsB)
+                predA = jnp.log(logitsA)
+            else:
+                predB = jax.nn.log_softmax(logitsB, axis=-1)
+                predA = jax.nn.log_softmax(logitsA, axis=-1)
             predB = jnp.argmax(predB, axis=-1)
             predA = jnp.argmax(predA, axis=-1)
             conflicts = jnp.where(
@@ -755,36 +812,47 @@ class TrainState(train_state.TrainState):
         kwargs["training"] = training
         return mu_t, sigma_t, jnp.sqrt(bigsigma_t), kwargs
 
-    def sample(self, rng, apply, x0, ctx, cfl, stats):
+    def sample(self, rng, apply, x0, ctx, cfl, stats, clock=False):
         shape = x0.shape
         batch_size = shape[0]
-        x_n = x0  # (B, d)
+        _sigma_t = stats["sigma_t"]
+        _alpos_weight_t = stats["alpos_weight_t"]
+        _sigma_t_square = stats["sigma_t_square"]
+        _t = jnp.array([1/self.n_T])  # (1,)
+        _t = jnp.tile(_t, [batch_size])  # (B,)
+        h_arr = jax.random.normal(rng, (len(_sigma_t), *shape))
+        h_arr = h_arr.at[0].set(0)
+        std_arr = jnp.sqrt(_alpos_weight_t*_sigma_t_square)
 
+        @jax.jit
         def body_fn(n, val):
-            rng, x_n = val
+            x_n = val
             idx = self.n_T - n
-            rng = jax.random.fold_in(rng, idx)
-            t_n = jnp.array([idx/self.n_T])  # (1,)
-            t_n = jnp.tile(t_n, [batch_size])  # (B,)
+            t_n = idx * _t
 
-            h = jnp.where(idx > 1, jax.random.normal(
-                rng, shape), jnp.zeros(shape))  # (B, d)
+            h = h_arr[idx]  # (B, d)
             eps = apply(x_n, t_n, ctx, cfl)  # (2*B, d)
 
-            sigma_t = stats["sigma_t"][idx]
-            alpos_weight_t = stats["alpos_weight_t"][idx]
-            sigma_t_square = stats["sigma_t_square"][idx]
-            std = jnp.sqrt(alpos_weight_t*sigma_t_square)
+            sigma_t = _sigma_t[idx]
+            alpos_weight_t = _alpos_weight_t[idx]
+            # sigma_t_square = _sigma_t_square[idx]
+            # std = jnp.sqrt(alpos_weight_t*sigma_t_square)
+            std = std_arr[idx]
 
             x_0_eps = x_n - sigma_t*eps
             mean = alpos_weight_t*x_0_eps + (1-alpos_weight_t)*x_n
             x_n = mean + std * h  # (B, d)
 
-            return rng, x_n
+            return x_n
 
-        _, x_n = jax.lax.fori_loop(0, self.n_T, body_fn, (rng, x_n))
+        @jax.jit
+        def f():
+            x_n = jax.lax.fori_loop(0, self.n_T, body_fn, x0)
+            return x_n
+        if clock:
+            return f
 
-        return x_n
+        return f()
 
     def sample2(self, rng, apply, x0, ctx, cfl, stats):
         shape = x0.shape
@@ -822,6 +890,143 @@ class TrainState(train_state.TrainState):
             x_all.append(body_fn(idx, (rng, x_all[-1]))[1])
 
         return jnp.stack(x_all)
+
+
+class RFTrainState(train_state.TrainState):
+    batch_stats: Any
+    rng: Any
+    dynamic_scale: dynamic_scale_lib.DynamicScale
+    ema_params: Any
+    eps: jnp.float32
+
+    n_T: jnp.int32
+
+    def forward(self, x0, x1, training=True, **kwargs):
+        # rng
+        assert 'rng' in kwargs.keys()
+        rng = kwargs["rng"]
+        _ts = jax.random.uniform(
+            rng, (x0.shape[0],), minval=self.eps, maxval=1.)  # (B,)
+        # time 0 --> x0, time 1 --> x1
+        x_t = batch_mul((1 - _ts), x0) + batch_mul(_ts, x1)
+
+        kwargs["t"] = _ts
+        kwargs["training"] = training
+        return x_t, kwargs
+
+    def sample(self, apply, x0, ctx, cfl, eps, n_T, clock=False):
+        shape = x0.shape
+        batch_size = shape[0]
+        x_n = x0  # (B, d)
+
+        timesteps = jnp.linspace(eps, 1., n_T)
+        timesteps = jnp.concatenate([jnp.array([0]), timesteps], axis=0)
+
+        def body_fn(n, val):
+            """
+              n in [0, self.n_T - 1]
+            """
+            x_n = val
+            current_t = jnp.array([timesteps[n_T - n]])
+            next_t = jnp.array([timesteps[n_T - n - 1]])
+            current_t = jnp.tile(current_t, [batch_size])
+            next_t = jnp.tile(next_t, [batch_size])
+
+            eps = apply(x_n, current_t, ctx, cfl)
+
+            x_n = x_n + batch_mul(next_t - current_t, eps)
+
+            return x_n
+
+        begin = time.time()
+        x_n = jax.lax.fori_loop(0, n_T, body_fn, x_n)
+        sec = time.time() - begin
+        if clock:
+            return x_n, sec
+
+        return x_n
+
+
+def get_resnet(config):
+    from sgd_trainstate import TrainState as TrainStateSGD
+    from sgd_trainstate import TrainStateRNG
+    from models.resnet import FlaxResNet
+    rng = jax.random.PRNGKey(config.seed)
+
+    # specify precision
+    model_dtype = jnp.float32
+    if config.precision == 'fp16':
+        model_dtype = jnp.bfloat16 if jax.local_devices(
+        )[0].platform == 'tpu' else jnp.float16
+
+    # build dataloaders
+    dataloaders = build_dataloaders(config)
+
+    # build model
+    if config.model_name == 'FlaxResNet':
+        _ResNet = partial(
+            FlaxResNet,
+            depth=config.model_depth,
+            widen_factor=config.model_width,
+            dtype=model_dtype,
+            pixel_mean=defaults.PIXEL_MEAN,
+            pixel_std=defaults.PIXEL_STD,
+            num_classes=dataloaders['num_classes'])
+
+    if config.model_style == 'BN-ReLU':
+        model = _ResNet()
+    elif config.model_style == "FRN-Swish":
+        model = _ResNet(
+            conv=partial(
+                flax.linen.Conv,
+                use_bias=True,
+                kernel_init=jax.nn.initializers.he_normal(),
+                bias_init=jax.nn.initializers.zeros),
+            norm=FilterResponseNorm,
+            relu=flax.linen.swish)
+
+    # initialize model
+    def initialize_model(key, model):
+        @jax.jit
+        def init(*args):
+            return model.init(*args)
+        return init({'params': key}, jnp.ones(dataloaders['image_shape'], model.dtype))
+    _, init_rng = jax.random.split(rng)
+    variables = initialize_model(init_rng, model)
+
+    # define dynamic_scale
+    dynamic_scale = None
+    if config.precision == 'fp16' and jax.local_devices()[0].platform == 'gpu':
+        dynamic_scale = dynamic_scale_lib.DynamicScale()
+
+    # define optimizer with scheduler
+    scheduler = optax.cosine_decay_schedule(
+        init_value=config.optim_lr,
+        decay_steps=config.optim_ne * dataloaders['trn_steps_per_epoch'])
+    optimizer = optax.sgd(
+        learning_rate=scheduler,
+        momentum=config.optim_momentum)
+    # build train state
+    if not config.bezier:
+        state = TrainStateSGD.create(
+            apply_fn=model.apply,
+            params=variables['params'],
+            tx=optimizer,
+            image_stats=variables.get('image_stats'),
+            batch_stats=variables.get('batch_stats'),
+            dynamic_scale=dynamic_scale)
+    else:
+        _, state_rng = jax.random.split(rng)
+        state = TrainStateRNG.create(
+            apply_fn=model.apply,
+            params=variables['params'],
+            tx=optimizer,
+            image_stats=variables.get('image_stats'),
+            batch_stats=variables.get('batch_stats'),
+            rng=state_rng,
+            dynamic_scale=dynamic_scale)
+
+    return state, dataloaders
 
 
 def launch(config, print_fn):
@@ -866,9 +1071,9 @@ def launch(config, print_fn):
             x_dim = 10
     elif config.features_dir in feature_dir_list:
         if config.data_name == "CIFAR100_x32":
-            x_dim = 128
+            x_dim = int(128*config.model_width)
         else:
-            x_dim = 64
+            x_dim = int(64*config.model_width)
     elif config.features_dir in feature2_dir_list:
         if config.data_name == "CIFAR100_x32":
             x_dim = (8, 8, 128)
@@ -876,15 +1081,15 @@ def launch(config, print_fn):
             x_dim = (8, 8, 64)
     elif config.features_dir in feature3_dir_list:
         if config.data_name == "CIFAR100_x32":
-            x_dim = (8, 8, 256)
+            x_dim = (8, 8, int(128*config.model_width))
         else:
-            x_dim = (8, 8, 128)
+            x_dim = (8, 8, int(64*config.model_width))
 
     if config.contexts_dir in feature_dir_list:
         if config.data_name == "CIFAR100_x32":
-            ctx_dim = 128
+            ctx_dim = int(128*config.model_width)
         else:
-            ctx_dim = 64
+            ctx_dim = int(64*config.model_width)
     elif config.contexts_dir in feature2_dir_list:
         if config.data_name == "CIFAR100_x32":
             ctx_dim = (8, 8, 128)
@@ -918,7 +1123,36 @@ def launch(config, print_fn):
 
     # settings = __import__(
     #     f"{config.features_dir}.settings", fromlist=[""])
-    if isinstance(x_dim, int):
+    if config.ldm:
+        score_func = FeatureUnet(
+            in_channels=config.z_dim,
+            ver=config.version,
+            n_feat=config.n_feat,
+            droprate=config.droprate,
+            context=ctx_dim if config.context else None,
+            conflict=config.conflict
+        )
+        classifier = partial(FlaxResNetClassifier3,
+                             depth=config.model_depth,
+                             widen_factor=config.model_width,
+                             dtype=model_dtype,
+                             pixel_mean=defaults_sgd.PIXEL_MEAN,
+                             pixel_std=defaults_sgd.PIXEL_STD,
+                             num_classes=dataloaders["num_classes"])
+        if config.model_style == "BN-ReLU":
+            classifier = classifier()
+        elif config.model_style == "FRN-Swish":
+            classifier = classifier(
+                conv=partial(
+                    flax.linen.Conv,
+                    use_bias=True,
+                    kernel_init=jax.nn.initializers.he_normal(),
+                    bias_init=jax.nn.initializers.zeros
+                ),
+                norm=FilterResponseNorm,
+                relu=flax.linen.swish
+            )
+    elif isinstance(x_dim, int):
         score_func = FeatureUnet(
             in_channels=x_dim,
             ver=config.version,
@@ -936,7 +1170,6 @@ def launch(config, print_fn):
         channel_mult = ""
         learn_sigma = config.learn_sigma
         num_res_blocks = config.num_res_blocks
-        class_cond = False
         attention_resolutions = "16"
         num_heads = config.num_heads
         num_head_channels = -1
@@ -960,7 +1193,7 @@ def launch(config, print_fn):
             elif image_size == 16:
                 channel_mult = (1, 2, 4)
             elif image_size == 8:
-                channel_mult = (1, 2)
+                channel_mult = (1,)
             else:
                 raise ValueError(f"unsupported image size: {image_size}")
         else:
@@ -971,22 +1204,24 @@ def launch(config, print_fn):
         for res in attention_resolutions.split(","):
             attention_ds.append(image_size // int(res))
 
-        score_func = UNetModel(
-            image_size=image_size,
-            in_channels=in_channels,
-            model_channels=num_channels,
-            out_channels=(in_channels if not learn_sigma else 2*in_channels),
-            num_res_blocks=num_res_blocks,
-            attention_resolutions=tuple(attention_ds),
+        score_func = (UNetModel if config.large else TinyUNetModel)(
+            ver=config.version,
+            image_size=image_size,  # 8
+            in_channels=in_channels,  # 128
+            model_channels=num_channels,  # 256
+            out_channels=(
+                in_channels if not learn_sigma else 2 * in_channels),  # 128
+            num_res_blocks=num_res_blocks,  # 1
+            attention_resolutions=tuple(attention_ds),  # (0,)
             dropout=dropout,
-            channel_mult=channel_mult,
-            num_classes=(dataloaders["num_classes"] if class_cond else None),
+            channel_mult=channel_mult,  # (1,)
+            num_classes=None,
             dtype=model_dtype,
-            num_heads=num_heads,
-            num_head_channels=num_head_channels,
-            num_heads_upsample=num_heads_upsample,
-            use_scale_shift_norm=use_scale_shift_norm,
-            resblock_updown=resblock_updown,
+            num_heads=num_heads,  # 1
+            num_head_channels=num_head_channels,  # -1
+            num_heads_upsample=num_heads_upsample,  # -1
+            use_scale_shift_norm=use_scale_shift_norm,  # False
+            resblock_updown=resblock_updown,  # False
             use_new_attention_order=use_new_attention_order,
             context=ctx_dim if config.context else None
         )
@@ -1018,6 +1253,15 @@ def launch(config, print_fn):
 
     corrector = CorrectionModel(layers=config.corrector)
 
+    if config.ldm:
+        assert not config.rectified_flow
+        score_func = LatentFeatureUnet(
+            features=config.z_dim,
+            scorenet=score_func,
+            betas=(beta1, beta2),
+            n_T=config.T,
+            **dsb_stats
+        )
     # initialize model
 
     def initialize_model(key, model, input_dim=None):
@@ -1040,14 +1284,24 @@ def launch(config, print_fn):
             cfl=init_cfl,
             training=False
         )
-    variables = initialize_model(init_rng, score_func)
+    clsB_rng, clsA_rng, cor_rng = jax.random.split(init_rng, 3)
+    if config.ldm:
+        init_x = jnp.empty((1, *x_dim), model_dtype)
+        variables = score_func.init(
+            {"params": init_rng},
+            rng=init_rng,
+            x0=init_x,
+            x1=init_x,
+            training=False
+        )
+    else:
+        variables = initialize_model(init_rng, score_func)
     variables_clsB = initialize_model(init_rng, classifier)
     variables_clsA = initialize_model(init_rng, classifier)
     variables_cor = initialize_model(init_rng, corrector, input_dim=logit_dim)
 
-    def load_classifier(variables_cls, ckpt_dir, cnn=False):
-        if cnn:
-            assert config.model_depth == 32
+    def load_classifier(variables_cls, ckpt_dir, sgd_state=False):
+        if "last3" in config.features_dir:
             assert config.features_dir in feature3_dir_list
             variables_cls = variables_cls.unfreeze()
             ckpt = checkpoints.restore_checkpoint(
@@ -1059,7 +1313,10 @@ def launch(config, print_fn):
                 if arc[0] == "Dense":
                     key = k
                 else:
-                    n = int(arc[-1])+33-5
+                    if config.model_depth == 32:
+                        n = int(arc[-1])+33-5
+                    elif config.model_depth == 44:
+                        n = int(arc[-1])+45-6  # TODO
                     key = f"{arc[0]}_{str(n)}"
                 p = ckpt["model"]["params"][key]
                 variables_cls["params"][k] = p
@@ -1068,7 +1325,8 @@ def launch(config, print_fn):
         else:
             variables_cls = variables_cls.unfreeze()
             ckpt = checkpoints.restore_checkpoint(
-                ckpt_dir=os.path.join(ckpt_dir, "sghmc"),
+                ckpt_dir=os.path.join(
+                    ckpt_dir, "sghmc") if not sgd_state else ckpt_dir,
                 target=None
             )
             params = ckpt["model"]["params"].get("Dense_0")
@@ -1087,11 +1345,75 @@ def launch(config, print_fn):
     style = config.model_style
     shared = config.shared_head
     sgd_state = getattr(config, "sgd_state", False)
-    model_dir_list = model_list(name, style, shared, sgd_state)
+    bezier = "bezier" in config.features_dir
+    distill = "distill" in config.features_dir
+    distref = "distref" in config.features_dir
+    distA = "distA" in config.features_dir
+    distB = "distB" in config.features_dir
+    AtoB = "AtoB" in config.features_dir
+    AtoshB = "AtoshB" in config.features_dir
+    tag = ""
+    if bezier:
+        tag = "bezier"
+    elif distill:
+        tag = "distill"
+    elif distref:
+        tag = "distref"
+    elif distA:
+        tag = "distA"
+    elif distB:
+        tag = "distB"
+    elif AtoB:
+        tag = "AtoB"
+    elif AtoshB:
+        tag = "AtoshB"
+    model_dir_list = model_list(name, style, shared, tag)
     variables_clsB = load_classifier(
-        variables_clsB, model_dir_list[0], config.bezier)  # current mode
+        variables_clsB, model_dir_list[0], sgd_state)  # current mode
     variables_clsA = load_classifier(
-        variables_clsA, model_dir_list[1], config.bezier)  # target mode
+        variables_clsA, model_dir_list[1], sgd_state)  # target mode
+    # if AtoshB:
+    #     for k, v in variables_clsA["params"].items():
+    #         if "FilterResponseNorm" in k:
+    #             a = v["gamma"]
+    #             b = variables_clsB["params"][k]["gamma"]
+    #         else:
+    #             a = v["kernel"]
+    #             b = variables_clsB["params"][k]["kernel"]
+    #         assert jnp.all(a == b)
+
+    # ----------------------------------------------------------------
+    # ResNet for time measuring
+    # ----------------------------------------------------------------
+    if config.compare_time:
+        resnet_state, image_loader = get_resnet(config)
+        params_dict = dict(params=resnet_state.params)
+        if resnet_state.image_stats is not None:
+            params_dict["image_stats"] = resnet_state.image_stats
+        if resnet_state.batch_stats is not None:
+            params_dict["batch_stats"] = resnet_state.batch_stats
+        image_loader = image_loader["tst_loader"](rng=None)
+        image_loader = jax_utils.prefetch_to_device(image_loader, size=2)
+        example = next(image_loader)
+        single_example = get_single_batch(example)
+
+        @jax.jit
+        def resnet(batch):
+            _, new_model_state = resnet_state.apply_fn(
+                params_dict, batch["images"],
+                rngs=None,
+                mutable='intermediates',
+                use_running_average=True
+            )
+            logits = new_model_state["intermediates"]["cls.logit"][0]
+            return jax.nn.log_softmax(logits, axis=-1)
+
+        def measure_resnet(batch):
+            resnet(batch)
+            begin = time.time()
+            resnet(batch)
+            sec = time.time() - begin
+            return sec
 
     dynamic_scale = None
     if config.precision == 'fp16' and jax.local_devices()[0].platform == 'gpu':
@@ -1105,33 +1427,54 @@ def launch(config, print_fn):
         decay_steps=total_epochs * dataloaders["trn_steps_per_epoch"])
     optimizer = optax.adamw(
         learning_rate=scheduler, weight_decay=config.optim_weight_decay)
-    # if isinstance(score_func, UNetModel):
-    if config.shared_head:
-        partition_optimizer = {"trainable": optimizer,
-                               "frozen": optax.set_to_zero()}
-        param_partitions = freeze(flax.traverse_util.path_aware_map(
-            lambda path, _: "frozen" if "frozen" in path else "trainable", variables["params"]))
-        optimizer = optax.multi_transform(
-            partition_optimizer, param_partitions)
+    # if config.shared_head:
+    #     partition_optimizer = {"trainable": optimizer,
+    #                            "frozen": optax.set_to_zero()}
+    #     param_partitions = freeze(flax.traverse_util.path_aware_map(
+    #         lambda path, _: "frozen" if "frozen" in path else "trainable", variables["params"]))
+    #     optimizer = optax.multi_transform(
+    #         partition_optimizer, param_partitions)
 
     # Train state of diffusion bridge
-    state = TrainState.create(
-        apply_fn=score_func.apply,
-        params=(
-            variables["params"],
-            variables_cor["params"],
-            variables_clsA["params"]),
-        ema_params=(
-            variables["params"],
-            variables_cor["params"],
-            variables_clsA["params"]),
-        tx=optimizer,
-        batch_stats=variables.get("batch_stats"),
-        rng=init_rng,
-        dynamic_scale=dynamic_scale,
-        betas=(beta1, beta2),
-        n_T=config.T,
-        **dsb_stats)
+    if config.rectified_flow:
+        state = RFTrainState.create(
+            apply_fn=score_func.apply,
+            params=(
+                variables["params"],
+                variables_cor["params"],
+                variables_clsA["params"] if config.clsA else variables_clsB["params"]
+            ),
+            ema_params=(
+                variables["params"],
+                variables_cor["params"],
+                variables_clsA["params"] if config.clsA else variables_clsB["params"]
+            ),
+            tx=optimizer,
+            batch_stats=variables.get("batch_stats"),
+            rng=init_rng,
+            dynamic_scale=dynamic_scale,
+            n_T=config.T,
+            eps=config.eps)
+    else:
+        state = TrainState.create(
+            apply_fn=score_func.apply,
+            params=(
+                variables["params"],
+                variables_cor["params"],
+                variables_clsA["params"] if config.clsA else variables_clsB["params"]
+            ),
+            ema_params=(
+                variables["params"],
+                variables_cor["params"],
+                variables_clsA["params"] if config.clsA else variables_clsB["params"]
+            ),
+            tx=optimizer,
+            batch_stats=variables.get("batch_stats"),
+            rng=init_rng,
+            dynamic_scale=dynamic_scale,
+            betas=(beta1, beta2),
+            n_T=config.T,
+            **dsb_stats)
 
     if config.save_cls2:
         ckpt = dict(model=state, config=dict(),
@@ -1177,8 +1520,10 @@ def launch(config, print_fn):
                 feat = correct_feature(cparams, feat)
         if "last" in config.features_dir:
             if mode.lower() == "a" or mode.lower() == "c":
-                if config.bezier and mode.lower() == "c":
+                # if config.bezier and mode.lower() == "c":
+                if mode.lower() == "c":
                     variables_cls_params = bparams
+                    # variables_cls_params = variables_clsA["params"]
                 else:
                     variables_cls_params = variables_clsA["params"]
             elif mode.lower() == "b":
@@ -1188,6 +1533,9 @@ def launch(config, print_fn):
             )
         else:
             logits = feat
+        if config.prob_input:
+            logits = jnp.clip(logits, 1e-8, 1-1e-8)
+            logits = logits / jnp.sum(logits, axis=-1, keepdims=True)
         return logits
 
     def ensemble_accuracy(f_list, labels, marker, mode, cparams=None, bparams=None):
@@ -1196,7 +1544,10 @@ def launch(config, print_fn):
         for m, f_gen in zip(mode, f_list):
             logits = get_logits(f_gen, m, cparams, bparams)
 
-            predictions = jax.nn.log_softmax(logits, axis=-1)
+            if config.prob_input:
+                predictions = jnp.log(logits)  # logits == probs
+            else:
+                predictions = jax.nn.log_softmax(logits, axis=-1)
             avg_preds += jnp.exp(predictions)
             acc = evaluate_acc(
                 predictions, labels, log_input=True, reduction="none")
@@ -1220,7 +1571,10 @@ def launch(config, print_fn):
         each_acc = []
         for m, f_gen in zip(mode, f_list):
             logits = get_logits(f_gen, m, cparams, bparams)
-            predictions = jax.nn.log_softmax(logits, axis=-1)
+            if config.prob_input:
+                predictions = jnp.log(logits)
+            else:
+                predictions = jax.nn.log_softmax(logits, axis=-1)
             avg_preds += jnp.exp(predictions)
             acc = evaluate_top2acc(
                 predictions, labels, log_input=True, reduction="none")
@@ -1238,7 +1592,10 @@ def launch(config, print_fn):
         each_acc = []
         for m, f_gen in zip(mode, f_list):
             logits = get_logits(f_gen, m, cparams, bparams)
-            predictions = jax.nn.log_softmax(logits, axis=-1)
+            if config.prob_input:
+                predictions = jnp.log(logits)
+            else:
+                predictions = jax.nn.log_softmax(logits, axis=-1)
             avg_preds += jnp.exp(predictions)
             acc = evaluate_topNacc(
                 predictions, labels, top, log_input=True, reduction="none")
@@ -1256,8 +1613,10 @@ def launch(config, print_fn):
         each_acc = []
         for m, f_gen in zip(mode, f_list):
             logits = get_logits(f_gen, m, cparams, bparams)
-
-            predictions = jax.nn.log_softmax(logits, axis=-1)
+            if config.prob_input:
+                predictions = jnp.log(logits)
+            else:
+                predictions = jax.nn.log_softmax(logits, axis=-1)
             avg_preds += jnp.exp(predictions)
             acc = evaluate_acc(
                 predictions, labels, log_input=True, reduction="none")
@@ -1278,19 +1637,25 @@ def launch(config, print_fn):
 
     def cross_entropy(f_gen, labels, marker, mode="C", cparams=None, bparams=None):
         logits = get_logits(f_gen, mode, cparams, bparams)
+        if config.prob_input:
+            predictions = jnp.log(logits)
+        else:
+            predictions = jax.nn.log_softmax(logits, axis=-1)
         target = common_utils.onehot(
             labels, num_classes=logits.shape[-1])  # [B, K,]
-        loss = -jnp.sum(
-            target * jax.nn.log_softmax(logits, axis=-1),
-            axis=-1)      # [B,]
+        loss = -jnp.sum(target * predictions, axis=-1)      # [B,]
         loss = jnp.where(marker, loss, 0)
         return loss
 
     def distill_entropy(logitsA_eps, logitsA, marker, mode_eps="C", mode="A", cparams=None, bparams=None):
         logitsA_eps = get_logits(logitsA_eps, mode_eps, cparams, bparams)
         logitsA = get_logits(logitsA, mode, cparams, bparams)
-        soft_labels = jax.nn.softmax(logitsA, axis=-1)
-        soft_preds = jax.nn.log_softmax(logitsA_eps, axis=-1)
+        if config.prob_input:
+            soft_labels = logitsA
+            soft_preds = jnp.log(logitsA_eps)
+        else:
+            soft_labels = jax.nn.softmax(logitsA, axis=-1)
+            soft_preds = jax.nn.log_softmax(logitsA_eps, axis=-1)
         loss = -jnp.sum(soft_labels*soft_preds, axis=-1)
         loss = jnp.where(marker, loss, 0)
         return loss
@@ -1300,7 +1665,10 @@ def launch(config, print_fn):
         ens_preds = 0
         for m, _logits in zip(mode, logits):
             logits = get_logits(_logits, m, cparams, bparams)
-            ens_preds += jnp.exp(jax.nn.log_softmax(logits, axis=-1))
+            if config.prob_input:
+                ens_preds += logits
+            else:
+                ens_preds += jnp.exp(jax.nn.log_softmax(logits, axis=-1))
         ens_preds /= len(ens_preds)
         target = common_utils.onehot(
             labels, num_classes=logits.shape[-1])  # [B, K,]
@@ -1317,11 +1685,14 @@ def launch(config, print_fn):
 
         return KL(q||p)
         """
-
         logit_tar = get_logits(logit_tar, mode_tar, cparams, bparams)
         logit_ref = get_logits(logit_ref, mode_ref, cparams, bparams)
-        logq = jax.nn.log_softmax(logit_tar, axis=-1)
-        logp = jax.nn.log_softmax(logit_ref, axis=-1)
+        if config.prob_input:
+            logq = jnp.log(logit_tar)
+            logp = jnp.log(logit_ref)
+        else:
+            logq = jax.nn.log_softmax(logit_tar, axis=-1)
+            logp = jax.nn.log_softmax(logit_ref, axis=-1)
         if mask is not None:
             logq = mask*logq
         q = jnp.exp(logq)
@@ -1336,8 +1707,12 @@ def launch(config, print_fn):
                       for tar in logits_tar]
         logits_ref = [get_logits(ref, mode_ref, cparams, bparams)
                       for ref in logits_ref]
-        q_list = [jax.nn.softmax(tar, axis=-1) for tar in logits_tar]
-        p_list = [jax.nn.softmax(ref, axis=-1) for ref in logits_ref]
+        if config.prob_input:
+            q_list = logits_tar
+            p_list = logits_ref
+        else:
+            q_list = [jax.nn.softmax(tar, axis=-1) for tar in logits_tar]
+            p_list = [jax.nn.softmax(ref, axis=-1) for ref in logits_ref]
         q = sum(q_list)/len(q_list)
         p = sum(p_list)/len(p_list)
         logq = jnp.log(q)
@@ -1419,25 +1794,30 @@ def launch(config, print_fn):
                     mse_loss(unnorm_logitsB, unnorm_logitsA)
                 )
             elif name == "var":
+                assert not config.prob_input
                 p = jax.nn.softmax(unnorm_x0eps, axis=-1)
                 indices = 1+jnp.arange(0, p.shape[-1])[None, ...]
                 ECx2J = jnp.sum(indices**2*p, axis=-1)
                 ECxJ2 = jnp.sum(indices*p, axis=-1)**2
                 rglr = 100*(ECx2J - ECxJ2)
             elif name == "prob":
+                assert not config.prob_input
                 p_C = stable*jax.nn.softmax(unnorm_x0eps, axis=-1)
                 p_A = stable*jax.nn.softmax(unnorm_logitsA, axis=-1)
                 rglr = mse_loss(p_C, p_A) / stable**power
             elif name == "regress":
+                assert not config.prob_input
                 p_C = stable*jax.nn.softmax(unnorm_x0eps, axis=-1)
                 p_y = stable*common_utils.onehot(labels, p_C.shape[-1])
                 rglr = mse_loss(p_C, p_y) / stable**power
             elif name == "ymatch":
+                assert not config.prob_input
                 p_C = stable*jax.nn.softmax(unnorm_x0eps, axis=-1)
                 p_A = stable*jax.nn.softmax(unnorm_logitsA, axis=-1)
                 y = common_utils.onehot(labels, p_C.shape[-1])
                 rglr = mse_loss(y*p_C, y*p_A) / stable**power
             elif name == "maxmatch":
+                assert not config.prob_input
                 p_C = stable*jax.nn.softmax(unnorm_x0eps, axis=-1)
                 p_A = stable*jax.nn.softmax(unnorm_logitsA, axis=-1)
                 p_B = stable*jax.nn.softmax(unnorm_logitsA, axis=-1)
@@ -1448,6 +1828,7 @@ def launch(config, print_fn):
                 mask = jnp.logical_or(yA, yB)
                 rglr = mse_loss(mask*p_C, mask*p_A) / stable**power
             elif name == "meanmatch":
+                assert not config.prob_input
                 p_C = stable*jax.nn.softmax(unnorm_x0eps, axis=-1)
                 p_A = stable*jax.nn.softmax(unnorm_logitsA, axis=-1)
                 p_B = stable*jax.nn.softmax(unnorm_logitsB, axis=-1)
@@ -1458,12 +1839,20 @@ def launch(config, print_fn):
                 mask = jnp.logical_or(maskA, maskB)
                 rglr = mse_loss(mask*p_C, mask*p_A) / stable**power
             elif name == "conflict":
+                assert not config.prob_input
                 p_C = stable*jax.nn.softmax(unnorm_x0eps, axis=-1)
                 p_A = stable*jax.nn.softmax(unnorm_logitsA, axis=-1)
                 p_B = stable*jax.nn.softmax(unnorm_logitsB, axis=-1)
                 mask = jnp.argmax(p_A, axis=-1) != jnp.argmax(p_B, axis=-1)
                 mask = mask[:, None]
                 rglr = mse_loss(mask*p_C, mask*p_A) / stable**power
+            elif name == "prob_kld":
+                assert config.prob_input
+                rglr1 = jnp.sum(jnp.where(batch["marker"], jnp.linalg.norm(
+                    jnp.sum(unnorm_x0eps, axis=-1) - 1), 0))
+                rglr2 = kl_divergence(
+                    unnorm_x0eps, unnorm_logitsA, batch["marker"], "C", "A", cparams, bparams)
+                rglr = rglr1 + 0.1*rglr2
             else:
                 raise Exception("Invalid Regularization Name")
             total_rglr += coef*rglr
@@ -1487,56 +1876,130 @@ def launch(config, print_fn):
 
         def loss_fn(params):
             params, cparams, bparams = params
-            logits_t, sigma_t, kwargs = state.forward(
-                logitsA, logitsB, training=True, rng=state.rng)
-            mu_t = kwargs["mu_t"]
-            del kwargs["mu_t"]
+
+            # model params
             params_dict = dict(params=params)
+            d_rng, i_rng = jax.random.split(state.rng)
             rngs_dict = dict(dropout=state.rng)
             mutable = []
             if state.batch_stats is not None:
                 params_dict["batch_stats"] = state.batch_stats
                 mutable.append("batch_stats")
-            epsilon, new_model_state = state.apply_fn(
-                params_dict, logits_t, ctx=contexts, cfl=conflicts,
-                mutable=mutable, rngs=rngs_dict, **kwargs)
-            _sigma_t = expand_to_broadcast(sigma_t, logits_t, axis=1)
-            if config.determ_eps:
-                logits_t = mu_t
-            diff = (logits_t - logitsA) / _sigma_t
+            model_bd = score_func.bind(params_dict, rngs=rngs_dict)
+
+            # model feed-forward
+            if config.ldm:
+                (
+                    (epsilon, z_t, t, mu_t, sigma_t),
+                    (new_logitsA, new_logitsB),
+                    (zA, zB)
+                ), new_model_state = state.apply_fn(
+                    params_dict,
+                    i_rng, logitsA, logitsB,
+                    ctx=contexts,
+                    cfl=conflicts,
+                    mutable=mutable,
+                    rngs=rngs_dict,
+                    training=True)
+                _sigma_t = expand_to_broadcast(sigma_t, z_t, axis=1)
+                if config.determ_eps:
+                    z_t = mu_t
+                diff = (z_t - zA) / _sigma_t
+
+            else:
+                if config.rectified_flow:
+                    logits_t, kwargs = state.forward(
+                        logitsA, logitsB, training=True, rng=state.rng)
+                else:
+                    logits_t, sigma_t, kwargs = state.forward(
+                        logitsA, logitsB, training=True, rng=state.rng)
+                    mu_t = kwargs["mu_t"]
+                    del kwargs["mu_t"]
+                epsilon, new_model_state = state.apply_fn(
+                    params_dict, logits_t, ctx=contexts, cfl=conflicts,
+                    mutable=mutable, rngs=rngs_dict, **kwargs)
+
+                if config.rectified_flow:
+                    diff = logits_t - logitsA
+                else:
+                    _sigma_t = expand_to_broadcast(sigma_t, logits_t, axis=1)
+                    if config.determ_eps:
+                        logits_t = mu_t
+                    diff = (logits_t - logitsA) / _sigma_t
+                t = kwargs["t"]
+
             unnorm_logitsA = _logitsA
             unnorm_logitsB = _logitsB
+            # compute loss
             p2 = (lambda t: 0.0001 + 0.5*(1-0.0001)*(1+jnp.cos(math.pi *
-                  jnp.where(t > 0.5, 2*t-1, 1-2*t))))(kwargs["t"])
-            lamb = p2 if config.p2_weight else jnp.ones_like(kwargs["t"])
+                  jnp.where(t > 0.5, 2*t-1, 1-2*t))))(t)
+            lamb = p2 if config.p2_weight else jnp.ones_like(t)
             mask = None
             if config.pm051101:
-                p_A = jax.nn.softmax(unnorm_logitsA, axis=-1)
-                p_B = jax.nn.softmax(unnorm_logitsB, axis=-1)
+                assert not config.ldm
+                if config.prob_input:
+                    p_A = unnorm_logitsA
+                    p_B = unnorm_logitsB
+                else:
+                    p_A = jax.nn.softmax(unnorm_logitsA, axis=-1)
+                    p_B = jax.nn.softmax(unnorm_logitsB, axis=-1)
                 mask = jnp.argmax(p_A, axis=-1) != jnp.argmax(p_B, axis=-1)
                 mask = expand_to_broadcast(mask, diff, axis=1)
             elif config.pm053105:
-                p_A = jax.nn.softmax(unnorm_logitsA, axis=-1)
-                p_B = jax.nn.softmax(unnorm_logitsB, axis=-1)
+                assert not config.ldm
+                if config.prob_input:
+                    p_A = unnorm_logitsA
+                    p_B = unnorm_logitsB
+                else:
+                    p_A = jax.nn.softmax(unnorm_logitsA, axis=-1)
+                    p_B = jax.nn.softmax(unnorm_logitsB, axis=-1)
                 mask = jnp.argmax(p_A, axis=-1) == jnp.argmax(p_B, axis=-1)
                 mask = expand_to_broadcast(mask, diff, axis=1)
             loss = mse_loss(epsilon, diff, lamb=lamb, mask=mask)
-            x0eps = logits_t - _sigma_t*epsilon
+
+            # estimated B
+            if config.ldm:
+                z0eps = z_t - _sigma_t*epsilon
+                x0eps = model_bd.decode(z0eps)
+            else:
+                if config.rectified_flow:
+                    x0eps = logits_t
+                else:
+                    x0eps = logits_t - _sigma_t*epsilon
             if config.supple:
                 unnorm_x0eps = unnormalize(x0eps[..., :x_dim//2])
             else:
                 unnorm_x0eps = unnormalize(x0eps)
+
+            # train autoencoder
+            if config.ldm:
+                auloss0 = mse_loss(new_logitsB, logitsB)
+                auloss1 = mse_loss(new_logitsA, logitsA)
+                auloss2 = 1e-5*0.5*(zA**2).sum(-1)
+                auloss3 = 1e-5*0.5*(zB**2).sum(-1)
+                auloss = auloss0+auloss1+auloss2+auloss3
+
+            # train classifier
             celoss = collect_rglr(
                 unnorm_x0eps, unnorm_logitsA, unnorm_logitsB, labels, batch, cparams, bparams)
-            celoss /= sigma_t**2
+            if not config.rectified_flow:
+                celoss /= sigma_t**2
             count = jnp.sum(batch["marker"])
             loss = jnp.where(batch["marker"], loss, jnp.zeros_like(loss))
             celoss = jnp.where(batch["marker"], celoss, jnp.zeros_like(celoss))
+            if config.ldm:
+                auloss = jnp.where(
+                    batch["marker"], auloss, jnp.zeros_like(auloss))
+                if config.ae_only:
+                    loss = auloss
+                    config.beta = 0
+                else:
+                    loss += config.eta * auloss
             if config.p2_gamma or config.p2_gammainv:
                 if config.p2_gamma:
-                    gamma = kwargs["t"] * gamma_fn(state.step)
+                    gamma = t * gamma_fn(state.step)
                 else:
-                    gamma = (1-kwargs["t"]) * gamma_fn(state.step)
+                    gamma = (1-t) * gamma_fn(state.step)
                 totalloss = (1-gamma)*loss + gamma*celoss
                 totalloss = jnp.sum(totalloss) / count
                 loss = jnp.sum(loss) / count
@@ -1553,6 +2016,8 @@ def launch(config, print_fn):
 
             metrics = OrderedDict(
                 {"loss": loss*count, "count": count, "celoss": celoss*count})
+            if config.ldm:
+                metrics["auloss"] = jnp.sum(auloss)
 
             return totalloss, (metrics, new_model_state)
 
@@ -1569,11 +2034,13 @@ def launch(config, print_fn):
         new_state = state.apply_gradients(
             grads=grads, batch_stats=new_model_state.get('batch_stats'))
         a = config.ema_decay
-        new_state = new_state.replace(
-            ema_params=jax.tree_util.tree_map(
-                lambda wt, ema_tm1: jnp.where(a < 1, a*wt + (1-a)*ema_tm1, wt),
-                new_state.params,
-                new_state.ema_params))
+        if a < 1:
+            new_state = new_state.replace(
+                ema_params=jax.tree_util.tree_map(
+                    lambda wt, ema_tm1: jnp.where(
+                        wt != ema_tm1, a*wt + (1-a)*ema_tm1, wt),
+                    new_state.params,
+                    new_state.ema_params))
         metrics = jax.lax.psum(metrics, axis_name="batch")
 
         if dynamic_scale:
@@ -1602,26 +2069,64 @@ def launch(config, print_fn):
             logitsB = jnp.concatenate([logitsB, supplesB], axis=-1)
             logitsA = jnp.concatenate([logitsA, supplesA], axis=-1)
 
-        # get interpolation
-        logits_t, sigma_t, kwargs = state.forward(
-            logitsA, logitsB, training=False, rng=state.rng)
-        # get epsilon
         params_dict = dict(params=ema_params)
+        d_rng, i_rng = jax.random.split(state.rng)
         rngs_dict = dict(dropout=state.rng)
         if state.batch_stats is not None:
             params_dict["batch_stats"] = state.batch_stats
-        output = state.apply_fn(
-            params_dict, logits_t, ctx=contexts, cfl=conflicts,
-            rngs=rngs_dict, **kwargs)
+        # get interpolation
+        if config.ldm:
+            (
+                (output, z_t, t, mu_t, sigma_t),
+                (new_logitsA, new_logitsB),
+                (zA, zB)
+            ) = state.apply_fn(
+                params_dict,
+                i_rng, logitsA, logitsB,
+                ctx=contexts,
+                cfl=conflicts,
+                rngs=rngs_dict,
+                training=False)
+        else:
+            if config.rectified_flow:
+                logits_t, kwargs = state.forward(
+                    logitsA, logitsB, training=False, rng=state.rng)
+            else:
+                logits_t, sigma_t, kwargs = state.forward(
+                    logitsA, logitsB, training=False, rng=state.rng)
+            # get epsilon
+            output = state.apply_fn(
+                params_dict, logits_t, ctx=contexts, cfl=conflicts,
+                rngs=rngs_dict, **kwargs)
         # compute loss
-        _sigma_t = expand_to_broadcast(sigma_t, logits_t, axis=1)
-        diff = (logits_t - logitsA) / _sigma_t
+        if config.ldm:
+            _sigma_t = expand_to_broadcast(sigma_t, z_t, axis=1)
+            diff = (z_t - zA) / _sigma_t
+        else:
+            if config.rectified_flow:
+                diff = logits_t - logitsA
+            else:
+                _sigma_t = expand_to_broadcast(sigma_t, logits_t, axis=1)
+                diff = (logits_t - logitsA) / _sigma_t
         loss = mse_loss(output, diff)
         loss = jnp.where(batch["marker"], loss, jnp.zeros_like(loss))
+        if config.ldm:
+            auloss0 = mse_loss(new_logitsB, logitsB)
+            auloss1 = mse_loss(new_logitsA, logitsA)
+            auloss2 = 1e-5*0.5*(zA**2).sum(-1)
+            auloss3 = 1e-5*0.5*(zB**2).sum(-1)
+            auloss = auloss0+auloss1+auloss2+auloss3
+            auloss = jnp.where(batch["marker"], auloss, 0)
+            if config.ae_only:
+                loss = auloss
+            else:
+                loss += config.eta*auloss
         count = jnp.sum(batch["marker"])
         loss = jnp.where(count > 0, jnp.sum(loss)/count, 0)
         # collect metrics
         metrics = OrderedDict({"loss": loss*count, "count": count})
+        if config.ldm:
+            metrics["auloss"] = jnp.sum(auloss)
         metrics = jax.lax.psum(metrics, axis_name="batch")
         return metrics
 
@@ -1647,6 +2152,7 @@ def launch(config, print_fn):
         _logitsA = batch["labels"]  # mixture of other modes
         labels = batch["cls_labels"]
         logitsB = normalize(_logitsB)
+        logitsA = normalize(_logitsA)
         if config.supple:
             logitsB = jnp.concatenate([logitsB, supplesB], axis=-1)
         if config.conflict:
@@ -1655,48 +2161,73 @@ def launch(config, print_fn):
             cfl0 = jnp.zeros_like(labels)
             cfl1 = jnp.ones_like(labels)
             conflicts = jnp.concatenate([cfl0, cfl1], axis=0)
-        if config.time_ensemble:
+        if config.ldm:
+            params_dict = dict(params=ema_params)
+            rngs_dict = dict(dropout=state.rng)
+            if state.batch_stats is not None:
+                params_dict["batch_stats"] = state.batch_stats
+            model_bd = score_func.bind(params_dict, rngs=rngs_dict)
+            d_rng, i_rng = jax.random.split(state.rng)
             begin = time.time()
-            f_gen_all = state.sample2(
-                state.rng, apply, logitsB, context, conflicts, dsb_stats)
+            if config.ae_only:
+                z = model_bd.encode(logitsA)
+                f_gen = model_bd.decode(z)
+            else:
+                f_gen = model_bd.sample(i_rng, logitsB, context, conflicts)
             sec = time.time()-begin
-            if config.supple:
-                f_gen_all, a_gen_all = f_gen_all[...,
-                                                 :x_dim//2], f_gen_all[..., x_dim//2:]
-                a_gen_all = jax.vmap(unnormalize)(a_gen_all)
-                a_gen = a_gen_all[-1]
-            f_gen_all = jax.vmap(unnormalize)(f_gen_all)
-            f_gen = f_gen_all[-1]
-        elif config.sample_ensemble > 1:
-            begin = time.time()
-            repeats = config.sample_ensemble
-            expand = (1,)*len(logitsB.shape[1:])
-            n_logitsB = jnp.tile(logitsB, reps=[repeats, *expand])
-            n_context = jnp.tile(
-                context, reps=[repeats, *((1,)*len(context.shape[1:]))]) if config.context else context
-            n_conflicts = jnp.tile(
-                conflicts, reps=[repeats, *((1,)*len(conflicts.shape[1:]))]) if config.conflict else conflicts
-            f_gen_all = state.sample(
-                state.rng, apply, n_logitsB, n_context, n_conflicts, dsb_stats)
-            sec = time.time()-begin
-            f_gen_all = jnp.reshape(
-                f_gen_all, (repeats, -1, *logitsB.shape[1:]))
-            if config.supple:
-                f_gen_all, a_gen_all = f_gen_all[...,
-                                                 :x_dim//2], f_gen_all[..., x_dim//2:]
-                a_gen_all = jax.vmap(unnormalize)(a_gen_all)
-                a_gen = a_gen_all.mean(0)
-            f_gen_all = jax.vmap(unnormalize)(f_gen_all)
-            f_gen = f_gen_all.mean(0)
-        else:
-            begin = time.time()
-            f_gen = state.sample(
-                state.rng, apply, logitsB, context, conflicts, dsb_stats)
-            sec = time.time()-begin
-            if config.supple:
-                f_gen, a_gen = f_gen[..., :x_dim//2], f_gen[..., x_dim//2:]
-                a_gen = unnormalize(a_gen)
             f_gen = unnormalize(f_gen)
+        else:
+            if config.time_ensemble:
+                assert config.retified_flow == False
+                begin = time.time()
+                f_gen_all = state.sample2(
+                    state.rng, apply, logitsB, context, conflicts, dsb_stats)
+                sec = time.time()-begin
+                if config.supple:
+                    f_gen_all, a_gen_all = f_gen_all[...,
+                                                     :x_dim//2], f_gen_all[..., x_dim//2:]
+                    a_gen_all = jax.vmap(unnormalize)(a_gen_all)
+                    a_gen = a_gen_all[-1]
+                f_gen_all = jax.vmap(unnormalize)(f_gen_all)
+                f_gen = f_gen_all[-1]
+            elif config.sample_ensemble > 1:
+                begin = time.time()
+                repeats = config.sample_ensemble
+                expand = (1,)*len(logitsB.shape[1:])
+                n_logitsB = jnp.tile(logitsB, reps=[repeats, *expand])
+                n_context = jnp.tile(
+                    context, reps=[repeats, *((1,)*len(context.shape[1:]))]) if config.context else context
+                n_conflicts = jnp.tile(
+                    conflicts, reps=[repeats, *((1,)*len(conflicts.shape[1:]))]) if config.conflict else conflicts
+                if config.rectified_flow:
+                    f_gen_all = state.sample(
+                        apply, n_logitsB, n_context, n_conflicts, config.eps, config.T)
+                else:
+                    f_gen_all = state.sample(
+                        state.rng, apply, n_logitsB, n_context, n_conflicts, dsb_stats)
+                sec = time.time()-begin
+                f_gen_all = jnp.reshape(
+                    f_gen_all, (repeats, -1, *logitsB.shape[1:]))
+                if config.supple:
+                    f_gen_all, a_gen_all = f_gen_all[...,
+                                                     :x_dim//2], f_gen_all[..., x_dim//2:]
+                    a_gen_all = jax.vmap(unnormalize)(a_gen_all)
+                    a_gen = a_gen_all.mean(0)
+                f_gen_all = jax.vmap(unnormalize)(f_gen_all)
+                f_gen = f_gen_all.mean(0)
+            else:
+                begin = time.time()
+                if config.rectified_flow:
+                    f_gen = state.sample(
+                        apply, logitsB, context, conflicts, config.eps, config.T)
+                else:
+                    f_gen = state.sample(
+                        state.rng, apply, logitsB, context, conflicts, dsb_stats)
+                sec = time.time()-begin
+                if config.supple:
+                    f_gen, a_gen = f_gen[..., :x_dim//2], f_gen[..., x_dim//2:]
+                    a_gen = unnormalize(a_gen)
+                f_gen = unnormalize(f_gen)
         f_real = _logitsA
         f_init = _logitsB
         a_real = _supplesA
@@ -1704,6 +2235,9 @@ def launch(config, print_fn):
         if config.conflict:
             # product of expert
             f_gen = f_gen.reshape(2, -1, *f_gen.shape[1:]).mean(0)
+            # TODO: f_gen_all for time_ensemble
+        # if config.prob_input:
+        #     f_gen = jnp.clip(f_gen, 1e-12, 1-1e-12)
             # TODO: f_gen_all for time_ensemble
 
         f_all = jnp.stack([f_init, f_gen, f_real], axis=-1)
@@ -1730,6 +2264,7 @@ def launch(config, print_fn):
                                         fn=batch["fn"], tn=batch["tn"]),
                                    ["B", "C"], ema_cparams, ema_bparams)
         if config.time_ensemble:
+            assert not config.ldm
             ((tens_acc, tens_nll), _) = ensemble_accuracy(
                 [f_init, f_init, f_init, f_gen_all[-3],
                     f_gen_all[-2], f_gen_all[-1]],
@@ -1836,6 +2371,72 @@ def launch(config, print_fn):
         metrics = jax.lax.psum(metrics, axis_name='batch')
         return metrics
 
+    def measure_wallclock(state, batch):
+        ema_params, ema_cparams, ema_bparams = state.ema_params
+        context = f_normalize(batch["contexts"]) if config.context else None
+        conflicts = batch["conflicts"] if config.conflict else None
+        _supplesB = batch["supplesB"] if config.supple else None
+        _supplesA = batch["supplesA"] if config.supple else None
+        supplesB = normalize(_supplesB) if config.supple else None
+        supplesA = normalize(_supplesA) if config.supple else None
+        params_dict = dict(params=ema_params)
+        rngs_dict = dict(dropout=state.rng)
+        if state.batch_stats is not None:
+            params_dict["batch_stats"] = state.batch_stats
+
+        @jax.jit
+        def apply(x_n, t_n, ctx, cfl):
+            output = state.apply_fn(
+                params_dict, x=x_n, t=t_n, ctx=ctx, cfl=cfl,
+                rngs=rngs_dict, training=False)
+            return output
+        _logitsB = batch["images"]  # the current mode
+        _logitsA = batch["labels"]  # mixture of other modes
+        labels = batch["cls_labels"]
+        logitsB = normalize(_logitsB)
+        logitsA = normalize(_logitsA)
+        if config.supple:
+            logitsB = jnp.concatenate([logitsB, supplesB], axis=-1)
+        if config.conflict:
+            logitsB = jnp.tile(logitsB, [2, 1])
+            context = jnp.tile(context, [2, 1])
+            cfl0 = jnp.zeros_like(labels)
+            cfl1 = jnp.ones_like(labels)
+            conflicts = jnp.concatenate([cfl0, cfl1], axis=0)
+        if config.rectified_flow:
+            # def f():
+            #     out = state.sample(
+            #         apply, logitsB, context, conflicts, config.eps, config.T, clock=True)
+            #     # jax.block_until_ready(out)
+            #     return out
+            f = state.sample(
+                apply, logitsB, context, conflicts, config.eps, config.T, clock=True)
+        else:
+            # def f():
+            #     out = state.sample(
+            #         state.rng, apply, logitsB, context, conflicts, dsb_stats, clock=True)
+            #     # jax.block_until_ready(out)
+            #     return out
+            f = state.sample(
+                state.rng, apply, logitsB, context, conflicts, dsb_stats, clock=True)
+
+        f()
+        begin = time.time()
+        f()
+        sec10 = time.time() - begin
+        t = jnp.array([1/config.T])
+        apply(logitsB, t, None, None)
+        begin = time.time()
+        apply(logitsB, t, None, None)
+        sec = time.time() - begin
+        if config.compare_time:
+            resnet(single_example)
+            begin = time.time()
+            resnet(single_example)
+            secre = time.time() - begin
+
+        return OrderedDict({"sec": sec, "sec10": sec10, "secre": secre})
+
     def save_samples(state, batch, epoch_idx, train):
         if (epoch_idx+1) % 50 == 0 and os.environ.get("DEBUG") != True:
             z_all, _ = p_step_sample(state, batch)
@@ -1869,6 +2470,7 @@ def launch(config, print_fn):
                 arr = -mask2*1e10+(1-mask2)*arr
                 mask = jnp.logical_or(mask, mask2)
             return mask
+        assert not config.prob_input
         # index of batch that was correct in B but not in A
         Apred = jax.nn.log_softmax(A, axis=-1)
         Acorrect = evaluate_acc(
@@ -1927,11 +2529,18 @@ def launch(config, print_fn):
                 arr = -mask2*1e10+(1-mask2)*arr
                 mask = jnp.logical_or(mask, mask2)
             return mask
+
         # index of batch that was correct in B but not in A
-        Apred = jax.nn.log_softmax(A, axis=-1)
+        if config.prob_input:
+            Apred = jnp.log(A)
+            Bpred = jnp.log(B)
+            Cpred = jnp.log(C)
+        else:
+            Apred = jax.nn.log_softmax(A, axis=-1)
+            Bpred = jax.nn.log_softmax(B, axis=-1)
+            Cpred = jax.nn.log_softmax(C, axis=-1)
         Acorrect = evaluate_acc(
             Apred, labels, log_input=True, reduction="none")
-        Bpred = jax.nn.log_softmax(B, axis=-1)
         Bcorrect = evaluate_acc(
             Bpred, labels, log_input=True, reduction="none")
         Acorrect = jnp.asarray(Acorrect, dtype=bool)
@@ -1946,7 +2555,6 @@ def launch(config, print_fn):
                 save_labelA = top5(Apred[save_mask][0])
                 save_labelB = top5(Bpred[save_mask][0])
                 save_label = jnp.logical_or(save_labelA, save_labelB)
-                Cpred = jax.nn.log_softmax(C, axis=-1)
                 _A = jnp.exp(Apred[save_mask][0][save_label])
                 _B = jnp.exp(Bpred[save_mask][0][save_label])
                 _C = jnp.exp(Cpred[save_mask][0][save_label])
@@ -1960,7 +2568,8 @@ def launch(config, print_fn):
     cross_replica_mean = jax.pmap(lambda x: jax.lax.pmean(x, 'x'), 'x')
     p_step_train = jax.pmap(
         partial(step_train, config=config), axis_name="batch")
-    p_step_valid = jax.pmap(step_valid, axis_name="batch")
+    p_step_valid = jax.pmap(
+        step_valid, axis_name="batch")
     p_step_sample = jax.pmap(
         partial(step_sample, config=config), axis_name="batch")
     p_step_acc_ref = jax.pmap(step_acc_ref, axis_name="batch")
@@ -2003,8 +2612,14 @@ def launch(config, print_fn):
     wandb.define_metric("val/acc", summary="max")
     wandb.define_metric("val/ens_acc", summary="max")
     wandb.define_metric("val/ens_nll", summary="min")
-    wandb.run.summary["params"] = sum(
-        x.size for x in jax.tree_util.tree_leaves(variables["params"]))
+    wandb.run.summary["params"] = (
+        sum(x.size for x in jax.tree_util.tree_leaves(variables["params"]))
+        + sum(x.size for x in jax.tree_util.tree_leaves(variables_clsB["params"]))
+    )
+    # params_flatten = flax.traverse_util.flatten_dict(variables["params"])
+    # for k, v in params_flatten.items():
+    #     print(k, v.shape)
+
     wl = WandbLogger()
     if config.nowandb:
         time_stamp = datetime.datetime.now().strftime('%Y%m%d%H%M%S')
@@ -2013,6 +2628,7 @@ def launch(config, print_fn):
         path = wandb.run.name
     config.path = path
     save_path = os.path.abspath(f"./score_checkpoints/{path}")
+    save_examples = None
 
     for epoch_idx, _ in enumerate(tqdm(range(total_epochs)), start=1):
         rng = jax.random.fold_in(rng, epoch_idx)
@@ -2043,8 +2659,10 @@ def launch(config, print_fn):
                     save_samples(state, batch, epoch_idx, train=True)
             else:
                 if (epoch_idx+1) % 50 == 0:
-                    _, acc_metrics, _, _ = p_step_sample(state, batch)
+                    _, acc_metrics, examples, _ = p_step_sample(state, batch)
                     metrics.update(acc_metrics)
+                    if batch_idx == 1:
+                        save_examples = examples
 
             train_metrics.append(metrics)
 
@@ -2116,12 +2734,23 @@ def launch(config, print_fn):
         # -----------------------------------------------------------------
         # testing
         # -----------------------------------------------------------------
-        criteria = val_summarized["val/ens_acc"] if not config.am051101 else val_summarized["val/acc"]
+        if config.am051101 or config.distill:
+            criteria = val_summarized["val/acc"]
+        else:
+            criteria = val_summarized["val/ens_acc"]
         if best_acc < criteria or config.testall:
+            if config.compare_time:
+                image_loader = jax_utils.prefetch_to_device(
+                    image_loader, size=2)
+                for batch_idx, batch in enumerate(image_loader, start=1):
+                    if best_acc == 0 and batch_idx == 1:
+                        sbatch = get_single_batch(batch)
+                        sec = measure_resnet(sbatch)
+                        print("RESNET wall clock time", sec, "sec")
+                        break
             test_metrics = []
             test_loader = dataloaders["tst_featureloader"](rng=None)
             test_loader = jax_utils.prefetch_to_device(test_loader, size=2)
-            save_examples = None
             for batch_idx, batch in enumerate(test_loader, start=1):
                 rng = jax.random.fold_in(rng, batch_idx)
                 state = state.replace(rng=jax_utils.replicate(rng))
@@ -2129,14 +2758,27 @@ def launch(config, print_fn):
                 if best_acc == 0:
                     acc_ref_metrics = p_step_acc_ref(state, batch)
                     metrics.update(acc_ref_metrics)
+                    if config.compare_time and batch_idx == 1:
+                        sbatch = get_single_batch(batch)
+                        sstate = jax_utils.unreplicate(state)
+                        wallclock_metrics = measure_wallclock(sstate, sbatch)
+                        print("wall clock time",
+                              wallclock_metrics["sec"], "sec")
+                        print("10 steps wall clock time",
+                              wallclock_metrics["sec10"], "sec")
+                        print("RESNET wall clock time 2",
+                              wallclock_metrics["secre"], "sec")
                 if batch_idx == 1:
                     save_examples = examples
-                if config.save_cls:
-                    if not config.supple:
-                        A, B, C, labels = examples
-                        save_cls(A, B, C, labels, path, epoch_idx)
-                    else:
-                        save_advcls(examples, sexamples, path, epoch_idx)
+                    if config.save_cls:
+                        if not config.supple:
+                            A, B, C, labels = examples
+                            save_cls(A, B, C, labels, path, epoch_idx)
+                        else:
+                            save_advcls(examples, sexamples, path, epoch_idx)
+                    elif config.save_train_cls:
+                        A, B, C, labels = save_examples
+                        save_cls(A, B, C, labels, path+"trn", epoch_idx)
                 test_metrics.append(metrics)
             test_metrics = common_utils.get_metrics(test_metrics)
             tst_summarized = {
@@ -2192,6 +2834,12 @@ def main():
 
     parser = defaults.default_argument_parser()
 
+    parser.add_argument("--config", default=None, type=str)
+    args, argv = parser.parse_known_args(sys.argv[1:])
+    if args.config is not None:
+        import yaml
+        with open(args.config, 'r') as f:
+            arg_defaults = yaml.safe_load(f)
     # ---------------------------------------------------------------------------------------
     # optimizer
     # ---------------------------------------------------------------------------------------
@@ -2220,15 +2868,15 @@ def main():
     parser.add_argument("--gamma", default=0., type=float)
     parser.add_argument("--beta", default=0., type=float)
     parser.add_argument("--start_rglr", default=0, type=int)
-    parser.add_argument("--rglr_list", default="rkld", type=str)
+    parser.add_argument("--rglr_list", default="kld", type=str)
     parser.add_argument("--rglr_coef", default="1", type=str)
     parser.add_argument("--nowandb", action="store_true")
     parser.add_argument("--show", action="store_true")
-    parser.add_argument("--get_stats", action="store_true")
+    parser.add_argument("--get_stats", default="", type=str)
     parser.add_argument("--n_Amodes", default=1, type=int)
     parser.add_argument("--n_samples_each_mode", default=1, type=int)
     parser.add_argument("--take_valid", action="store_true")
-    parser.add_argument("--ema_decay", default=0.999, type=float)
+    parser.add_argument("--ema_decay", default=0.9999, type=float)
     parser.add_argument("--mixup_alpha", default=0., type=float)
     parser.add_argument("--mixup_gamma", default=1., type=float)
     parser.add_argument("--permaug", action="store_true")
@@ -2252,6 +2900,8 @@ def main():
     parser.add_argument("--pm050905", action="store_true")
     # save classification plots
     parser.add_argument("--save_cls", action="store_true")
+    # save classification plots of train dataset
+    parser.add_argument("--save_train_cls", action="store_true")
     # learn ensembled logits
     parser.add_argument("--pm051010", action="store_true")
     # learn averaged logits
@@ -2264,7 +2914,7 @@ def main():
     parser.add_argument("--conflict", action="store_true")
     # save classification plots from restored model
     parser.add_argument("--save_cls2", action="store_true")
-    # enhance loss where A inference does not conflicts with B (opposite to pm051101)
+    # enhance loss where A iAtoinference does not conflicts with B (opposite to pm051101)
     parser.add_argument("--pm053105", action="store_true")
     # dsb between two modes close to each other
     parser.add_argument("--pm060704", default=0, type=int)
@@ -2272,16 +2922,38 @@ def main():
     parser.add_argument("--bezier", action="store_true")
     # No normalization
     parser.add_argument("--nonorm", action="store_true")
+    # diffusion in the probability space
+    parser.add_argument("--prob_input", action="store_true")
+    # Build a bridge between distilled output and ensemble output
+    parser.add_argument("--distill", action="store_true")
+    # Build a bridge between distilled output and single output
+    parser.add_argument("--sdistill", action="store_true")
+    # Encoder context so that context size is reduced
+    parser.add_argument("--small_ctx", action="store_true")
+    # Single to Single bridge dataset setting
+    parser.add_argument("--stos", action="store_true")
+    # Compare wall clock time
+    parser.add_argument("--compare_time", action="store_true")
+    # Initialize the classifier with A (target mode)
+    parser.add_argument("--clsA", action="store_true")
     # ---------------------------------------------------------------------------------------
     # diffusion
     # ---------------------------------------------------------------------------------------
     parser.add_argument("--T", default=5, type=int)
     parser.add_argument("--beta1", default=1e-4, type=float)
-    parser.add_argument("--beta2", default=0.02, type=float)
+    parser.add_argument("--beta2", default=3e-4, type=float)
     parser.add_argument("--time_ensemble", action="store_true")
     parser.add_argument("--sample_ensemble", default=0, type=int)
     parser.add_argument("--determ_eps", action="store_true")
     parser.add_argument("--maxmask", action="store_true")
+    # rectified flow
+    parser.add_argument("--rectified_flow", action="store_true")
+    parser.add_argument("--eps", default=1e-3, type=float)
+    # latent diffusion
+    parser.add_argument("--ldm", action="store_true")
+    parser.add_argument("--z_dim", default=128, type=int)
+    parser.add_argument("--eta", default=1., type=float)
+    parser.add_argument("--ae_only", action="store_true")
     # ---------------------------------------------------------------------------------------
     # networks
     # ---------------------------------------------------------------------------------------
@@ -2297,6 +2969,10 @@ def main():
     parser.add_argument("--use_scale_shift_norm", action="store_true")
     parser.add_argument("--resblock_updown", action="store_true")
     parser.add_argument("--use_new_attention_order", action="store_true")
+    parser.add_argument("--large", action="store_true")
+
+    if args.config is not None:
+        parser.set_defaults(**arg_defaults)
 
     args = parser.parse_args()
 
@@ -2361,11 +3037,10 @@ def main():
 
 if __name__ == '__main__':
     import traceback
-
-    # This line opens a log file
     with open("error.log", "w") as log:
-
         try:
             main()
         except Exception:
+            print("ERROR OCCURED! Check it out in error.log.")
             traceback.print_exc(file=log)
+    # main()

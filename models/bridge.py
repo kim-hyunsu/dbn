@@ -1,4 +1,5 @@
 from functools import partial
+from utils import jprint
 import math
 from typing import Any, Tuple, Callable, Sequence, Union
 import flax.linen as nn
@@ -18,6 +19,7 @@ class CorrectionModel(nn.Module):
         bias_init=jax.nn.initializers.zeros)
     dense2: nn.Module = nn.Dense
     swish: Callable = nn.swish
+    relu: Callable = nn.relu
 
     @nn.compact
     def __call__(self, x, **kwargs):
@@ -28,7 +30,7 @@ class CorrectionModel(nn.Module):
             x = self.dense(x_dim, kernel_init=kernel_init)(x)
         else:
             for _ in range(self.layers-1):
-                x = self.swish(self.dense(x_dim)(x))
+                x = self.relu(self.dense(x_dim)(x))
             x = self.dense(x_dim)(x)
         return x
 
@@ -185,17 +187,35 @@ class EmbedFC(nn.Module):
     dense2: nn.Module = nn.Dense
     gelu: Callable = partial(nn.gelu, approximate=False)
     conv: nn.Module = nn.Conv
+    norm: nn.Module = nn.LayerNorm
 
     @nn.compact
     def __call__(self, x, **kwargs):
-        input_dim = self.input_dim
         if isinstance(self.input_dim, Tuple):
             H, W, C = self.input_dim
-            x = self.conv(C, (5, 5))(x)
-            x = self.conv(C, (5, 5))(x)
+            residual = x
+            x = self.conv(
+                features=C,
+                kernel_size=(3, 3),
+                strides=(1, 1),
+                padding="SAME"
+            )(x)
+            x = self.norm()(x)
+            x = self.gelu(x)
+            x = self.conv(
+                features=C,
+                kernel_size=(3, 3),
+                strides=(1, 1),
+                padding="SAME"
+            )(x)
+            x = self.norm()(x)
             B, H1, W1, C1 = x.shape
             input_dim = H1*W1*C1
-        x = x.reshape(-1, input_dim)
+            x = self.gelu(x+residual)
+            x = jnp.mean(x, axis=(1, 2))
+        else:
+            input_dim = self.input_dim
+            x = x.reshape(-1, input_dim)
         x = self.dense1(self.emb_dim)(x)
         x = self.gelu(x)
         out = self.dense2(self.emb_dim)(x)
@@ -716,7 +736,7 @@ class FeatureUnet(nn.Module):
         if self.conflict:
             cf = kwargs["cfl"]-0.5
             cf = expand_to_broadcast(cf, x, axis=1)
-            x = jnp.concatenate([x,cf], axis=-1)
+            x = jnp.concatenate([x, cf], axis=-1)
         return self._call_v1_0(x, t, **kwargs)
 
     def _call_v1_8(self, x, t, **kwargs):
@@ -727,8 +747,8 @@ class FeatureUnet(nn.Module):
         if self.conflict:
             cf = kwargs["cfl"]-0.5
             cf = expand_to_broadcast(cf, x, axis=1)
-            x = jnp.concatenate([x,cf], axis=-1)
-            
+            x = jnp.concatenate([x, cf], axis=-1)
+
         x = self.init_block(
             x.shape[-1], self.n_feat
         )(x, **kwargs)  # (B,n_feat)
@@ -787,3 +807,216 @@ class FeatureUnet(nn.Module):
         out = out_fn(jnp.concatenate([up3, x], axis=-1))
 
         return out
+
+
+class Encoder(nn.Module):
+    features: int = 128
+    conv: nn.Module = partial(nn.Conv, use_bias=False,
+                              kernel_init=jax.nn.initializers.he_normal(),
+                              bias_init=jax.nn.initializers.zeros)
+    norm: nn.Module = nn.LayerNorm
+    relu: Callable = nn.relu
+    fc:           nn.Module = partial(nn.Dense, use_bias=True,
+                                      kernel_init=jax.nn.initializers.he_normal(),
+                                      bias_init=jax.nn.initializers.zeros)
+
+    @nn.compact
+    def __call__(self, x, **kwargs):
+        residual = x  # 8x8x128
+        x = self.conv(
+            features=self.features,
+            kernel_size=(2, 2),
+            strides=(2, 2)
+        )(x)  # 4x4x128
+        x = self.norm()(x)
+        x = self.relu(x)
+        x = self.conv(
+            features=self.features,
+            kernel_size=(2, 2),
+            strides=(2, 2)
+        )(x)  # 2x2x128
+        x = self.norm()(x)
+        x = self.relu(x)
+        x = self.conv(
+            features=self.features,
+            kernel_size=(2, 2),
+            strides=(2, 2)
+        )(x)  # 1x1x128
+        x = self.norm()(x)
+        x = self.relu(x)
+        x = x.reshape(-1, self.features)
+        residual = x
+        x = self.fc(self.features)(x)
+        x = self.relu(x+residual)
+        x = self.fc(self.features)(x)
+        return x
+
+
+class Decoder(nn.Module):
+    features: int = 128
+    convT: nn.Module = partial(nn.ConvTranspose, use_bias=False,
+                               kernel_init=jax.nn.initializers.he_normal(),
+                               bias_init=jax.nn.initializers.zeros)
+    norm: nn.Module = nn.LayerNorm
+    relu: Callable = nn.relu
+    fc: nn.Module = partial(nn.Dense, use_bias=True,
+                            kernel_init=jax.nn.initializers.he_normal(),
+                            bias_init=jax.nn.initializers.zeros)
+
+    @nn.compact
+    def __call__(self, x, **kwargs):
+        residual = x
+        x = self.fc(self.features)(x)
+        x = self.relu(x+residual)
+        x = self.fc(self.features)(x)
+        B = x.shape[0]
+        x = x.reshape(B, 1, 1, -1)
+        x = self.convT(
+            features=self.features,
+            kernel_size=(2, 2),
+            strides=(2, 2)
+        )(x)  # 2x2x128
+        # x = jnp.tile(x, [1, 2, 2, 1])
+        x = self.norm()(x)
+        x = self.relu(x)
+        x = self.convT(
+            features=self.features,
+            kernel_size=(2, 2),
+            strides=(2, 2)
+        )(x)  # 4x4x128
+        x = self.norm()(x)
+        x = self.relu(x)
+        x = self.convT(
+            features=self.features,
+            kernel_size=(2, 2),
+            strides=(2, 2)
+        )(x)  # 8x8x128
+        x = self.norm()(x)
+        x = self.relu(x)
+        x = self.fc(self.features)(x)
+        return x
+
+
+class LatentFeatureUnet(nn.Module):
+    # parameters
+    features: int
+
+    # diffusion parameters
+    betas: Tuple
+    n_T: int
+    alpha_t: Any
+    oneover_sqrta: Any
+    sqrt_beta_t: Any
+    alphabar_t: Any
+    sqrtab: Any
+    sqrtmab: Any
+    mab_over_sqrtmab: Any
+    sigma_weight_t: Any
+    sigma_t: Any
+    sigmabar_t: Any
+    bigsigma_t: Any
+    alpos_t: Any
+    alpos_weight_t: Any
+    sigma_t_square: Any
+
+    # networks
+    scorenet: nn.Module
+
+    def setup(self, **kwargs):
+        self.encoder = Encoder(self.features)
+        self.decoder = Decoder(self.features)
+        # self.betas = kwargs["betas"]
+        # self.n_T = kwargs["n_T"]
+        # self.alpha_t = kwargs["alpha_t"]
+        # self.oneover_sqrta = kwargs["oneover_sqrta"]
+        # self.sqrt_beta_t = kwargs["sqrt_beta_t"]
+        # self.alphabar_t = kwargs["alphabar_t"]
+        # self.sqrtab = kwargs["sqrtab"]
+        # self.sqrtmab = kwargs["sqrtmab"]
+        # self.mab_over_sqrtmab = kwargs["mab_over_sqrtmab"]
+        # self.sigma_weight_t = kwargs["sigma_weight_t"]
+        # self.sigma_t = kwargs["sigma_t"]
+        # self.sigmabar_t = kwargs["sigmabar_t"]
+        # self.bigsigma_t = kwargs["bigsigma_t"]
+        # self.alpos_t = kwargs["alpos_t"]
+        # self.alpos_weight_t = kwargs["alpos_weight_t"]
+        # self.sigma_t_square = kwargs["sigma_t_square"]
+
+    def __call__(self, rng, x0, x1, **kwargs):
+        z0 = self.encode(x0)
+        z1 = self.encode(x1)
+        new_x0 = self.decode(z0)
+        new_x1 = self.decode(z1)
+        z_t, t, mu_t, sigma_t = self.forward(rng, z0, z1)
+        eps = self.score(z_t, t, **kwargs)
+        return (eps, z_t, t, mu_t, sigma_t), (new_x0, new_x1), (z0, z1)
+
+    def forward(self, rng, x0, x1):
+        t_rng, n_rng = jax.random.split(rng, 2)
+
+        _ts = jax.random.randint(t_rng, (x0.shape[0],), 1, self.n_T)  # (B,)
+        sigma_weight_t = self.sigma_weight_t[_ts]  # (B,)
+        sigma_weight_t = expand_to_broadcast(sigma_weight_t, x0, axis=1)
+        sigma_t = self.sigma_t[_ts]
+        mu_t = (sigma_weight_t*x0+(1-sigma_weight_t)*x1)
+        bigsigma_t = self.bigsigma_t[_ts]  # (B,)
+        bigsigma_t = expand_to_broadcast(bigsigma_t, mu_t, axis=1)
+
+        # q(X_t|X_0,X_1) = N(X_t;mu_t,bigsigma_t)
+        noise = jax.random.normal(n_rng, mu_t.shape)  # (B, d)
+        x_t = mu_t + noise*jnp.sqrt(bigsigma_t)
+        t = _ts/self.n_T
+        return x_t, t, mu_t, sigma_t
+
+    def sample(self, rng, x0, ctx, cfl):
+        z0 = self.encode(x0)
+        z1 = self._sample(rng, z0, ctx, cfl)
+        x1 = self.decode(z1)
+        return x1
+
+    def _sample(self, rng, x0, ctx, cfl):
+        shape = x0.shape
+        batch_size = shape[0]
+        x_n = x0  # (B, d)
+
+        def body_fn(n, val):
+            rng, x_n = val
+            idx = self.n_T - n
+            rng = jax.random.fold_in(rng, idx)
+            t_n = jnp.array([idx/self.n_T])  # (1,)
+            t_n = jnp.tile(t_n, [batch_size])  # (B,)
+
+            h = jnp.where(idx > 1, jax.random.normal(
+                rng, shape), jnp.zeros(shape))  # (B, d)
+            # eps = apply(x_n, t_n, ctx, cfl)  # (2*B, d)
+            eps = self.score(x_n, t=t_n, ctx=ctx, cfl=cfl,
+                             training=False)  # (2*B, d)
+
+            sigma_t = self.sigma_t[idx]
+            alpos_weight_t = self.alpos_weight_t[idx]
+            sigma_t_square = self.sigma_t_square[idx]
+            std = jnp.sqrt(alpos_weight_t*sigma_t_square)
+
+            x_0_eps = x_n - sigma_t*eps
+            mean = alpos_weight_t*x_0_eps + (1-alpos_weight_t)*x_n
+            x_n = mean + std * h  # (B, d)
+
+            return rng, x_n
+
+        # _, x_n = jax.lax.fori_loop(0, self.n_T, body_fn, (rng, x_n))
+        val = (rng, x_n)
+        for i in range(0, self.n_T):
+            val = body_fn(i, val)
+        _, x_n = val
+
+        return x_n
+
+    def score(self, x, t, **kwargs):
+        eps = self.scorenet(x, t, **kwargs)
+        return eps
+
+    def encode(self, x):
+        return self.encoder(x)
+
+    def decode(self, z):
+        return self.decoder(z)

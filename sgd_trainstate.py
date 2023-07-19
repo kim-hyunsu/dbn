@@ -37,7 +37,40 @@ def get_sgd_state(config, dataloaders, model, variables):
     elif config.optim == "adam":
         optimizer = optax.adam(
             learning_rate=scheduler)
-    if config.shared_head:
+    frozen_keys = []
+    if getattr(config, "shared_last3", None) is not None:
+        assert config.model_style == "FRN-Swish"
+        assert config.model_depth == 32
+        params = variables.unfreeze()
+        shared_ckpt = checkpoints.restore_checkpoint(
+            ckpt_dir=config.shared_last3,
+            target=None
+        )
+        for i in range(28, 34):
+            for arc in ["Conv", "FilterResponseNorm"]:
+                key = f"{arc}_{i}"
+                frozen_keys.append(key)
+        frozen_keys.append("Dense_0")
+        for key in frozen_keys:
+            p = shared_ckpt["model"]["params"][key]
+            params["params"][key] = p
+        variables = freeze(params)
+        # freeze head
+        partition_optimizer = {"trainable": optimizer,
+                               "frozen": optax.set_to_zero()}
+
+        def include(keywords, path):
+            included = False
+            for k in keywords:
+                if k in path:
+                    included = True
+                    break
+            return included
+        param_partitions = freeze(traverse_util.path_aware_map(
+            lambda path, v: "frozen" if include(frozen_keys, path) else "trainable", variables["params"]))
+        optimizer = optax.multi_transform(
+            partition_optimizer, param_partitions)
+    elif config.shared_head:
         # load trained head
         params = variables.unfreeze()
         ckpt = checkpoints.restore_checkpoint(
@@ -47,6 +80,9 @@ def get_sgd_state(config, dataloaders, model, variables):
         saved = ckpt["model"]["params"].get("Dense_0")
         if saved is None:
             saved = ckpt["model"]["params"]["head"]
+            frozen_keys.append("head")
+        else:
+            frozen_keys.append("Dense_0")
         params["params"]["Dense_0"] = saved
         variables = freeze(params)
         # freeze head

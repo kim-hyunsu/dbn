@@ -1,6 +1,7 @@
 from ast import Call
 from email.headerregistry import Group
 from functools import partial
+from site import USER_BASE
 from telnetlib import SE
 from typing import Any, Callable, Sequence, Dict
 import flax.linen as nn
@@ -157,6 +158,7 @@ class ResBlock(EmbedModule, TrainModule):
     dims: int = 2
     up: bool = False
     down: bool = False
+    small: bool = False
     # networks
     silu: Callable = nn.silu
     norm: nn.Module = partial(nn.GroupNorm, num_groups=32)
@@ -228,15 +230,19 @@ class ResBlock(EmbedModule, TrainModule):
             _kernels = (1,)*self.dims
             skip_connection = self.conv(_features, _kernels)
 
-        if updown:
-            in_rest, in_conv = in_layers[:-1], in_layers[-1]
-            h = in_rest(x)
-            h = h_upd(h)
-            x = x_upd(x)
-            h = in_conv(h)
+        if not self.small:
+            if updown:
+                in_rest, in_conv = in_layers[:-1], in_layers[-1]
+                h = in_rest(x)
+                h = h_upd(h)
+                x = x_upd(x)
+                h = in_conv(h)
+            else:
+                h = in_layers(x)
         else:
-            h = in_layers(x)
-        emb_out = jnp.asarray(emb_layers(emb), h.dtype)
+            h = x
+        # emb_out = jnp.asarray(emb_layers(emb), h.dtype)
+        emb_out = emb_layers(emb)
         B, E = emb_out.shape
         # expand = len(h.shape) - len(emb_out.shape)
         # init_axis = len(emb_out.shape)
@@ -254,6 +260,52 @@ class ResBlock(EmbedModule, TrainModule):
             h = h + emb_out
             h = out_layers(h)
         return skip_connection(x) + h
+
+
+class TinyResBlock(nn.Module):
+    channels: int
+    dropout: float
+    reduced: bool = False
+    use_batchnorm: bool = False
+    # networks
+    silu: Callable = nn.silu
+    norm: nn.Module = partial(nn.GroupNorm, num_groups=32)
+    batchnorm: nn.Module = partial(nn.BatchNorm, momentum=0.9, epsilon=1e-5, use_bias=True, use_scale=True,
+                                   scale_init=jax.nn.initializers.ones,
+                                   bias_init=jax.nn.initializers.zeros)
+    conv: nn.Module = nn.Conv
+    dense: nn.Module = nn.Dense
+    drop: nn.Module = nn.Dropout
+
+    @nn.compact
+    def __call__(self, x, emb, **kwargs):
+        ch = self.channels
+        residual = x
+        if self.reduced:
+            emb = self.dense(ch)(emb)
+            emb = emb[:, None, None, :]
+        else:
+            emb = self.silu(emb)
+            emb = self.dense(ch)(emb)
+            emb = emb[:, None, None, :]
+        x = x+emb
+        if self.use_batchnorm:
+            x = self.batchnorm(use_running_average=not kwargs["training"])(x)
+        else:
+            x = self.norm()(x)
+        x = self.silu(x)
+        if self.dropout > 0:
+            x = self.drop(
+                self.dropout,
+                deterministic=not kwargs["training"]
+            )(x)
+        x = self.conv(
+            features=ch,
+            kernel_size=(3, 3),
+            padding=(1, 1)
+        )(x)
+        x = x+residual
+        return x
 
 
 class QKVAttentionLegacy(nn.Module):
@@ -720,3 +772,457 @@ class UNetModel(nn.Module):
         assert h.shape[1] == h.shape[2]
 
         return h
+
+
+class MidUNetModel(nn.Module):
+    # parameters
+    image_size: int
+    in_channels: int
+    model_channels: int
+    out_channels: Sequence
+    num_res_blocks: int
+    attention_resolutions: Sequence
+    dropout: float = 0.
+    channel_mult: Sequence = (1, 2, 4, 8)
+    conv_resample: bool = True
+    dims: int = 2
+    num_classes: int = None
+    dtype: Any = jnp.float32
+    num_heads: int = 1
+    num_head_channels: int = -1
+    num_heads_upsample: int = -1
+    use_scale_shift_norm: bool = False
+    resblock_updown: bool = False
+    use_new_attention_order: bool = False
+    context: Sequence = None
+    # networks
+    silu: Callable = nn.silu
+    dense: nn.Module = nn.Dense
+    embed: nn.Module = nn.Embed
+    conv: nn.Module = nn.Conv
+    # zero_conv: nn.Module = partial(
+    #     nn.Conv,
+    #     kernel_init=jax.nn.initializers.zeros,
+    #     bias_init=jax.nn.initializers.zeros,
+    #     name="frozen")
+    zero_conv: nn.Module = nn.Conv
+    res_block: nn.Module = ResBlock
+    att_block: nn.Module = AttentionBlock
+    downsample: nn.Module = Downsample
+    upsample: nn.Module = Upsample
+    norm: nn.Module = partial(nn.GroupNorm, num_groups=32)
+    embed_sequential: nn.Module = EmbedSequential
+    sequential: nn.Module = Sequential
+
+    @nn.compact
+    def __call__(self, x, t, y=None, **kwargs):
+        timesteps = t
+        # if self.context is None:
+        #     del kwargs["ctx"]
+
+        assert (y is not None) == (
+            self.num_classes is not None
+        ), "must specify y if and only if the model is class-conditional"
+
+        assert x.shape[1] == x.shape[2]
+        assert len(x.shape) == 4
+        # B, H, W, C -> B, C, H, W
+        # x = jnp.transpose(x, (0, 3, 1, 2))
+        # assert x.shape[2] == x.shape[3]
+
+        if self.num_heads_upsample == -1:
+            num_heads_upsample = self.num_heads  # 1
+        else:
+            num_heads_upsample = self.num_heads_upsample
+
+        # ---------------------------------------------------------------------
+        # time embedding
+        # ---------------------------------------------------------------------
+        time_embed_dim = self.model_channels  # 256
+        time_embed = self.sequential([
+            self.dense(time_embed_dim),
+            self.silu,
+            self.dense(time_embed_dim),
+        ])
+
+        ch = input_ch = int(self.channel_mult[0] * self.model_channels)  # 256
+        _features = ch
+        _kernels = (3,)*self.dims  # (3,3)
+        _paddings = (1,)*self.dims  # (1,1)
+        input_blocks = [
+            self.sequential([
+                self.conv(_features, _kernels, padding=_paddings)
+            ])
+        ]
+
+        _feature_size = ch  # 256
+        input_block_chans = [ch]
+        ds = 1
+        layers = [
+            self.res_block(
+                ch,  # 256
+                time_embed_dim,  # 256
+                self.dropout,  # 0.2
+                out_channels=int(self.model_channels),  # 256
+                dims=self.dims,  # 2
+                use_scale_shift_norm=self.use_scale_shift_norm,  # False
+            )
+        ]
+        ch = int(self.model_channels)  # 256
+        input_blocks.append(self.embed_sequential(layers))
+        _feature_size += ch  # 512
+        input_block_chans.append(ch)  # [256, 256]
+
+        middle_block = self.embed_sequential([
+            self.res_block(
+                ch,
+                time_embed_dim,
+                self.dropout,
+                dims=self.dims,
+                use_scale_shift_norm=self.use_scale_shift_norm,
+            ),
+            # self.att_block(
+            #     ch,
+            #     num_heads=self.num_heads,
+            #     num_head_channels=self.num_head_channels,
+            #     use_new_attention_order=self.use_new_attention_order,
+            # ),
+            # self.res_block(
+            #     ch,
+            #     time_embed_dim,
+            #     self.dropout,
+            #     dims=self.dims,
+            #     use_scale_shift_norm=self.use_scale_shift_norm,
+            # ),
+        ])
+        _feature_size += ch  # 768
+
+        output_blocks = []
+        for i in range(self.num_res_blocks + 1):  # 2
+            ich = input_block_chans.pop()  # 256 -> 256
+            layers = [
+                self.res_block(
+                    ch + ich,  # 256+256 -> 256+256
+                    # ch,
+                    time_embed_dim,  # 256
+                    self.dropout,
+                    out_channels=int(self.model_channels),  # 256
+                    dims=self.dims,
+                    use_scale_shift_norm=self.use_scale_shift_norm,
+                )
+            ]
+            ch = int(self.model_channels)
+            output_blocks.append(self.embed_sequential(layers))
+            _feature_size += ch  # 1024 -> 1280
+
+        _features = self.out_channels  # 128
+        _kernels = (3,)*self.dims  # (3,3)
+        _paddings = (1,)*self.dims  # (1,1)
+        out_fn = self.sequential([
+            # self.norm(group_size=ch),
+            self.norm(),
+            self.silu,
+            self.zero_conv(_features, _kernels, padding=_paddings),
+        ])
+
+        # forward
+        hs = []
+        emb = time_embed(timestep_embedding(timesteps, self.model_channels))
+
+        # h = jnp.asarray(x, self.dtype)
+        h = x
+        for module in input_blocks:
+            h = module(h, emb, **kwargs)
+            hs.append(h)
+        h = middle_block(h, emb, **kwargs)
+        for module in output_blocks:
+            h = jnp.concatenate([h, hs.pop()], axis=-1)
+            h = module(h, emb, **kwargs)
+        # h = jnp.asarray(h, x.dtype)
+        h = out_fn(h)
+        # # B, C, H, W -> B, H, W, C
+        # h = jnp.transpose(h, (0, 2, 3, 1))
+        assert h.shape[1] == h.shape[2]
+
+        return h
+
+
+class TinyUNetModel(nn.Module):
+    ver: str
+    # parameters
+    image_size: int
+    in_channels: int
+    model_channels: int
+    out_channels: Sequence
+    num_res_blocks: int
+    attention_resolutions: Sequence
+    dropout: float = 0.
+    channel_mult: Sequence = (1, 2, 4, 8)
+    conv_resample: bool = True
+    dims: int = 2
+    num_classes: int = None
+    dtype: Any = jnp.float32
+    num_heads: int = 1
+    num_head_channels: int = -1
+    num_heads_upsample: int = -1
+    use_scale_shift_norm: bool = False
+    resblock_updown: bool = False
+    use_new_attention_order: bool = False
+    context: Sequence = None
+    # networks
+    silu: Callable = nn.silu
+    dense: nn.Module = nn.Dense
+    embed: nn.Module = nn.Embed
+    conv: nn.Module = nn.Conv
+    # zero_conv: nn.Module = partial(
+    #     nn.Conv,
+    #     kernel_init=jax.nn.initializers.zeros,
+    #     bias_init=jax.nn.initializers.zeros,
+    #     name="frozen")
+    zero_conv: nn.Module = nn.Conv
+    res_block: nn.Module = partial(ResBlock, small=True)
+    att_block: nn.Module = AttentionBlock
+    downsample: nn.Module = Downsample
+    upsample: nn.Module = Upsample
+    norm: nn.Module = partial(nn.GroupNorm, num_groups=32)
+    batchnorm: nn.Module = partial(nn.BatchNorm, momentum=0.9, epsilon=1e-5, use_bias=True, use_scale=True,
+                                   scale_init=jax.nn.initializers.ones,
+                                   bias_init=jax.nn.initializers.zeros)
+    embed_sequential: nn.Module = EmbedSequential
+    sequential: nn.Module = Sequential
+    drop: nn.Module = nn.Dropout
+    tiny_resblock: nn.Module = TinyResBlock
+
+    @nn.compact
+    def __call__(self, *args, **kwargs):
+        if self.ver == "v1.0":
+            return self._call_v1_0(*args, **kwargs)
+        elif self.ver == "v1.1":
+            return self._call_v1_1(*args, **kwargs)
+        elif self.ver == "v1.2":
+            return self._call_v1_2(*args, **kwargs)
+        elif self.ver == "v1.3":
+            return self._call_v1_3(*args, **kwargs)
+        else:
+            raise NotImplementedError
+
+    def _call_v1_0(self, x, t, y=None, **kwargs):
+        timesteps = t
+        # ---------------------------------------------------------------------
+        # time embedding
+        # ---------------------------------------------------------------------
+        time_embed_dim = self.model_channels//4  # 256
+        time_embed = self.sequential([
+            self.dense(time_embed_dim),
+            self.silu,
+            self.dense(time_embed_dim),
+        ])
+
+        ch = self.model_channels//2
+        _features = ch
+        _kernels = (3,)*self.dims  # (3,3)
+        _paddings = (1,)*self.dims  # (1,1)
+        input_blocks = [
+            self.sequential([
+                self.conv(_features, _kernels, padding=_paddings)
+            ])
+        ]
+
+        input_block_chans = [ch]
+        # embed_sequential
+        # for layer in self.layers:
+        #   x = layer(x, emb=emb, training=training, ctx=ctx)
+        middle_block = self.embed_sequential([
+            self.res_block(
+                ch,
+                time_embed_dim,
+                self.dropout,
+                dims=self.dims,
+                use_scale_shift_norm=self.use_scale_shift_norm,
+            ),
+        ])
+
+        output_blocks = []
+        ich = input_block_chans.pop()  # 256 -> 256
+        layers = [
+            self.res_block(
+                ch + ich,  # 256+256 -> 256+256
+                time_embed_dim,  # 256
+                self.dropout,
+                out_channels=int(self.model_channels),  # 256
+                dims=self.dims,
+                use_scale_shift_norm=self.use_scale_shift_norm,
+            )
+        ]
+        output_blocks.append(self.embed_sequential(layers))
+
+        _features = self.out_channels  # 128
+        _kernels = (3,)*self.dims  # (3,3)
+        _paddings = (1,)*self.dims  # (1,1)
+        out_fn = self.sequential([
+            # self.norm(group_size=ch),
+            self.norm(),
+            self.silu,
+            self.zero_conv(_features, _kernels, padding=_paddings),
+        ])
+
+        # forward
+        hs = []
+        emb = time_embed(timestep_embedding(timesteps, self.model_channels))
+
+        # h = jnp.asarray(x, self.dtype)
+        h = x
+        for module in input_blocks:
+            h = module(h, emb, **kwargs)
+            hs.append(h)
+        h = middle_block(h, emb, **kwargs)
+        for module in output_blocks:
+            h = jnp.concatenate([h, hs.pop()], axis=-1)
+            h = module(h, emb, **kwargs)
+        # h = jnp.asarray(h, x.dtype)
+        h = out_fn(h)
+        # # B, C, H, W -> B, H, W, C
+        # h = jnp.transpose(h, (0, 2, 3, 1))
+        # assert h.shape[1] == h.shape[2]
+
+        return h
+
+    def _call_v1_1(self, x, t, **kwargs):
+        t = timestep_embedding(t, self.model_channels)
+        t_dim = self.model_channels//4  # 32
+        t = self.dense(t_dim)(t)
+        t = self.silu(t)
+        t = self.dense(t_dim)(t)
+
+        ch = self.model_channels//2  # 64
+        x = self.conv(
+            features=ch,
+            kernel_size=(3, 3),
+            padding=(1, 1)
+        )(x)
+
+        ch = self.model_channels//2  # 64
+        residual = x
+        _t = self.silu(t)
+        _t = self.dense(ch)(_t)
+        _t = _t.reshape(-1, 1, 1, ch)
+        x = x+_t
+        x = self.norm()(x)
+        x = self.silu(x)
+        x = self.drop(
+            self.dropout,
+            deterministic=not kwargs["training"]
+        )(x)
+        x = self.conv(
+            features=ch,
+            kernel_size=(3, 3),
+            padding=(1, 1)
+        )(x)
+        x = x + residual
+
+        x = jnp.concatenate([x, residual], axis=-1)
+
+        ch = self.model_channels
+        residual = x
+        _t = self.silu(t)
+        _t = self.dense(ch)(_t)
+        _t = _t.reshape(-1, 1, 1, ch)
+        x = x+_t
+        x = self.norm()(x)
+        x = self.silu(x)
+        x = self.drop(
+            self.dropout,
+            deterministic=not kwargs["training"]
+        )(x)
+        x = self.conv(
+            features=ch,
+            kernel_size=(3, 3),
+            padding=(1, 1)
+        )(x)
+        x = x+residual
+
+        x = self.norm()(x)
+        x = self.silu(x)
+        x = self.conv(
+            features=ch,
+            kernel_size=(3, 3),
+            padding=(1, 1)
+        )(x)
+
+        return x
+
+    def _call_v1_2(self, x, t, **kwargs):
+        t = timestep_embedding(t, self.model_channels)
+        # t = jnp.tile(t.reshape(-1, 1), [1, self.model_channels])
+        t_dim = self.model_channels//4  # 32
+        t = self.dense(t_dim)(t)
+        t = self.silu(t)
+        t = self.dense(t_dim)(t)
+
+        ch = self.model_channels//2  # 64
+        x = self.conv(
+            features=ch,
+            kernel_size=(3, 3),
+            padding=(1, 1)
+        )(x)
+        residual = x
+
+        ch = self.model_channels//2  # 64
+        x = self.tiny_resblock(
+            ch, self.dropout
+        )(x, t, **kwargs)
+
+        x = jnp.concatenate([x, residual], axis=-1)
+
+        ch = self.model_channels
+        x = self.tiny_resblock(
+            ch, self.dropout
+        )(x, t, **kwargs)
+
+        x = self.norm()(x)
+        x = self.silu(x)
+        x = self.conv(
+            features=ch,
+            kernel_size=(3, 3),
+            padding=(1, 1)
+        )(x)
+        return x
+
+    def _call_v1_3(self, x, t, **kwargs):
+        t = timestep_embedding(t, self.model_channels)
+        t_dim = self.model_channels//2  # 64
+        t = self.dense(t_dim)(t)
+        t = self.silu(t)
+
+        ch = self.model_channels//2  # 64
+        x = self.conv(
+            features=ch,
+            kernel_size=(3, 3),
+            padding=(1, 1)
+        )(x)
+        residual = x
+
+        ch = self.model_channels//2  # 64
+        x = self.tiny_resblock(
+            ch, self.dropout, reduced=True,
+            use_batchnorm=True
+        )(x, t, **kwargs)
+
+        x = jnp.concatenate([x, residual], axis=-1)
+
+        ch = self.model_channels
+        x = self.tiny_resblock(
+            ch, self.dropout, reduced=True,
+            use_batchnorm=True
+        )(x, t, **kwargs)
+
+        x = self.batchnorm(
+            use_running_average=not kwargs["training"]
+        )(x)
+        x = self.silu(x)
+        x = self.conv(
+            features=ch,
+            kernel_size=(3, 3),
+            padding=(1, 1)
+        )(x)
+        return x

@@ -44,6 +44,7 @@ from functools import partial
 
 from utils import batch_mul, batch_add
 
+
 def build_featureloaders(config, rng=None):
     def load_arrays(dir, div, prop, mode_idx, i, length=None):
         path = f"{dir}/{div}_{prop}_M{mode_idx}S{i}.npy"
@@ -658,21 +659,22 @@ class TrainState(train_state.TrainState):
     n_T: jnp.int32
 
     def forward(self, x0, x1, training=True, **kwargs):
-        # rng 
+        # rng
         assert 'rng' in kwargs.keys()
         rng = kwargs["rng"]
-        _ts = jax.random.uniform(rng, (x0.shape[0],), minval=self.eps, maxval=1.)  # (B,)
-        x_t = batch_mul((1 - _ts), x0) + batch_mul(_ts, x1) # time 0 --> x0, time 1 --> x1
-        
+        _ts = jax.random.uniform(
+            rng, (x0.shape[0],), minval=self.eps, maxval=1.)  # (B,)
+        # time 0 --> x0, time 1 --> x1
+        x_t = batch_mul((1 - _ts), x0) + batch_mul(_ts, x1)
+
         kwargs["t"] = _ts
         kwargs["training"] = training
         return x_t, kwargs
 
-
     def sample(self, apply, x0, ctx, cfl, eps, n_T):
         shape = x0.shape
         batch_size = shape[0]
-        x_n = x0 # (B, d)
+        x_n = x0  # (B, d)
 
         timesteps = jnp.linspace(eps, 1., n_T)
         timesteps = jnp.concatenate([jnp.array([0]), timesteps], axis=0)
@@ -1290,7 +1292,7 @@ def launch(config, print_fn):
         def loss_fn(params):
             params, cparams = params
             logits_t, kwargs = state.forward(
-                logitsA, logitsB, training=True, rng=state.rng) # linear interpolation of logitsA --> logitsB
+                logitsA, logitsB, training=True, rng=state.rng)  # linear interpolation of logitsA --> logitsB
             params_dict = dict(params=params)
             rngs_dict = dict(dropout=state.rng)
             mutable = []
@@ -1299,7 +1301,7 @@ def launch(config, print_fn):
                 mutable.append("batch_stats")
             epsilon, new_model_state = state.apply_fn(
                 params_dict, logits_t, ctx=contexts, cfl=conflicts,
-                mutable=mutable, rngs=rngs_dict, **kwargs) # epsilon: expected logitsB - logitsA
+                mutable=mutable, rngs=rngs_dict, **kwargs)  # epsilon: expected logitsB - logitsA
             # logits
             diff = logitsB - logitsA
             unnorm_logitsA = _logitsA
@@ -1319,7 +1321,7 @@ def launch(config, print_fn):
                 mask = jnp.argmax(p_A, axis=-1) == jnp.argmax(p_B, axis=-1)
                 mask = expand_to_broadcast(mask, diff, axis=1)
             loss = mse_loss(epsilon, diff, lamb=lamb, mask=mask)
-            x0eps = logits_t# - _sigma_t*epsilon
+            x0eps = logits_t  # - _sigma_t*epsilon
             if config.supple:
                 unnorm_x0eps = unnormalize(x0eps[..., :x_dim//2])
             else:

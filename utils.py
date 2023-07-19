@@ -5,6 +5,7 @@ import os
 import wandb
 import jax
 from flax.training import common_utils
+from collections import OrderedDict
 
 debug = os.environ.get("DEBUG")
 if isinstance(debug, str):
@@ -94,6 +95,10 @@ features_smooth_std = jnp.array([0.94868135, 0.6022823, 0.94064116, 0.91724193, 
                                  0.95391244, 0.68137455, 1.6059061, 0.6699924, 0.6911579, 0.5560083,
                                  1.1337692, 0.97876066, 0.87733203, 0.9236515, 0.6251136, 0.95945084,
                                  0.7923356, 1.0319482, 0.5455782, 0.92253876])
+features_distill_mean = jnp.array([0.1836805, 0.89949, 0.00020471588, 0.9135661, 0.6716172, -0.011881779, 0.06586564, 0.720666, 0.52559346, -0.01614934, 0.6009757, 0.06779358, 0.023763863, 0.6046596, 0.2862989, -0.0056467117, -0.0033583802, 0.1625143, 0.47007152, 0.23485251, 0.15238921, 0.36120453, 0.5677881, 0.2686528, 0.8904303, -0.012129007, 0.5339156, -0.008703122, 0.16506232, 0.07140288, 0.07729245, 0.6795017, 0.7726102, 0.114162765, 0.18428952, 0.13435091, 0.7933065, 0.3730125, 0.0025451307, 0.324043, 0.08836073, 0.09291136, 0.07099205, 0.57956624, 0.5370984, 0.7010044, 0.6071492, -0.009859117, 0.45578328, 0.7058281, 1.1387206, 0.116564155, 0.06189805, 0.2482125, -0.00550368, -0.0153475525, 0.7932736, 0.58778405, -0.015639393, 0.594829, -0.009078252, 0.4890053, 0.3147516,
+                                  0.7906901, 0.1460719, 0.31479913, 0.0170031, 0.015329893, 0.67046535, 0.5882265, 0.69799167, 0.06377407, 0.072437555, 0.6209511, 0.18408017, 0.18994342, 0.26823658, 0.12628563, 0.51579326, -0.015487096, 0.61900765, 0.1419141, 0.04696526, 0.2949275, 0.027260503, 0.43429366, -0.019967766, 0.3345459, 0.61587566, 0.15839125, 0.020077612, 0.22092064, 0.462596, 0.49455753, 0.19629338, 0.22702895, -0.018575273, 0.254619, 0.48662353, 0.28201506, 0.12915748, 0.25314116, -0.016497316, 0.753344, 0.23228335, 1.0461062, -0.015335688, 0.14268038, 0.26577458, 0.057914782, 0.100101605, 0.74785894, 0.02988643, 0.44161066, 0.4484521, 0.043168165, -0.010376733, 0.25071913, 0.059633907, 0.43442377, 0.4831384, 0.4151755, 0.23733333, 0.5372636, 0.63729113, 0.5389537, -0.0039897547, -0.009411941])
+features_distill_std = jnp.array([0.4004328, 0.49071223, 0.042120293, 1.0239208, 0.46692687, 0.022985786, 0.095656656, 0.52912515, 0.59449756, 0.02185829, 0.8010316, 0.13417535, 0.07724402, 0.5123894, 0.49359438, 0.039027683, 0.034420285, 0.24433266, 0.52041197, 0.48277548, 0.20756, 0.42718846, 0.7666676, 0.32105213, 0.7412302, 0.029002156, 0.6678274, 0.029829795, 0.26547468, 0.17151353, 0.11765411, 0.65457326, 0.8849071, 0.17667672, 0.25866964, 0.1871659, 0.5769421, 0.5394248, 0.038498443, 0.25067022, 0.20422041, 0.116865, 0.16854763, 0.73978996, 0.46205533, 0.6621149, 0.67449135, 0.015844963, 0.61470073, 0.493543, 1.0338677, 0.18010461, 0.08314824, 0.47485057, 0.046495877, 0.02475971, 0.61741203, 0.66893625, 0.018331738, 0.64631605, 0.041797202, 0.6361974, 0.40673947,
+                                 0.9126539, 0.13849959, 0.40177453, 0.05197387, 0.06944028, 0.8500696, 0.73495716, 0.83224994, 0.11189154, 0.11517098, 0.6369473, 0.34643322, 0.26924357, 0.43130895, 0.2425186, 0.6087092, 0.026972422, 0.65981275, 0.2343494, 0.115255795, 0.5992024, 0.10400451, 0.48756865, 0.020745942, 0.35583842, 0.69944865, 0.3749256, 0.062974334, 0.31633726, 0.4243998, 0.6242687, 0.41032368, 0.2815571, 0.019547947, 0.5186795, 0.5660364, 0.43746075, 0.19853331, 0.31125706, 0.019962108, 0.5869517, 0.39363697, 0.8071371, 0.018567147, 0.1782012, 0.5210108, 0.07139344, 0.22205092, 0.66306466, 0.07236691, 0.55074376, 0.5840531, 0.1017845, 0.023990886, 0.5124783, 0.1640616, 0.54729265, 0.43871817, 0.6514353, 0.3646758, 0.66479576, 0.55979997, 0.642272, 0.042918645, 0.023177313])
 logits_1mixup10_mean = jnp.array([])
 logits_1mixup10_std = jnp.array([])
 features_1mixup10_mean = jnp.array([])
@@ -216,7 +221,7 @@ def unnormalize(x):
     # return x+pixel_mean
 
 
-def model_list(data_name, model_style, shared_head=False, bezier=False):
+def model_list(data_name, model_style, shared_head=False, tag=""):
     if data_name == "CIFAR100_x32" and model_style == "BN-ReLU":
         if shared_head:
             return [
@@ -232,17 +237,49 @@ def model_list(data_name, model_style, shared_head=False, bezier=False):
             return [
                 "./checkpoints/bn100_sd2",
                 "./checkpoints/bn100_sd3",
-                "./checkpoints/bn100_sd5",
-                "./checkpoints/bn100_sd7",
-                "./checkpoints/bn100_sd11",
-                "./checkpoints/bn100_sd13",
-                "./checkpoints/bn100_sd17",
+                # "./checkpoints/bn100_sd5",
+                # "./checkpoints/bn100_sd7",
+                # "./checkpoints/bn100_sd11",
+                # "./checkpoints/bn100_sd13",
+                # "./checkpoints/bn100_sd17",
             ]
     elif data_name == "CIFAR10_x32" and model_style == "FRN-Swish":
-        if bezier:
+        if tag == "bezier":
             return [
                 "./checkpoints/frn_sd2_be",
-                "./checkpoints/frn_sd23_bezier"
+                "./checkpoints/frn_sd25_bezier"
+            ]
+        elif tag == "distill":
+            return [
+                "./checkpoints/frn_sd23_distill_mean2",
+                "./checkpoints/frn_sd2_be",
+                "./checkpoints/frn_sd3_be"
+            ]
+        elif tag == "distref":
+            return [
+                "./checkpoints/frn_sd2_be",
+                "./checkpoints/frn_sd2_be",
+                "./checkpoints/frn_sd3_be"
+            ]
+        elif tag == "AtoB":
+            return [
+                "./checkpoints/frn_sd2_be",
+                "./checkpoints/frn_sd3_be"
+            ]
+        elif tag == "AtoshB":
+            return [
+                "./checkpoints/frn_sd2_be",
+                "./checkpoints/frn_sd23_shared3"
+            ]
+        elif tag == "distA":
+            return [
+                "./checkpoints/frn_sd23_distill_mean2",
+                "./checkpoints/frn_sd2_be"
+            ]
+        elif tag == "distB":
+            return [
+                "./checkpoints/frn_sd23_distill_mean2",
+                "./checkpoints/frn_sd3_be"
             ]
         return [
             "./checkpoints/frn_sd2",
@@ -265,29 +302,61 @@ def model_list(data_name, model_style, shared_head=False, bezier=False):
         raise Exception("Invalid data_name and model_style.")
 
 
-logit_dir_list = ["features", "features_fixed",
-                  "features_1mixup10", "features_1mixup10_fixed",
-                  "features_1mixupplus10",
-                  "features_smooth",
-                  "features100",
-                  "features100_ods", "features100_noise",
-                  "features100_2ods",
-                  "features100_fixed", "features100_shared",
-                  "features100_1mixup10", "features100_1mixupplus10",
-                  "features100_1mixupext10", "features100_1mixupplusext10",
-                  "features100_0p4mixup10_fixed", "features100_0p4mixup10_rand",
-                  "features100_0p4mixup10", "features100_0p4mixup10_valid"]
-feature_dir_list = ["features_last", "features_last_fixed",
-                    "features_last_1mixup10", "features_last_1mixup10_fixed",
-                    "features_last_1mixupplus10",
-                    "features_last_smooth",
-                    "features100_last",
-                    "features100_last_1mixup10", "features100_last_0p4mixup10",
-                    "features100_last_0p4mixup10_fixed", "features100_last_0p4mixup10_rand",
-                    "features100_last_fixed", "features100_last_shared"]
-feature2_dir_list = ["features_last2",
-                     "features100_last2", "features100_last2_shared"]
-feature3_dir_list = ["features_last3_bezier"]
+logit_dir_list = [
+    "features", "features_fixed",
+    "features_1mixup10", "features_1mixup10_fixed",
+    "features_1mixupplus10",
+    "features_smooth",
+    "features_distill",
+    "features_distill_mean",
+    "features_distill_mean20",
+    "features_distill_mean5e-4",
+    "features_distill_mean2",
+    "features_distref",
+    "features100",
+    "features100_ods", "features100_noise",
+    "features100_2ods",
+    "features100_fixed", "features100_shared",
+    "features100_1mixup10", "features100_1mixupplus10",
+    "features100_1mixupext10", "features100_1mixupplusext10",
+    "features100_0p4mixup10_fixed", "features100_0p4mixup10_rand",
+    "features100_0p4mixup10", "features100_0p4mixup10_valid",
+    "features_distA", "features_distB",
+    "features_AtoB", "features_AtoshB"
+]
+feature_dir_list = [
+    "features_last", "features_last_fixed",
+    "features_last_1mixup10", "features_last_1mixup10_fixed",
+    "features_last_1mixupplus10",
+    "features_last_smooth",
+    "features_last_distill",
+    "features_last_distill_mean5e-4",
+    "features_last_distill_mean2",
+    "features_last_distref",
+    "features100_last",
+    "features100_last_1mixup10", "features100_last_0p4mixup10",
+    "features100_last_0p4mixup10_fixed", "features100_last_0p4mixup10_rand",
+    "features100_last_fixed", "features100_last_shared",
+    "features_last_distA", "features_last_distB",
+    "features_last_bezier25"
+]
+feature2_dir_list = [
+    "features_last2",
+    "features100_last2",
+    "features100_last2_shared"
+]
+feature3_dir_list = [
+    "features_last3_bezier",
+    "features_last3_bezier_0p4mixup5",
+    "features_last3_bezier_0p4mixup10",
+    "features_last3_bezier25",
+    "features_last3_bezier27",
+    "features_last3_distref",
+    "features100_last3",
+    "features_last3_distA",
+    "features_last3_distill_mean2",
+    "features_last3_AtoB", "features_last3_AtoshB"
+]
 
 
 def _get_meanstd(features_dir):
@@ -298,7 +367,18 @@ def _get_meanstd(features_dir):
             "features_fixed",
             "features_1mixup10",
             "features_1mixup10_fixed",
-            "features_1mixupplus10"]:
+            "features_1mixupplus10",
+            "features_distill",
+            "features_distill_mean",
+            "features_distill_mean20",
+            "features_distill_mean5e-4",
+            "features_distill_mean2",
+            "features_distref",
+            "features_distA",
+            "features_distB",
+            "features_AtoB",
+            "features_AtoshB"
+    ]:
         mean = logits_fixed_mean
         std = logits_fixed_std
     elif features_dir in ["features_smooth"]:
@@ -314,10 +394,11 @@ def _get_meanstd(features_dir):
         mean = features_mean[None, None, ...]
         std = features_std[None, None, ...]
     elif features_dir in [
-            "features_last_fixed",
-            "features_last_1mixup10",
-            "features_last_1mixup10_fixed",
-            "features_last_1mixupplus10"]:
+        "features_last_fixed",
+        "features_last_1mixup10",
+        "features_last_1mixup10_fixed",
+        "features_last_1mixupplus10",
+    ]:
         mean = features_fixed_mean
         std = features_fixed_std
     elif features_dir in [
@@ -334,7 +415,8 @@ def _get_meanstd(features_dir):
         "features100_0p4mixup10_rand",
         "features100_1mixupplus10",
         "features100_1mixupext10",
-            "features100_1mixupplusext10"]:
+        "features100_1mixupplusext10"
+    ]:
         mean = logits100_mean
         std = logits100_std
     elif features_dir in [
@@ -344,15 +426,39 @@ def _get_meanstd(features_dir):
         "features100_last_0p4mixup10",
         "features100_last_0p4mixup10_fixed",
         "features100_last_0p4mixup10_rand",
-            "features100_last_1mixup10"]:
+        "features100_last_1mixup10"
+    ]:
         mean = features100_mean
         std = features100_std
     elif features_dir in ["features100_last2", "features100_last2_shared"]:
         mean = features100_mean[None, None, ...]
         std = features100_std[None, None, ...]
-    elif features_dir in ["features_last3_bezier"]:
+    elif features_dir in [
+        "features_last3_bezier",
+        "features_last3_bezier_0p4mixup10",
+        "features_last3_bezier_0p4mixup5",
+        "features_last3_bezier25",
+        "features_last3_bezier27",
+        "features_last3_distref",
+        "features100_last3",
+        "features_last3_distA",
+        "features_last3_distill_mean2",
+        "features_last3_AtoB",
+        "features_last3_AtoshB"
+    ]:
         mean = 0
         std = 1
+    elif features_dir in [
+        "features_last_distill",
+        "features_last_distill_mean5e-4",
+        "features_last_distill_mean2",
+        "features_last_distref",
+        "features_last_distA",
+        "features_last_distB",
+        "features_last_bezier25"
+    ]:
+        mean = features_distill_mean
+        std = features_distill_std
     else:
         raise Exception("Calculate corresponding statistics")
     return mean, std
@@ -648,3 +754,45 @@ def batch_add(a, b):
 
 def batch_mul(a, b):
     return jax.vmap(lambda a, b: a * b)(a, b)
+
+
+def get_probs(logits, ignore=False):
+    if ignore:
+        return logits
+    if len(logits) == 0:
+        return logits
+    probs = jnp.exp(jax.nn.log_softmax(logits, axis=-1))
+    return probs
+
+
+def get_logprobs(logits, ignore=False):
+    if ignore:
+        return logits
+    if len(logits) == 0:
+        return logits
+    logprobs = jax.nn.log_softmax(logits, axis=-1)
+    return logprobs
+
+
+def get_ens_logits(logits, logitmean=None, mean_axis=0):
+    if logitmean is None:
+        logitmean = jnp.mean(logits[mean_axis], axis=-1)[:, None]
+    ens_prob = 0
+    for l in logits:
+        ens_prob += jax.nn.softmax(l, axis=-1)
+    ens_prob /= len(logits)
+    ens_logprob = jnp.log(ens_prob)
+    ens_logprob_mean = jnp.mean(ens_logprob, axis=-1)[:, None]
+    ens_logits = ens_logprob-ens_logprob_mean+logitmean
+    return ens_logits
+
+
+def get_avg_logits(logits):
+    return sum(logits)/len(logits)
+
+
+def get_single_batch(batch, i=0):
+    new_batch = OrderedDict()
+    for k, v in batch.items():
+        new_batch[k] = v[i]
+    return new_batch

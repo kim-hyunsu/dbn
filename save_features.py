@@ -255,10 +255,32 @@ if __name__ == "__main__":
     model_style = settings.model_style
     shared_head = settings.shared_head
     sgd_state = getattr(settings, "sgd_state", False)
-    model_dir_list = model_list(data_name, model_style, shared_head, sgd_state)
+    bezier = "bezier" in dir
+    distill = "distill" in dir
+    distref = "distref" in dir
+    distA = "distA" in dir
+    distB = "distB" in dir
+    AtoB = "AtoB" in dir
+    AtoshB = "AtoshB" in dir
+    tag = ""
+    if bezier:
+        tag = "bezier"
+    elif distill:
+        tag = "distill"
+    elif distref:
+        tag = "distref"
+    elif distA:
+        tag = "distA"
+    elif distB:
+        tag = "distB"
+    elif AtoB:
+        tag = "AtoB"
+    elif AtoshB:
+        tag = "AtoshB"
+    model_dir_list = model_list(
+        data_name, model_style, shared_head, tag)
     config, ckpt, rng = get_ckpt_temp(
         model_dir_list[0], shared_head, sgd_state)
-    state_for_rng = sgd_trainstate.TrainState2TrainStateRNG(ckpt["model"])
     config.optim_bs = 512
     n_samples_each_mode = 30
     n_modes = len(model_dir_list)
@@ -371,15 +393,24 @@ if __name__ == "__main__":
 
     shape = None
     data_rng, rng = jax.random.split(rng)
-    temp = ckpt["model"]
+    # temp = ckpt["model"]
     for mode_idx in range(n_modes):
-        for i in tqdm(range(n_samples_each_mode)):
 
-            model_dir = model_dir_list[mode_idx]
-            if "bezier" in model_dir:
-                ckpt["model"] = state_for_rng
-            else:
-                ckpt["model"] = temp
+        model_dir = model_dir_list[mode_idx]
+
+        # if mode_idx != 0:
+        _, ckpt, _ = get_ckpt_temp(
+            model_dir, shared_head, sgd_state)
+
+        if "bezier" in model_dir:
+            # change here if bezier seed is changed
+            assert "sd25" in model_dir and "bezier25" in dir
+            ckpt["model"] = sgd_trainstate.TrainState2TrainStateRNG(
+                ckpt["model"])
+        # else:
+        #     ckpt["model"] = temp
+
+        for i in tqdm(range(n_samples_each_mode)):
             classifier_state, _ = load_classifer_state(
                 model_dir, i+1, ckpt, sgd_state)
             if classifier_state is None:

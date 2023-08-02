@@ -1303,7 +1303,12 @@ def launch(config, print_fn):
     def load_classifier(variables_cls, ckpt_dir, sgd_state=False):
         if "last3" in config.features_dir:
             assert config.features_dir in feature3_dir_list
-            variables_cls = variables_cls.unfreeze()
+            # TODO (2023/07/26)
+            """
+              The type of variables_cls is 'dict', and cannot be unfreezed.
+              Maybe the type is changed because of flax version update.
+            """
+            # variables_cls = variables_cls.unfreeze()
             ckpt = checkpoints.restore_checkpoint(
                 ckpt_dir=ckpt_dir,
                 target=None
@@ -1320,10 +1325,10 @@ def launch(config, print_fn):
                     key = f"{arc[0]}_{str(n)}"
                 p = ckpt["model"]["params"][key]
                 variables_cls["params"][k] = p
-            variables_cls = freeze(variables_cls)
+            # variables_cls = freeze(variables_cls)
             del ckpt
         else:
-            variables_cls = variables_cls.unfreeze()
+            # variables_cls = variables_cls.unfreeze()
             ckpt = checkpoints.restore_checkpoint(
                 ckpt_dir=os.path.join(
                     ckpt_dir, "sghmc") if not sgd_state else ckpt_dir,
@@ -1333,7 +1338,7 @@ def launch(config, print_fn):
             if params is None:
                 params = ckpt["model"]["params"]["head"]
             variables_cls["params"]["Dense_0"] = params
-            variables_cls = freeze(variables_cls)
+            # variables_cls = freeze(variables_cls)
             del ckpt
 
         return variables_cls

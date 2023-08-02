@@ -3,7 +3,7 @@ from email.headerregistry import Group
 from functools import partial
 from site import USER_BASE
 from telnetlib import SE
-from typing import Any, Callable, Sequence, Dict
+from typing import Any, Callable, Sequence, Dict, Tuple
 import flax.linen as nn
 import jax.numpy as jnp
 import jax
@@ -306,6 +306,28 @@ class TinyResBlock(nn.Module):
         )(x)
         x = x+residual
         return x
+
+
+
+class DepthwiseSeparableConv(nn.Module):
+    """
+    Depthwise separable convolution.
+    """
+    features: int
+    kernel_size: Tuple[int]
+    padding: Tuple[int]
+    kernels_per_layer: int = 1
+
+    @nn.compact
+    def __call__(self, x):
+        B, H, W, C = x.shape
+        features = self.features
+        kernel_size = self.kernel_size
+        padding = self.padding
+        x = nn.Conv(features=C * self.kernels_per_layer, kernel_size=kernel_size, padding=padding, feature_group_count=C)(x) # depthwise
+        x = nn.Conv(features=features, kernel_size=(1, 1), padding='SAME')(x) # pointwise
+        return x
+
 
 
 class QKVAttentionLegacy(nn.Module):
@@ -1003,6 +1025,10 @@ class TinyUNetModel(nn.Module):
             return self._call_v1_2(*args, **kwargs)
         elif self.ver == "v1.3":
             return self._call_v1_3(*args, **kwargs)
+        elif self.ver == "v1.4":
+            return self._call_v1_4(*args, **kwargs) # Depthwise separable convolution applied, 1 layer.
+        elif self.ver == "v1.5":
+            return self._call_v1_5(*args, **kwargs) # Depthwise separable convolution applied, 2 layers.
         else:
             raise NotImplementedError
 
@@ -1221,6 +1247,114 @@ class TinyUNetModel(nn.Module):
         )(x)
         x = self.silu(x)
         x = self.conv(
+            features=ch,
+            kernel_size=(3, 3),
+            padding=(1, 1)
+        )(x)
+        return x
+
+    def _call_v1_4(self, x, t, **kwargs):
+        conv = DepthwiseSeparableConv
+        # time embedding
+        t = timestep_embedding(t, self.model_channels)
+        # t = jnp.tile(t.reshape(-1, 1), [1, self.model_channels])
+        t_dim = self.model_channels//4  # 32
+        t = self.dense(t_dim)(t)
+        t = self.silu(t)
+        t = self.dense(t_dim)(t)
+
+        # Conv
+        ch = self.model_channels//2  # 64
+        x = conv(
+            features=ch,
+            kernel_size=(3, 3),
+            padding=(1, 1)
+        )(x)
+        residual = x
+
+        # Downsample
+        ch = self.model_channels//2  # 64
+        x = self.tiny_resblock(
+            ch, self.dropout, conv=conv
+        )(x, t, **kwargs)
+
+        x = jnp.concatenate([x, residual], axis=-1)
+
+        # Upsample
+        ch = self.model_channels
+        x = self.tiny_resblock(
+            ch, self.dropout, conv=conv
+        )(x, t, **kwargs)
+
+        x = self.norm()(x)
+        x = self.silu(x)
+        x = conv(
+            features=ch,
+            kernel_size=(3, 3),
+            padding=(1, 1)
+        )(x)
+        return x
+
+    def _call_v1_5(self, x, t, **kwargs):
+        conv = DepthwiseSeparableConv
+        # time embedding
+        t = timestep_embedding(t, self.model_channels)
+        # t = jnp.tile(t.reshape(-1, 1), [1, self.model_channels])
+        t_dim = self.model_channels//4  # 32
+        t = self.dense(t_dim)(t)
+        t = self.silu(t)
+        t = self.dense(t_dim)(t)
+
+        # Conv
+        ch = self.model_channels//2  # 64
+        x = conv(
+            features=ch,
+            kernel_size=(3, 3),
+            padding=(1, 1)
+        )(x)
+        residual = x
+
+        # Downsample
+        # ch = self.model_channels // 4  # 32
+        ch = x.shape[-1] # 64
+        x = self.tiny_resblock(
+            ch, self.dropout, conv=conv
+        )(x, t, **kwargs)
+
+        ch = self.model_channels // 4  # 32
+        x = conv(
+            features=ch,
+            kernel_size=(3, 3),
+            padding=(1, 1)
+        )(x)
+        residual2 = x
+
+        # Downsample
+        # ch = self.model_channels // 4  # 64
+        ch = x.shape[-1]
+        x = self.tiny_resblock(
+            ch, self.dropout, conv=conv
+        )(x, t, **kwargs)
+
+        # Upsample
+        x = jnp.concatenate([x, residual2], axis=-1)
+        # ch = self.model_channels // 2 # 64
+        ch = x.shape[-1]
+        x = self.tiny_resblock(
+            ch, self.dropout, conv=conv
+        )(x, t, **kwargs)
+
+        # Upsample
+        x = jnp.concatenate([x, residual], axis=-1)
+        # ch = self.model_channels # 64
+        ch = x.shape[-1]
+        x = self.tiny_resblock(
+            ch, self.dropout, conv=conv
+        )(x, t, **kwargs)
+
+        x = self.norm()(x)
+        x = self.silu(x)
+        x = conv(
             features=ch,
             kernel_size=(3, 3),
             padding=(1, 1)

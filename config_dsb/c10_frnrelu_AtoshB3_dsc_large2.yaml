@@ -11,7 +11,7 @@ beta: 0.05
 beta2: 0.0005
 droprate: 0.1
 ema_decay: 0.99995
-version: v1.4
+version: v1.6
 T: 10
 stos: True
 features_dir: features_last3_AtoshB

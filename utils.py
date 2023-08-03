@@ -271,6 +271,14 @@ def model_list(data_name, model_style, shared_head=False, tag=""):
                 "./checkpoints/frn_sd2_be",
                 "./checkpoints/frn_sd23_shared3"
             ]
+        elif tag == "AtoshABC":
+            return [
+                "./checkpoints/frn_sd2_be",
+                "./checkpoints/frn_sd23_shared3",
+                "./checkpoints/frn_sd25_shared3",
+                "./checkpoints/frn_sd27_shared3",
+                "./checkpoints/frn_sd29_shared3"
+            ]
         elif tag == "distA":
             return [
                 "./checkpoints/frn_sd23_distill_mean2",
@@ -322,7 +330,8 @@ logit_dir_list = [
     "features100_0p4mixup10_fixed", "features100_0p4mixup10_rand",
     "features100_0p4mixup10", "features100_0p4mixup10_valid",
     "features_distA", "features_distB",
-    "features_AtoB", "features_AtoshB"
+    "features_AtoB", "features_AtoshB",
+    "features_AtoshABC"
 ]
 feature_dir_list = [
     "features_last", "features_last_fixed",
@@ -355,7 +364,8 @@ feature3_dir_list = [
     "features100_last3",
     "features_last3_distA",
     "features_last3_distill_mean2",
-    "features_last3_AtoB", "features_last3_AtoshB"
+    "features_last3_AtoB", "features_last3_AtoshB",
+    "features_last3_AtoshABC"
 ]
 
 
@@ -444,7 +454,9 @@ def _get_meanstd(features_dir):
         "features_last3_distA",
         "features_last3_distill_mean2",
         "features_last3_AtoB",
-        "features_last3_AtoshB"
+        "features_last3_AtoshB",
+        "features_last3_AtoshABC",
+        "features_AtoshABC"
     ]:
         mean = 0
         std = 1
@@ -775,6 +787,7 @@ def get_logprobs(logits, ignore=False):
 
 
 def get_ens_logits(logits, logitmean=None, mean_axis=0):
+    # TODO: better way
     if logitmean is None:
         logitmean = jnp.mean(logits[mean_axis], axis=-1)[:, None]
     ens_prob = 0

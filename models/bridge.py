@@ -867,7 +867,8 @@ class Decoder(nn.Module):
     def __call__(self, x, **kwargs):
         residual = x
         x = self.fc(self.features)(x)
-        x = self.relu(x+residual)
+        # x = self.relu(x+residual)
+        x = self.relu(x)
         x = self.fc(self.features)(x)
         B = x.shape[0]
         x = x.reshape(B, 1, 1, -1)
@@ -925,22 +926,6 @@ class LatentFeatureUnet(nn.Module):
     def setup(self, **kwargs):
         self.encoder = Encoder(self.features)
         self.decoder = Decoder(self.features)
-        # self.betas = kwargs["betas"]
-        # self.n_T = kwargs["n_T"]
-        # self.alpha_t = kwargs["alpha_t"]
-        # self.oneover_sqrta = kwargs["oneover_sqrta"]
-        # self.sqrt_beta_t = kwargs["sqrt_beta_t"]
-        # self.alphabar_t = kwargs["alphabar_t"]
-        # self.sqrtab = kwargs["sqrtab"]
-        # self.sqrtmab = kwargs["sqrtmab"]
-        # self.mab_over_sqrtmab = kwargs["mab_over_sqrtmab"]
-        # self.sigma_weight_t = kwargs["sigma_weight_t"]
-        # self.sigma_t = kwargs["sigma_t"]
-        # self.sigmabar_t = kwargs["sigmabar_t"]
-        # self.bigsigma_t = kwargs["bigsigma_t"]
-        # self.alpos_t = kwargs["alpos_t"]
-        # self.alpos_weight_t = kwargs["alpos_weight_t"]
-        # self.sigma_t_square = kwargs["sigma_t_square"]
 
     def __call__(self, rng, x0, x1, **kwargs):
         z0 = self.encode(x0)

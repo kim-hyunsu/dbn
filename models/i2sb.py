@@ -1,14 +1,13 @@
-from ast import Call
-from email.headerregistry import Group
 from functools import partial
-from site import USER_BASE
-from telnetlib import SE
-from typing import Any, Callable, Sequence, Dict
+from typing import Any, Callable, Sequence, Dict, Tuple
 import flax.linen as nn
 import jax.numpy as jnp
 import jax
 import math
 import numpy as np
+
+from utils import expand_to_broadcast, jprint
+from .bridge import Decoder as TinyDecoder
 
 # revised from https://github.com/NVlabs/I2SB
 
@@ -181,12 +180,12 @@ class ResBlock(EmbedModule, TrainModule):
         _features = out_channels
         _kernels = (3,)*self.dims
         _paddings = (1,)*self.dims
-        in_layers = nn.Sequential([
+        in_layers = [
             # self.norm(group_size=self.channels),
             self.norm(),
             self.silu,
             self.conv(_features, _kernels, padding=_paddings),
-        ])
+        ]
 
         updown = self.up or self.down
 
@@ -233,11 +232,13 @@ class ResBlock(EmbedModule, TrainModule):
         if not self.small:
             if updown:
                 in_rest, in_conv = in_layers[:-1], in_layers[-1]
+                in_rest = nn.Sequential(in_rest)
                 h = in_rest(x)
                 h = h_upd(h)
                 x = x_upd(x)
                 h = in_conv(h)
             else:
+                in_layers = nn.Sequential(in_layers)
                 h = in_layers(x)
         else:
             h = x
@@ -1226,3 +1227,293 @@ class TinyUNetModel(nn.Module):
             padding=(1, 1)
         )(x)
         return x
+
+
+class Decoder(nn.Module):
+    # parameters
+    image_size: int
+    in_channels: int
+    model_channels: int
+    out_channels: Sequence
+    num_res_blocks: int
+    attention_resolutions: Sequence
+    dropout: float = 0.
+    channel_mult: Sequence = (1, 2, 4, 8)
+    conv_resample: bool = True
+    dims: int = 2
+    num_heads: int = 1
+    num_head_channels: int = -1
+    num_heads_upsample: int = -1
+    use_scale_shift_norm: bool = False
+    resblock_updown: bool = False
+    resblock_updown: bool = False
+    use_new_attention_order: bool = False
+    # networks
+    silu: Callable = nn.silu
+    dense: nn.Module = nn.Dense
+    embed: nn.Module = nn.Embed
+    conv: nn.Module = nn.Conv
+    zero_conv: nn.Module = nn.Conv
+    res_block: nn.Module = ResBlock
+    att_block: nn.Module = AttentionBlock
+    downsample: nn.Module = Downsample
+    upsample: nn.Module = Upsample
+    norm: nn.Module = partial(nn.GroupNorm, num_groups=32)
+    embed_sequential: nn.Module = EmbedSequential
+    sequential: nn.Module = Sequential
+
+    @nn.compact
+    def __call__(self, x, **kwargs):
+        if self.num_heads_upsample == -1:
+            num_heads_upsample = self.num_heads
+        else:
+            num_heads_upsample = self.num_heads_upsample
+
+        time_embed_dim = self.model_channels * 4
+        time_embed = self.sequential([
+            self.dense(time_embed_dim),
+            self.silu,
+            self.dense(time_embed_dim),
+        ])
+
+        ch = input_ch = int(self.channel_mult[0] * self.model_channels)
+        _features = ch
+        _kernels = (3,)*self.dims
+        _paddings = (1,)*self.dims
+        input_blocks = [
+            self.sequential([
+                self.conv(_features, _kernels, padding=_paddings)
+            ])
+        ]
+
+        _feature_size = ch
+        input_block_chans = [ch]
+        ds = 1
+        for level, mult in enumerate(self.channel_mult):
+            for _ in range(self.num_res_blocks):
+                ch = int(mult * self.model_channels)
+                _feature_size += ch
+                input_block_chans.append(ch)
+            if level != len(self.channel_mult) - 1:
+                input_block_chans.append(ch)
+                ds *= 2
+                _feature_size += ch
+
+        middle_block = self.embed_sequential([
+            self.res_block(
+                ch,
+                time_embed_dim,
+                self.dropout,
+                dims=self.dims,
+                use_scale_shift_norm=self.use_scale_shift_norm,
+            ),
+            self.att_block(
+                ch,
+                num_heads=self.num_heads,
+                num_head_channels=self.num_head_channels,
+                use_new_attention_order=self.use_new_attention_order,
+            ),
+            self.res_block(
+                ch,
+                time_embed_dim,
+                self.dropout,
+                dims=self.dims,
+                use_scale_shift_norm=self.use_scale_shift_norm,
+            ),
+        ])
+        _feature_size += ch
+
+        output_blocks = []
+        for level, mult in list(enumerate(self.channel_mult))[::-1]:
+            for i in range(self.num_res_blocks + 1):
+                ich = input_block_chans.pop()
+                layers = [
+                    self.res_block(
+                        ch + ich,
+                        time_embed_dim,
+                        self.dropout,
+                        out_channels=int(self.model_channels * mult),
+                        dims=self.dims,
+                        use_scale_shift_norm=self.use_scale_shift_norm,
+                    )
+                ]
+                ch = int(self.model_channels * mult)
+                if ds in self.attention_resolutions:
+                    layers.append(
+                        self.att_block(
+                            ch,
+                            num_heads=num_heads_upsample,
+                            num_head_channels=self.num_head_channels,
+                            use_new_attention_order=self.use_new_attention_order,
+                        )
+                    )
+                if level and i == self.num_res_blocks:
+                    out_ch = ch
+                    layers.append(
+                        self.res_block(
+                            ch,
+                            time_embed_dim,
+                            self.dropout,
+                            out_channels=out_ch,
+                            dims=self.dims,
+                            use_scale_shift_norm=self.use_scale_shift_norm,
+                            up=True,
+                        )
+                        if self.resblock_updown
+                        else self.upsample(ch, self.conv_resample, dims=self.dims, out_channels=out_ch)
+                    )
+                    ds //= 2
+                output_blocks.append(self.embed_sequential(layers))
+                _feature_size += ch
+
+        _features = self.out_channels
+        _kernels = (3,)*self.dims
+        _paddings = (1,)*self.dims
+        out_fn = self.sequential([
+            self.norm(),
+            self.silu,
+            self.zero_conv(_features, _kernels, padding=_paddings),
+        ])
+
+        # forward
+        hs = []
+        emb = time_embed(x)
+
+        B = x.shape[0]
+        h = x.reshape(B, 1, 1, -1)
+        for module in input_blocks:
+            h = module(h, emb, **kwargs)
+            hs.append(h)
+        h = middle_block(h, emb, **kwargs)
+        for module in output_blocks:
+            # h = jnp.concatenate([h, hs.pop()], axis=-1)
+            h = module(h, emb, **kwargs)
+        h = out_fn(h)
+
+        return h
+
+
+class DiffusionClassifier(nn.Module):
+    # diffusion parameters
+    betas: Tuple
+    n_T: int
+    alpha_t: Any
+    oneover_sqrta: Any
+    sqrt_beta_t: Any
+    alphabar_t: Any
+    sqrtab: Any
+    sqrtmab: Any
+    mab_over_sqrtmab: Any
+    sigma_weight_t: Any
+    sigma_t: Any
+    sigmabar_t: Any
+    bigsigma_t: Any
+    alpos_t: Any
+    alpos_weight_t: Any
+    sigma_t_square: Any
+    # Classifier
+    classifier: Callable
+    # Unet parameters
+    ver: str
+    image_size: int
+    in_channels: int
+    model_channels: int
+    out_channels: Sequence
+    num_res_blocks: int
+    attention_resolutions: Sequence
+    dropout: float = 0.
+    channel_mult: Sequence = (1, 2, 4, 8)
+    conv_resample: bool = True
+    dims: int = 2
+    num_classes: int = None
+    dtype: Any = jnp.float32
+    num_heads: int = 1
+    num_head_channels: int = -1
+    num_heads_upsample: int = -1
+    use_scale_shift_norm: bool = False
+    resblock_updown: bool = False
+    use_new_attention_order: bool = False
+    context: Sequence = None
+    # scorenet
+    scorenet: nn.Module = TinyUNetModel
+    decodernet: nn.Module = TinyDecoder
+
+    def setup(self):
+        # self.decoder = Decoder(
+        #     image_size=8,
+        #     in_channels=128, # 8x8x128
+        #     model_channels=self.model_channels,
+        #     out_channels=128,
+        #     num_res_blocks=1,
+        #     attention_resolutions=(4,),
+        #     dropout=0.,
+        #     channel_mult=(1,1),
+        #     num_heads=2,
+        #     num_head_channels=-1,
+        #     num_heads_upsample=-1,
+        #     use_scale_shift_norm=False,
+        #     resblock_updown=True,
+        #     use_new_attention_order=False,
+        # )
+        self.decoder = self.decodernet(self.model_channels)
+        self.score = self.scorenet(
+            ver=self.ver,
+            image_size=self.image_size,  # 8
+            in_channels=self.in_channels,  # 128
+            model_channels=self.model_channels,  # 256
+            out_channels=self.out_channels,  # 128
+            num_res_blocks=self.num_res_blocks,  # 1
+            attention_resolutions=self.attention_resolutions,  # (0,)
+            dropout=self.dropout,
+            channel_mult=self.channel_mult,  # (1,)
+            num_classes=self.num_classes,
+            dtype=self.dtype,
+            num_heads=self.num_heads,  # 1
+            num_head_channels=self.num_head_channels,  # -1
+            num_heads_upsample=self.num_heads_upsample,  # -1
+            use_scale_shift_norm=self.use_scale_shift_norm,  # False
+            resblock_updown=self.resblock_updown,  # False
+            use_new_attention_order=self.use_new_attention_order,
+            context=self.context
+        )
+
+    # def set_classifier(self, params):
+    #     self.classifier = self.classifier.bind({"params":params})
+
+    # def encode(self, x, params=None, training=True):
+    #     if params is not None:
+    #         out = self.classifier({"params":params}, x, training=training)
+    #     out= self.classifier(x, training=training)
+    #     return jax.lax.stop_gradient(out)
+    def encode(self, params, x):
+        return self.classifier({"params": params}, x, training=False)
+
+    def decode(self, z):
+        return self.decoder(z)
+
+    def __call__(self, rng, x0, z1, cls_params, stop=False, **kwargs):
+        # x logits, z features
+        z0 = self.decode(x0)
+        z0 = jnp.where(stop, jax.lax.stop_gradient(z0), z0)
+        new_x0 = self.encode(cls_params, z0)
+        new_x0 = jnp.where(stop, jax.lax.stop_gradient(new_x0), new_x0)
+        z_t, t, mu_t, sigma_t = self.forward(rng, z0, z1)
+        eps = self.score(z_t, t, **kwargs)
+        return (eps, z_t, t, mu_t, sigma_t), new_x0, z0
+
+    def forward(self, rng, x0, x1):
+        t_rng, n_rng = jax.random.split(rng, 2)
+
+        _ts = jax.random.randint(t_rng, (x0.shape[0],), 1, self.n_T)  # (B,)
+        sigma_weight_t = self.sigma_weight_t[_ts]  # (B,)
+        sigma_weight_t = expand_to_broadcast(sigma_weight_t, x0, axis=1)
+        sigma_t = self.sigma_t[_ts]
+        mu_t = (sigma_weight_t*x0+(1-sigma_weight_t)*x1)
+        bigsigma_t = self.bigsigma_t[_ts]  # (B,)
+        bigsigma_t = expand_to_broadcast(bigsigma_t, mu_t, axis=1)
+
+        # q(X_t|X_0,X_1) = N(X_t;mu_t,bigsigma_t)
+        noise = jax.random.normal(n_rng, mu_t.shape)  # (B, d)
+        x_t = mu_t + noise*jnp.sqrt(bigsigma_t)
+        t = _ts/self.n_T
+        return x_t, t, mu_t, sigma_t

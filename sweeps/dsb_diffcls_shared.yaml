@@ -2,25 +2,23 @@ project: dsb-bnn
 program: dsb.py
 method: bayes
 metric:
-  name: tst/ens_acc
+  name: tst/acc
   goal: maximize
 parameters:
   config:
-    value: c10_frnrelu_AtoshABC.yaml
+    value: config_dsb/c10_frnrelu_AtoshABC.yaml
   optim_ne:
-    values: [300, 500, 700, 900, 1100]
+    values: [300, 500, 700, 900, 1100, 1300]
   optim_weight_decay:
-    values: [0,0.00001,0.0001,0.001,0.01]
+    values: [0,0.00001,0.0001,0.001,0.01,0.1]
   T:
-    value: 10
+    values: [1, 10]
   n_feat:
     value: 128
   beta2:
     values: [0.0003, 0.0001, 0.0005, 0.001]
   optim_lr:
     values: [0.000025, 0.00005, 0.000075, 0.0001, 0.00025]
-  stos:
-    value: True
   features_dir:
     value: features_last3_AtoshB
   optim_bs:
@@ -32,7 +30,7 @@ parameters:
   droprate:
     values: [0.,0.1,0.2,0.3,0.4]
   ema_decay:
-    values: [0.99995,0.9999,0.9995,0.999,0.995]
+    values: [1., 0.99995,0.9999,0.9995,0.999,0.995]
   features_dir:
     value: features_AtoshABC
   contexts_dir:
@@ -41,6 +39,14 @@ parameters:
     value: True
   diffcls:
     value: 3
+  corrector:
+    values: [0,1]
+  phase_trans:
+    values: [60, 90, 120, 150]
+  z_prior:
+    values: [1.0e-3, 1.0e-4, 1.0e-5, 1.0e-6]
+  train_cls:
+    values: [True, False]
 
   
 command:

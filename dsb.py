@@ -1599,6 +1599,47 @@ def launch(config, print_fn):
         decay_steps=total_epochs * dataloaders["trn_steps_per_epoch"])
     optimizer = optax.adamw(
         learning_rate=scheduler, weight_decay=config.optim_weight_decay)
+
+    if config.phase_trans > 0:
+        # zeta = 0 -> decoding loss only
+        # zeta = 1 -> score loss + decoding loss
+        zeta_schedules = [optax.constant_schedule(
+            0), optax.constant_schedule(1)]
+        zeta_boundaries = [config.phase_trans *
+                           dataloaders["trn_steps_per_epoch"]]
+        zeta_fn = optax.join_schedules(
+            schedules=zeta_schedules,
+            boundaries=zeta_boundaries
+        )
+    else:
+        def zeta_fn(step): return 1
+
+    if config.diffcls > 0:
+        partition_optimizers = {
+            "trainable": optax.adamw(
+                learning_rate=lambda step: zeta_fn(step)*scheduler(step),
+                weight_decay=config.optim_weight_decay
+            ),
+            # "trainable": optimizer,
+            "frozen": optax.adamw(
+                learning_rate=lambda step: (1-zeta_fn(step))*scheduler(step),
+                weight_decay=config.optim_weight_decay
+            )
+        }
+        def param_partitions_fn(params): return flax.core.freeze(flax.traverse_util.path_aware_map(
+            lambda path, v: "frozen" if "decoder" in path else "trainable", params))
+        partitions = (
+            param_partitions_fn(variables["params"]),
+            param_partitions_fn(variables_cor["params"]),
+            param_partitions_fn(
+                variables_clsA["params"] if config.clsA else variables_clsB["params"])
+        )
+        optimizer = optax.multi_transform(
+            partition_optimizers, partitions)
+        # params_flatten = flax.traverse_util.flatten_dict(partitions[0])
+        # for k, v in params_flatten.items():
+        #     print(k, v)
+
     # if config.shared_head:
     #     partition_optimizer = {"trainable": optimizer,
     #                            "frozen": optax.set_to_zero()}
@@ -1668,21 +1709,8 @@ def launch(config, print_fn):
     else:
         def gamma_fn(step): return config.gamma
 
-    if config.phase_trans > 0:
-        # zeta = 0 -> decoding loss only
-        # zeta = 1 -> score loss + decoding loss
-        zeta_schedules = [optax.constant_schedule(
-            0), optax.constant_schedule(1)]
-        zeta_boundaries = [config.phase_trans *
-                           dataloaders["trn_steps_per_epoch"]]
-        zeta_fn = optax.join_schedules(
-            schedules=zeta_schedules,
-            boundaries=zeta_boundaries
-        )
-    else:
-        def zeta_fn(step): return 1
-
     # objective
+
     def mse_loss(noise, output, lamb=None, mask=None):
         # assert len(output.shape) == 2
         sum_axis = list(range(1, len(output.shape[1:])+1))
@@ -1704,7 +1732,7 @@ def launch(config, print_fn):
                 feat = jax.lax.stop_gradient(feat)
             if config.corrector > 0:
                 feat = correct_feature(cparams, feat)
-        if "last" in config.features_dir:
+        if "last" in config.features_dir or feat.shape[-1] >= 128:
             if mode.lower() == "a" or mode.lower() == "c":
                 # if config.bezier and mode.lower() == "c":
                 if mode.lower() == "c":
@@ -2078,7 +2106,7 @@ def launch(config, print_fn):
                 # zB: 8x8x128
                 # logitsA: ensembled logit
                 zB = contexts
-                stop = (config.stop_decoder and zeta_fn(state.step) > 0)
+                cls_params = bparams if config.train_cls else variables_clsB["params"]
                 (
                     (epsilon, z_t, t, mu_t, sigma_t),
                     new_logitsA,
@@ -2086,8 +2114,7 @@ def launch(config, print_fn):
                 ), new_model_state = state.apply_fn(
                     params_dict,
                     i_rng, logitsA, zB,
-                    cls_params=variables_clsB["params"],
-                    stop=stop,
+                    cls_params=cls_params,
                     ctx=None,
                     cfl=conflicts,
                     mutable=mutable,
@@ -2170,7 +2197,9 @@ def launch(config, print_fn):
             # estimated B
             if config.diffcls:
                 z0eps = z_t - _sigma_t*epsilon
-                x0eps = model_bd.encode(variables_clsB["params"], z0eps)
+                cls_params = bparams if config.train_cls else variables_clsB["params"]
+                x0eps = model_bd.encode(cls_params, z0eps)
+                # x0eps = z0eps
             elif config.ldm:
                 z0eps = z_t - _sigma_t*epsilon
                 x0eps = model_bd.decode(z0eps)
@@ -2187,7 +2216,15 @@ def launch(config, print_fn):
             # train autoencoder
             if config.diffcls:
                 recon = mse_loss(new_logitsA, logitsA)
-                if config.kld_recon > 0:
+                if config.mse_recon > 0:
+                    T = config.mse_recon
+                    logq = jax.nn.log_softmax(logitsA/T, axis=-1)
+                    logp = jax.nn.log_softmax(new_logitsA/T, axis=-1)
+                    logq = jnp.exp(logq)
+                    logp = jnp.exp(logp)
+                    prob_recon = mse_loss(logq, logp)
+                    auloss0 = prob_recon
+                elif config.kld_recon > 0:
                     T = config.kld_recon
                     logq = jax.nn.log_softmax(logitsA/T, axis=-1)
                     logp = jax.nn.log_softmax(new_logitsA/T, axis=-1)
@@ -2196,13 +2233,25 @@ def launch(config, print_fn):
                     auloss0 = kld
                 else:
                     auloss0 = recon
-                auloss1 = 1e-5*mse_loss(zA, zB)
+                distance_prior = config.z_prior*mse_loss(zA, zB)
+                normal_prior = 0.5*config.z_prior * \
+                    jnp.sum(zA**2, (-1, -2, -3))*100
+                if config.normal_prior == 2:
+                    auloss1 = normal_prior + distance_prior
+                elif config.normal_prior == 1:
+                    auloss1 = normal_prior
+                else:
+                    auloss1 = distance_prior
                 auloss = auloss0+auloss1
 
                 logq = jax.nn.log_softmax(logitsA, axis=-1)
                 logp = jax.nn.log_softmax(new_logitsA, axis=-1)
                 q = jnp.exp(logq)
                 true_kld = jnp.sum(q*(logq-logp), axis=-1)
+
+                predictions = jax.nn.log_softmax(new_logitsA, axis=-1)
+                true_acc = evaluate_acc(
+                    predictions, labels, log_input=True, reduction="none")
             elif config.ldm:
                 auloss0 = mse_loss(new_logitsB, logitsB)
                 auloss1 = mse_loss(new_logitsA, logitsA)
@@ -2253,7 +2302,7 @@ def launch(config, print_fn):
                 metrics["auloss"] = jnp.sum(
                     jnp.where(
                         batch["marker"],
-                        true_kld,
+                        true_acc,
                         0
                     )
                 )
@@ -2293,7 +2342,7 @@ def launch(config, print_fn):
         return new_state, metrics
 
     def step_valid(state, batch):
-        ema_params, _, _ = state.ema_params
+        ema_params, _, ema_bparams = state.ema_params
         # normalize
         logitsB = batch["images"]  # the current mode
         logitsA = batch["labels"]  # mixture of other modes
@@ -2316,6 +2365,7 @@ def launch(config, print_fn):
         # get interpolation
         if config.diffcls:
             zB = contexts
+            cls_params = ema_bparams if config.train_cls else variables_clsB["params"]
             (
                 (output, z_t, t, mu_t, sigma_t),
                 new_logitsA,
@@ -2323,7 +2373,7 @@ def launch(config, print_fn):
             ) = state.apply_fn(
                 params_dict,
                 i_rng, logitsA, zB,
-                cls_params=variables_clsB["params"],
+                cls_params=cls_params,
                 ctx=None,
                 cfl=conflicts,
                 rngs=rngs_dict,
@@ -2378,13 +2428,18 @@ def launch(config, print_fn):
             else:
                 recon = mse_loss(new_logitsA, logitsA)
                 auloss0 = recon
-            auloss1 = 1e-5*mse_loss(zA, zB)
+            auloss1 = config.z_prior*mse_loss(zA, zB)
             auloss = auloss0+auloss1
 
             logq = jax.nn.log_softmax(logitsA, axis=-1)
             logp = jax.nn.log_softmax(new_logitsA, axis=-1)
             q = jnp.exp(logq)
             true_kld = jnp.sum(q*(logq-logp), axis=-1)
+
+            labels = batch["cls_labels"]
+            predictions = jax.nn.log_softmax(new_logitsA, axis=-1)
+            true_acc = evaluate_acc(
+                predictions, labels, log_input=True, reduction="none")
         if config.ldm:
             auloss0 = mse_loss(new_logitsB, logitsB)
             auloss1 = mse_loss(new_logitsA, logitsA)
@@ -2406,7 +2461,7 @@ def launch(config, print_fn):
             metrics["auloss"] = jnp.sum(
                 jnp.where(
                     batch["marker"],
-                    true_kld,
+                    true_acc,
                     0
                 )
             )
@@ -2458,7 +2513,8 @@ def launch(config, print_fn):
             f_gen = diffcls_sample(fn, i_rng, zB, None, conflicts)
             sec = time.time()-begin
             f_gen = unnormalize(f_gen)
-            f_gen = model_bd.encode(variables_clsB["params"], f_gen)
+            cls_params = ema_bparams if config.train_cls else variables_clsB["params"]
+            f_gen = model_bd.encode(cls_params, f_gen)
         elif config.ldm:
             params_dict = dict(params=ema_params)
             rngs_dict = dict(dropout=state.rng)
@@ -2538,7 +2594,8 @@ def launch(config, print_fn):
         #     f_gen = jnp.clip(f_gen, 1e-12, 1-1e-12)
             # TODO: f_gen_all for time_ensemble
 
-        f_all = jnp.stack([f_init, f_gen, f_real], axis=-1)
+        f_all = jnp.stack(
+            [f_init, f_gen, f_real], axis=-1) if not config.diffcls else None
 
         (
             (ens_acc, ens_nll),
@@ -2941,6 +2998,8 @@ def launch(config, print_fn):
         else:
             train_loader = dataloaders["val_featureloader"](rng=None)
         train_loader = jax_utils.prefetch_to_device(train_loader, size=2)
+        # if config.diffcls:
+        #     frozen1 = variables_clsB["params"]["Dense_0"]["kernel"]
 
         for batch_idx, batch in enumerate(train_loader, start=1):
             rng = jax.random.fold_in(rng, batch_idx)
@@ -2964,6 +3023,12 @@ def launch(config, print_fn):
                         save_examples = examples
 
             train_metrics.append(metrics)
+        # if config.diffcls:
+        #     frozen2 = variables_clsB["params"]["Dense_0"]["kernel"]
+        #     if jnp.all(frozen1==frozen2):
+        #         print("variables_clsB is frozen")
+        #     else:
+        #         print("variables_clsB is not frozen")
 
         train_metrics = common_utils.get_metrics(train_metrics)
         trn_summarized = {f'trn/{k}': v for k,
@@ -3256,8 +3321,11 @@ def main():
     # Diffusion Classifier
     parser.add_argument("--diffcls", default=None, type=int)
     parser.add_argument("--kld_recon", default=0, type=float)
+    parser.add_argument("--mse_recon", default=0, type=float)
     parser.add_argument("--phase_trans", default=0, type=int)
-    parser.add_argument("--stop_decoder", action="store_true")
+    parser.add_argument("--z_prior", default=1e-5, type=float)
+    parser.add_argument("--train_cls", action="store_true")
+    parser.add_argument("--normal_prior", action="store_true")
     # ---------------------------------------------------------------------------------------
     # networks
     # ---------------------------------------------------------------------------------------

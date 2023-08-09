@@ -948,6 +948,28 @@ class MidUNetModel(nn.Module):
         return h
 
 
+class DepthwiseSeparableConv(nn.Module):
+    """
+    Depthwise separable convolution.
+    """
+    features: int
+    kernel_size: Tuple[int]
+    padding: Tuple[int]
+    kernels_per_layer: int = 1
+
+    @nn.compact
+    def __call__(self, x):
+        B, H, W, C = x.shape
+        features = self.features
+        kernel_size = self.kernel_size
+        padding = self.padding
+        x = nn.Conv(features=C * self.kernels_per_layer, kernel_size=kernel_size,
+                    padding=padding, feature_group_count=C)(x)  # depthwise
+        x = nn.Conv(features=features, kernel_size=(
+            1, 1), padding='SAME')(x)  # pointwise
+        return x
+
+
 class TinyUNetModel(nn.Module):
     ver: str
     # parameters
@@ -1004,6 +1026,12 @@ class TinyUNetModel(nn.Module):
             return self._call_v1_2(*args, **kwargs)
         elif self.ver == "v1.3":
             return self._call_v1_3(*args, **kwargs)
+        elif self.ver == "v1.4":
+            # Depthwise separable convolution applied, 1 layer.
+            return self._call_v1_4(*args, **kwargs)
+        elif self.ver == "v1.5":
+            # Depthwise separable convolution applied, 2 layers.
+            return self._call_v1_5(*args, **kwargs)
         else:
             raise NotImplementedError
 
@@ -1222,6 +1250,114 @@ class TinyUNetModel(nn.Module):
         )(x)
         x = self.silu(x)
         x = self.conv(
+            features=ch,
+            kernel_size=(3, 3),
+            padding=(1, 1)
+        )(x)
+        return x
+
+    def _call_v1_4(self, x, t, **kwargs):
+        conv = DepthwiseSeparableConv
+        # time embedding
+        t = timestep_embedding(t, self.model_channels)
+        # t = jnp.tile(t.reshape(-1, 1), [1, self.model_channels])
+        t_dim = self.model_channels//4  # 32
+        t = self.dense(t_dim)(t)
+        t = self.silu(t)
+        t = self.dense(t_dim)(t)
+
+        # Conv
+        ch = self.model_channels//2  # 64
+        x = conv(
+            features=ch,
+            kernel_size=(3, 3),
+            padding=(1, 1)
+        )(x)
+        residual = x
+
+        # Downsample
+        ch = self.model_channels//2  # 64
+        x = self.tiny_resblock(
+            ch, self.dropout, conv=conv
+        )(x, t, **kwargs)
+
+        x = jnp.concatenate([x, residual], axis=-1)
+
+        # Upsample
+        ch = self.model_channels
+        x = self.tiny_resblock(
+            ch, self.dropout, conv=conv
+        )(x, t, **kwargs)
+
+        x = self.norm()(x)
+        x = self.silu(x)
+        x = conv(
+            features=ch,
+            kernel_size=(3, 3),
+            padding=(1, 1)
+        )(x)
+        return x
+
+    def _call_v1_5(self, x, t, **kwargs):
+        conv = DepthwiseSeparableConv
+        # time embedding
+        t = timestep_embedding(t, self.model_channels)
+        # t = jnp.tile(t.reshape(-1, 1), [1, self.model_channels])
+        t_dim = self.model_channels//4  # 32
+        t = self.dense(t_dim)(t)
+        t = self.silu(t)
+        t = self.dense(t_dim)(t)
+
+        # Conv
+        ch = self.model_channels//2  # 64
+        x = conv(
+            features=ch,
+            kernel_size=(3, 3),
+            padding=(1, 1)
+        )(x)
+        residual = x
+
+        # Downsample
+        # ch = self.model_channels // 4  # 32
+        ch = x.shape[-1]  # 64
+        x = self.tiny_resblock(
+            ch, self.dropout, conv=conv
+        )(x, t, **kwargs)
+
+        ch = self.model_channels // 4  # 32
+        x = conv(
+            features=ch,
+            kernel_size=(3, 3),
+            padding=(1, 1)
+        )(x)
+        residual2 = x
+
+        # Downsample
+        # ch = self.model_channels // 4  # 64
+        ch = x.shape[-1]
+        x = self.tiny_resblock(
+            ch, self.dropout, conv=conv
+        )(x, t, **kwargs)
+
+        # Upsample
+        x = jnp.concatenate([x, residual2], axis=-1)
+        # ch = self.model_channels // 2 # 64
+        ch = x.shape[-1]
+        x = self.tiny_resblock(
+            ch, self.dropout, conv=conv
+        )(x, t, **kwargs)
+
+        # Upsample
+        x = jnp.concatenate([x, residual], axis=-1)
+        # ch = self.model_channels # 64
+        ch = x.shape[-1]
+        x = self.tiny_resblock(
+            ch, self.dropout, conv=conv
+        )(x, t, **kwargs)
+
+        x = self.norm()(x)
+        x = self.silu(x)
+        x = conv(
             features=ch,
             kernel_size=(3, 3),
             padding=(1, 1)
@@ -1485,18 +1621,19 @@ class DiffusionClassifier(nn.Module):
     #         out = self.classifier({"params":params}, x, training=training)
     #     out= self.classifier(x, training=training)
     #     return jax.lax.stop_gradient(out)
-    def encode(self, params, x):
-        return self.classifier({"params": params}, x, training=False)
+    def encode(self, params, z):
+        return self.classifier({"params": params}, z, training=False)
 
-    def decode(self, z):
-        return self.decoder(z)
+    def decode(self, x, params=None):
+        if params is not None:
+            return self.decoder.apply({"params": params}, x, training=False)
+        return self.decoder(x)
 
-    def __call__(self, rng, x0, z1, cls_params, stop=False, **kwargs):
+    # def __call__(self, rng, x0, z1, cls_params, stop=False, **kwargs):
+    def __call__(self, rng, x0, z1, cls_params, **kwargs):
         # x logits, z features
         z0 = self.decode(x0)
-        z0 = jnp.where(stop, jax.lax.stop_gradient(z0), z0)
         new_x0 = self.encode(cls_params, z0)
-        new_x0 = jnp.where(stop, jax.lax.stop_gradient(new_x0), new_x0)
         z_t, t, mu_t, sigma_t = self.forward(rng, z0, z1)
         eps = self.score(z_t, t, **kwargs)
         return (eps, z_t, t, mu_t, sigma_t), new_x0, z0

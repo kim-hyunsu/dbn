@@ -788,6 +788,8 @@ def get_logprobs(logits, ignore=False):
 
 def get_ens_logits(logits, logitmean=None, mean_axis=0):
     # TODO: better way
+    if len(logits) == 1:
+        return logits[0]
     if logitmean is None:
         logitmean = jnp.mean(logits[mean_axis], axis=-1)[:, None]
     ens_prob = 0

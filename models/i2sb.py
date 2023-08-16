@@ -1630,9 +1630,10 @@ class DiffusionClassifier(nn.Module):
         return self.decoder(x)
 
     # def __call__(self, rng, x0, z1, cls_params, stop=False, **kwargs):
-    def __call__(self, rng, x0, z1, cls_params, **kwargs):
+    def __call__(self, rng, x0, z1, cls_params, z0=None, **kwargs):
         # x logits, z features
-        z0 = self.decode(x0)
+        if z0 is None:
+            z0 = self.decode(x0)
         new_x0 = self.encode(cls_params, z0)
         z_t, t, mu_t, sigma_t = self.forward(rng, z0, z1)
         eps = self.score(z_t, t, **kwargs)

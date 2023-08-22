@@ -10,7 +10,7 @@ from typing import Any, Tuple
 import flax
 from flax.training import train_state, common_utils, checkpoints
 from flax.training import dynamic_scale as dynamic_scale_lib
-from flax.core.frozen_dict import freeze
+from flax.core.frozen_dict import freeze, FrozenDict
 from flax import jax_utils
 
 import optax
@@ -226,6 +226,7 @@ def build_featureloaders(config, rng=None):
             merge = -2
         else:
             merge = -1
+            config.n_feat = config.fat*config.n_feat
     else:
         merge = 0
 
@@ -607,6 +608,16 @@ def build_featureloaders(config, rng=None):
         val_steps_per_epoch=math.ceil(len(valid_logitsA)/config.optim_bs),
         tst_steps_per_epoch=math.ceil(len(test_logitsA)/config.optim_bs)
     )
+
+    ############ for memory issue #############
+    train_logitsA = np.array(train_logitsA)
+    train_logitsB = np.array(train_logitsB)
+    valid_logitsA = np.array(valid_logitsA)
+    valid_logitsB = np.array(valid_logitsB)
+    test_logitsA = np.array(test_logitsA)
+    test_logitsB = np.array(test_logitsB)
+    ###########################################
+
     dataloaders["featureloader"] = partial(
         # _build_dataloader,
         _build_featureloader,
@@ -707,6 +718,9 @@ def build_featureloaders(config, rng=None):
             normalize_logits,  features_dir=f_dir) if config.context else None
         f_unnormalize = partial(
             unnormalize_logits,  features_dir=f_dir) if config.context else None
+
+    _normalize = normalize
+    def normalize(x): return _normalize(jnp.array(x))
 
     if config.get_stats != "":
         # ------------------------------------------------------------------
@@ -1522,6 +1536,7 @@ def launch(config, print_fn):
     AtoB = "AtoB" in config.features_dir
     AtoshB = "AtoshB" in config.features_dir
     AtoshABC = "AtoshABC" in config.features_dir
+    AtoABC = "AtoABC" in config.features_dir
     tag = ""
     if bezier:
         tag = "bezier"
@@ -1539,6 +1554,9 @@ def launch(config, print_fn):
         tag = "AtoshB"
     elif AtoshABC:
         tag = "AtoshABC"
+    elif AtoABC:
+        tag = "AtoABC"
+
     if config.diffcls:
         dirname = config.contexts_dir
     else:
@@ -1548,6 +1566,13 @@ def launch(config, print_fn):
         variables_clsB, model_dir_list[0], sgd_state, dirname=dirname)  # current mode
     variables_clsA = load_classifier(
         variables_clsA, model_dir_list[1], sgd_state, dirname=dirname)  # target mode
+    if config.fat > 1:
+        assert config.fat+1 <= len(model_dir_list)
+        variables_clsA_list = []
+        for i in range(1, config.fat+1):
+            variables_clsA_copy = variables_clsA.copy(FrozenDict({}))
+            variables_clsA_list.append(load_classifier(
+                variables_clsA_copy, model_dir_list[i], sgd_state, dirname=dirname))
     # if AtoshB:
     #     for k, v in variables_clsA["params"].items():
     #         if "FilterResponseNorm" in k:
@@ -1772,13 +1797,13 @@ def launch(config, print_fn):
         return loss
 
     def get_logits(feat, mode, cparams=None, bparams=None, redundant=False):
-        if config.fat:
+        if config.fat > 1:
             if config.widthwise:
                 feat = rearrange(
-                    feat, "b h (n w) z -> (n b) h w z", n=config.fat)
+                    feat, "b h (n w) z -> n b h w z", n=config.fat)
             else:
                 feat = rearrange(
-                    feat, "b h w (n z) -> (n b) h w z", n=config.fat)
+                    feat, "b h w (n z) -> n b h w z", n=config.fat)
             assert feat.shape[-1] == 128
         if mode.lower() == "c":
             if config.stop_grad:
@@ -1786,30 +1811,53 @@ def launch(config, print_fn):
             if config.corrector > 0:
                 feat = correct_feature(cparams, feat)
         if "last" in config.features_dir or feat.shape[-1] >= 128:
-            if mode.lower() == "a" or mode.lower() == "c":
-                # if config.bezier and mode.lower() == "c":
-                if mode.lower() == "c":
-                    variables_cls_params = bparams
-                    # variables_cls_params = variables_clsA["params"]
-                else:
-                    variables_cls_params = variables_clsA["params"]
-            elif mode.lower() == "b":
-                variables_cls_params = variables_clsB["params"]
-            logits = classifier.apply(
-                {"params": variables_cls_params}, feat
-            )
+            if config.fat > 1:
+                logit_list = []
+                for var, f in zip(variables_clsA_list, feat):
+                    if mode.lower() == "a":
+                        params = var["params"]
+                    elif mode.lower() == "b":
+                        params = variables_clsB["params"]
+                    elif mode.lower() == "c":
+                        params = bparams
+                    else:
+                        raise NameError
+                    logits = classifier.apply({"params": params}, f)
+                    logit_list.append(logits)
+                logits = jnp.stack(logit_list)
+            else:
+                if mode.lower() == "a" or mode.lower() == "c":
+                    # if config.bezier and mode.lower() == "c":
+                    if mode.lower() == "c":
+                        variables_cls_params = bparams
+                        # variables_cls_params = variables_clsA["params"]
+                    else:
+                        variables_cls_params = variables_clsA["params"]
+                elif mode.lower() == "b":
+                    variables_cls_params = variables_clsB["params"]
+                logits = classifier.apply(
+                    {"params": variables_cls_params}, feat
+                )
         else:
             logits = feat
         if config.prob_input:
             logits = jnp.clip(logits, 1e-8, 1-1e-8)
             logits = logits / jnp.sum(logits, axis=-1, keepdims=True)
-        if config.fat:
-            logits = rearrange(logits, "(n b) p -> n b p", n=config.fat)
+        if config.fat > 1:
+            # logits = rearrange(logits, "(n b) p -> n b p", n=config.fat)
             if mode.lower() == "b" and not redundant:
                 logits = logits[-1:]  # delete redundant logits
         return logits
 
-    def ensemble_accuracy(f_list, labels, marker, mode, cparams=None, bparams=None):
+    def ensemble_accuracy(
+        f_list,
+        labels,
+        marker,
+        mode,
+        cparams=None,
+        bparams=None,
+        filter=[True]*(config.fat+1)
+    ):
         avg_preds = 0
         each_acc = []
         for m, f_gen in zip(mode, f_list):
@@ -1833,11 +1881,11 @@ def launch(config, print_fn):
                 avg_preds += preds
                 each_acc.append((acc, nll))
             else:
-                for l in logits:
-                    preds, (acc, nll) = accnll(l)
-                    avg_preds += preds
-                    each_acc.append((acc, nll))
-        assert len(each_acc) == config.fat*(len(f_list)-1)+1
+                for valid, l in zip(filter,logits):
+                    if valid:
+                        preds, (acc, nll) = accnll(l)
+                        avg_preds += preds
+                        each_acc.append((acc, nll))
         avg_preds /= len(each_acc)
 
         acc = evaluate_acc(
@@ -2814,20 +2862,37 @@ def launch(config, print_fn):
             )
         ) = ensemble_accuracy(
             [f_init, f_gen], labels, batch["marker"], ["B", "C"], ema_cparams, ema_bparams)
-        (
-            ens_t2acc, (b_t2acc, a_t2acc)
-        ) = ensemble_top2accuracy(
-            [f_init, f_gen], labels, batch["marker"], ["B", "C"], ema_cparams, ema_bparams)
-        (
-            ens_t5acc, (b_t5acc, a_t5acc)
-        ) = ensemble_topNaccuracy(
-            5, [f_init, f_gen], labels, batch["marker"], ["B", "C"], ema_cparams, ema_bparams)
-        (
-            ens_tfpnacc, (b_tfpnacc, a_tfpnacc)
-        ) = ensemble_tfpn_accuracy([f_init, f_gen], labels, batch["marker"],
-                                   dict(tp=batch["tp"], fp=batch["fp"],
-                                        fn=batch["fn"], tn=batch["tn"]),
-                                   ["B", "C"], ema_cparams, ema_bparams)
+        if config.fat > 1:
+            ab1_filter = [False]*(config.fat+1)
+            ab1_filter[0] = True
+            ab1_filter[1] = True
+            (
+                (ens_acc_ab1, ens_nll_ab1), _
+            ) = ensemble_accuracy(
+                [f_init, f_gen], labels, batch["marker"], ["B", "C"], ema_cparams, ema_bparams,
+                filter=ab1_filter)
+            b1b2_filter = [False]*(config.fat+1)
+            b1b2_filter[1] = True
+            b1b2_filter[2] = True
+            (
+                (ens_acc_b1b2, ens_nll_b1b2), _
+            ) = ensemble_accuracy(
+                [f_init, f_gen], labels, batch["marker"], ["B", "C"], ema_cparams, ema_bparams,
+                filter=b1b2_filter)
+        # (
+        #     ens_t2acc, (b_t2acc, a_t2acc)
+        # ) = ensemble_top2accuracy(
+        #     [f_init, f_gen], labels, batch["marker"], ["B", "C"], ema_cparams, ema_bparams)
+        # (
+        #     ens_t5acc, (b_t5acc, a_t5acc)
+        # ) = ensemble_topNaccuracy(
+        #     5, [f_init, f_gen], labels, batch["marker"], ["B", "C"], ema_cparams, ema_bparams)
+        # (
+        #     ens_tfpnacc, (b_tfpnacc, a_tfpnacc)
+        # ) = ensemble_tfpn_accuracy([f_init, f_gen], labels, batch["marker"],
+        #                            dict(tp=batch["tp"], fp=batch["fp"],
+        #                                 fn=batch["fn"], tn=batch["tn"]),
+        #                            ["B", "C"], ema_cparams, ema_bparams)
         if config.time_ensemble:
             assert not config.ldm or not config.diffcls
             ((tens_acc, tens_nll), _) = ensemble_accuracy(
@@ -2856,22 +2921,27 @@ def launch(config, print_fn):
         metrics = OrderedDict({
             "acc": a_acc, "nll": a_nll,
             "ens_acc": ens_acc, "ens_nll": ens_nll,
-            "t2acc": a_t2acc, "ens_t2acc": ens_t2acc,
-            "t5acc": a_t5acc, "ens_t5acc": ens_t5acc,
+            # "t2acc": a_t2acc, "ens_t2acc": ens_t2acc,
+            # "t5acc": a_t5acc, "ens_t5acc": ens_t5acc,
             "count": count,
             "kld": kld, "rkld": rkld,
             "skld": skld, "rskld": rskld,
             "sec": sec*count,
-            "TPacc": a_tfpnacc["tp"],
-            "FPacc": a_tfpnacc["fp"],
-            "FNacc": a_tfpnacc["fn"],
-            "TNacc": a_tfpnacc["tn"]
+            # "TPacc": a_tfpnacc["tp"],
+            # "FPacc": a_tfpnacc["fp"],
+            # "FNacc": a_tfpnacc["fn"],
+            # "TNacc": a_tfpnacc["tn"]
         })
         if config.time_ensemble:
             metrics["tens_acc"] = tens_acc
             metrics["tens_nll"] = tens_nll
             metrics["tens_kld"] = tens_kld
             metrics["tens_rkld"] = tens_rkld
+        if config.fat > 1:
+            metrics["ens_acc_ab1"] = ens_acc_ab1
+            metrics["ens_nll_ab1"] = ens_nll_ab1
+            metrics["ens_acc_b1b2"] = ens_acc_b1b2
+            metrics["ens_nll_b1b2"] = ens_nll_b1b2
         metrics = jax.lax.psum(metrics, axis_name='batch')
 
         C = get_logits(f_gen, "C", ema_cparams, ema_bparams)

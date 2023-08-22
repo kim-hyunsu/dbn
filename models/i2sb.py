@@ -1117,6 +1117,7 @@ class TinyUNetModel(nn.Module):
         return h
 
     def _call_v1_1(self, x, t, **kwargs):
+        out_ch = x.shape[-1]
         t = timestep_embedding(t, self.model_channels)
         t_dim = self.model_channels//4  # 32
         t = self.dense(t_dim)(t)
@@ -1173,7 +1174,7 @@ class TinyUNetModel(nn.Module):
         x = self.norm()(x)
         x = self.silu(x)
         x = self.conv(
-            features=ch,
+            features=out_ch,
             kernel_size=(3, 3),
             padding=(1, 1)
         )(x)
@@ -1181,6 +1182,7 @@ class TinyUNetModel(nn.Module):
         return x
 
     def _call_v1_2(self, x, t, **kwargs):
+        out_ch = x.shape[-1]
         t = timestep_embedding(t, self.model_channels)
         # t = jnp.tile(t.reshape(-1, 1), [1, self.model_channels])
         t_dim = self.model_channels//4  # 32
@@ -1211,13 +1213,14 @@ class TinyUNetModel(nn.Module):
         x = self.norm()(x)
         x = self.silu(x)
         x = self.conv(
-            features=ch,
+            features=out_ch,
             kernel_size=(3, 3),
             padding=(1, 1)
         )(x)
         return x
 
     def _call_v1_3(self, x, t, **kwargs):
+        out_ch = x.shape[-1]
         t = timestep_embedding(t, self.model_channels)
         t_dim = self.model_channels//2  # 64
         t = self.dense(t_dim)(t)
@@ -1250,13 +1253,14 @@ class TinyUNetModel(nn.Module):
         )(x)
         x = self.silu(x)
         x = self.conv(
-            features=ch,
+            features=out_ch,
             kernel_size=(3, 3),
             padding=(1, 1)
         )(x)
         return x
 
     def _call_v1_4(self, x, t, **kwargs):
+        out_ch = x.shape[-1]
         conv = DepthwiseSeparableConv
         # time embedding
         t = timestep_embedding(t, self.model_channels)
@@ -1292,13 +1296,14 @@ class TinyUNetModel(nn.Module):
         x = self.norm()(x)
         x = self.silu(x)
         x = conv(
-            features=ch,
+            features=out_ch,
             kernel_size=(3, 3),
             padding=(1, 1)
         )(x)
         return x
 
     def _call_v1_5(self, x, t, **kwargs):
+        out_ch = x.shape[-1]
         conv = DepthwiseSeparableConv
         # time embedding
         t = timestep_embedding(t, self.model_channels)
@@ -1358,7 +1363,7 @@ class TinyUNetModel(nn.Module):
         x = self.norm()(x)
         x = self.silu(x)
         x = conv(
-            features=ch,
+            features=out_ch,
             kernel_size=(3, 3),
             padding=(1, 1)
         )(x)
@@ -1654,4 +1659,72 @@ class DiffusionClassifier(nn.Module):
         noise = jax.random.normal(n_rng, mu_t.shape)  # (B, d)
         x_t = mu_t + noise*jnp.sqrt(bigsigma_t)
         t = _ts/self.n_T
+        return x_t, t, mu_t, sigma_t
+
+
+class DiffusionBridgeNetwork(nn.Module):
+    base_net: nn.Module
+    score_net: nn.Module
+    cls_net: nn.Module
+    dsb_stats: dict
+    fat: int
+
+    def setup(self):
+        self.base = self.base_net()
+        self.score = self.score_net()
+        if self.cls_net is not None:
+            self.cls = self.cls_net()
+
+    def encode(self, x, params=None, batch_stats=None, **kwargs):
+        if params is not None:
+            params_dict = dict(params=params)
+            if batch_stats is not None:
+                params_dict["batch_stats"] = batch_stats
+            return self.base.apply(params_dict, x, **kwargs)
+        return self.base(x, **kwargs)
+
+    def classify(self, z, params=None, batch_stats=None, **kwargs):
+        if params is not None:
+            params_dict = dict(params=params)
+            if batch_stats is not None:
+                params_dict["batch_stats"] = batch_stats
+            return self.cls.apply(params_dict, z, **kwargs)
+        return self.cls(z, **kwargs)
+
+    def __call__(self, rng, z0, x1, base_params=None, cls_params=None, **kwargs):
+        z1 = self.encode(x1, base_params, **kwargs)
+        if self.fat > 1:
+            z1 = jnp.repeat(z1, self.fat, axis=-1)
+        z_t, t, mu_t, sigma_t = self.forward(rng, z0, z1)
+        eps = self.score(z_t, t, **kwargs)
+        _sigma_t = expand_to_broadcast(sigma_t, z_t, axis=1)
+        z0eps = z_t - _sigma_t*eps
+        if self.fat > 1:
+            z0eps = jnp.split(z0eps, self.fat, axis=-1)
+            logits0eps = [self.classify(z, cls_params, **kwargs)
+                          for z in z0eps]
+        else:
+            logits0eps = [self.classify(z0eps, cls_params, **kwargs)]
+        return (eps, z_t, t, mu_t, sigma_t), logits0eps
+
+    def forward(self, rng, x0, x1):
+        n_T = self.dsb_stats["n_T"]
+        _sigma_weight_t = self.dsb_stats["sigma_weight_t"]
+        _sigma_t = self.dsb_stats["sigma_t"]
+        _bigsigma_t = self.dsb_stats["bigsigma_t"]
+
+        t_rng, n_rng = jax.random.split(rng, 2)
+
+        _ts = jax.random.randint(t_rng, (x0.shape[0],), 1, n_T)  # (B,)
+        sigma_weight_t = _sigma_weight_t[_ts]  # (B,)
+        sigma_weight_t = expand_to_broadcast(sigma_weight_t, x0, axis=1)
+        sigma_t = _sigma_t[_ts]
+        mu_t = (sigma_weight_t*x0+(1-sigma_weight_t)*x1)
+        bigsigma_t = _bigsigma_t[_ts]  # (B,)
+        bigsigma_t = expand_to_broadcast(bigsigma_t, mu_t, axis=1)
+
+        # q(X_t|X_0,X_1) = N(X_t;mu_t,bigsigma_t)
+        noise = jax.random.normal(n_rng, mu_t.shape)  # (B, d)
+        x_t = mu_t + noise*jnp.sqrt(bigsigma_t)
+        t = _ts/n_T
         return x_t, t, mu_t, sigma_t

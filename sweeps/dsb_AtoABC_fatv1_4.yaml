@@ -18,15 +18,17 @@ parameters:
   optim_bs:
     value: 256
   beta:
-    values: [0.05, 0.1, 0.2, 0.3, 0.4, 0.5]
+    values: [0.01, 0.05, 0.1, 0.2, 0.3, 0.4, 0.5]
   version:
     value: v1.4
   n_feat:
     value: 128
-  widthwise:
-    value: True
   ema_decay:
     values: [1., 0.99995,0.9999,0.9995,0.999,0.995]
+  fat:
+    value: 2
+  features_dir:
+    value: features_last3_AtoABC
 
   
 command:

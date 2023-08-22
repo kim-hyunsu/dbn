@@ -263,6 +263,7 @@ if __name__ == "__main__":
     AtoB = "AtoB" in dir
     AtoshB = "AtoshB" in dir
     AtoshABC = "AtoshABC" in dir
+    AtoABC = "AtoABC" in dir
     tag = ""
     if bezier:
         tag = "bezier"
@@ -280,6 +281,8 @@ if __name__ == "__main__":
         tag = "AtoshB"
     elif AtoshABC:
         tag = "AtoshABC"
+    elif AtoABC:
+        tag = "AtoABC"
     model_dir_list = model_list(
         data_name, model_style, shared_head, tag)
     config, ckpt, rng = get_ckpt_temp(

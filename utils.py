@@ -279,6 +279,12 @@ def model_list(data_name, model_style, shared_head=False, tag=""):
                 "./checkpoints/frn_sd27_shared3",
                 "./checkpoints/frn_sd29_shared3"
             ]
+        elif tag == "AtoABC":
+            return [
+                "./checkpoints/frn_sd2_be",
+                "./checkpoints/frn_sd3_be",
+                "./checkpoints/frn_sd5_be"
+            ]
         elif tag == "distA":
             return [
                 "./checkpoints/frn_sd23_distill_mean2",
@@ -331,7 +337,8 @@ logit_dir_list = [
     "features100_0p4mixup10", "features100_0p4mixup10_valid",
     "features_distA", "features_distB",
     "features_AtoB", "features_AtoshB",
-    "features_AtoshABC"
+    "features_AtoshABC",
+    "features_AtoABC"
 ]
 feature_dir_list = [
     "features_last", "features_last_fixed",
@@ -365,7 +372,8 @@ feature3_dir_list = [
     "features_last3_distA",
     "features_last3_distill_mean2",
     "features_last3_AtoB", "features_last3_AtoshB",
-    "features_last3_AtoshABC"
+    "features_last3_AtoshABC",
+    "features_last3_AtoABC"
 ]
 
 
@@ -456,7 +464,9 @@ def _get_meanstd(features_dir):
         "features_last3_AtoB",
         "features_last3_AtoshB",
         "features_last3_AtoshABC",
-        "features_AtoshABC"
+        "features_AtoshABC",
+        "features_AtoABC",
+        "features_last3_AtoABC"
     ]:
         mean = 0
         std = 1

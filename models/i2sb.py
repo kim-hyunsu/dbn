@@ -5,6 +5,7 @@ import jax.numpy as jnp
 import jax
 import math
 import numpy as np
+from einops import rearrange
 
 from utils import expand_to_broadcast, jprint
 from .bridge import Decoder as TinyDecoder
@@ -1368,6 +1369,108 @@ class TinyUNetModel(nn.Module):
             padding=(1, 1)
         )(x)
         return x
+
+
+class ClsUnet(nn.Module):
+    num_input: int
+    p_dim: int = 10
+    z_dim: Tuple[int] = (8, 8, 128)
+    ch: int = 128
+
+    conv:         nn.Module = partial(nn.Conv, use_bias=False,
+                                      kernel_init=jax.nn.initializers.he_normal(),
+                                      bias_init=jax.nn.initializers.zeros)
+    norm:         nn.Module = partial(nn.BatchNorm, momentum=0.9, epsilon=1e-5, use_bias=True, use_scale=True,
+                                      scale_init=jax.nn.initializers.ones,
+                                      bias_init=jax.nn.initializers.zeros)
+    relu:         Callable = nn.relu
+    fc:           nn.Module = partial(nn.Dense, use_bias=True,
+                                      kernel_init=jax.nn.initializers.he_normal(),
+                                      bias_init=jax.nn.initializers.zeros)
+
+    def convblock(self, x, p, t, **kwargs):
+        norm_kwargs = dict(
+            use_running_average=not kwargs["training"]
+        ) if isinstance(self.norm, nn.Batchnorm) else dict()
+        p = p[:, None, None, :]
+        t = t[:, None, None, :]
+        residual = x
+        x = self.conv(
+            features=self.ch,
+            kernel_size=(3, 3),
+            strides=(1, 1),
+            padding="SAME"
+        )(x+p+t)
+        x = self.norm(
+            **norm_kwargs
+        )(x)
+        x = self.relu(x)
+        x = self.conv(
+            features=self.ch,
+            kernel_size=(3, 3),
+            strides=(1, 1),
+            padding="SAME"
+        )(x+t)
+        x = self.norm(
+            **norm_kwargs
+        )(x)
+        x = self.relu(x+residual)
+        return x
+
+    def input_layer(self, x, p, **kwargs):
+        norm_kwargs = dict(
+            use_running_average=not kwargs["training"]
+        ) if isinstance(self.norm, nn.Batchnorm) else dict()
+        x = self.conv(
+            features=self.ch,
+            kernel_size=(3, 3),
+            strides=(1, 1),
+            padding="SAME"
+        )(x+p)
+        x = self.norm(
+            **norm_kwargs
+        )(x)
+        x = self.relu(x)
+
+        p = self.fc(
+            features=self.ch,
+        )(p)
+        p = self.norm(
+            **norm_kwargs
+        )(p)
+        p = self.relu(p)
+        return x, p
+
+    def output_layer(self, x, **kwargs):
+        norm_kwargs = dict(
+            use_running_average=not kwargs["training"]
+        ) if isinstance(self.norm, nn.Batchnorm) else dict()
+        p = jnp.mean(x, axis=(1, 2))
+        p = self.fc(
+            features=self.p_dim*self.num_input
+        )(p)
+        x = self.conv(
+            features=self.ch*self.num_input,
+            kernel_size=(3, 3),
+            strides=(1, 1),
+            padding="SAME"
+        )(x)
+        return x, p
+
+    @nn.compact
+    def __call__(self, x, p, t, **kwargs):
+        # x: features (8,8,128*num_input) (resnet32x2)
+        # p: logits 10*num_input (cifar10)
+        # t: time
+        t = timestep_embedding(t, self.ch)
+        t = self.fc(self.ch)(t)
+        t = self.silu(t)
+        t = self.fc(self.ch)(t)
+        x, p = self.input_layer(x, p, **kwargs)
+        x = self.convblock(x, p, t, **kwargs)
+        x, p = self.output_layer(x, **kwargs)
+
+        return x, p
 
 
 class Decoder(nn.Module):

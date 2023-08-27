@@ -180,6 +180,8 @@ class FlaxResNet(nn.Module):
     fc:           nn.Module = functools.partial(nn.Dense, use_bias=True,
                                                 kernel_init=jax.nn.initializers.he_normal(),
                                                 bias_init=jax.nn.initializers.zeros)
+    num_planes: int = 16
+    num_blocks: Tuple[int] = None
 
     @nn.compact
     def __call__(self, x, **kwargs):
@@ -205,8 +207,10 @@ class FlaxResNet(nn.Module):
         x = x / jnp.reshape(s.value, (1, 1, 1, -1))
 
         # specify block structure and widen factor...
-        num_planes = 16
-        num_blocks = [(self.depth - 2) // 6,] * 3
+        num_planes = self.num_planes
+        num_blocks = (
+            [(self.depth - 2) // 6,] * 3
+        ) if self.num_blocks is None else self.num_blocks
         widen_factor = self.widen_factor
 
         # define the first layer...

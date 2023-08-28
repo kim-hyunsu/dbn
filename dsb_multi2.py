@@ -2347,10 +2347,12 @@ def launch(config, print_fn):
         logitsB = normalize(_logitsB)
         logitsA = normalize(_logitsA)
         if config.multi > 1:
+            logitsB = [logitsB]
             logitsA = jnp.split(logitsA, config.multi, axis=-1)
         ema_params, ema_cparams, ema_bparams = state.ema_params
 
         f_real = jnp.split(logitsA, config.multi, axis=-1)
+
         def dsample(params):
             def apply(x_n, t_n, ctx, cfl):
                 params_dict = dict(params=ema_params)
@@ -2433,11 +2435,11 @@ def launch(config, print_fn):
         return None, metrics, (A, B, C, labels), None
 
     def step_acc_ref(state, batch):
-        _logitsB = batch["images"]  # the current mode
-        _logitsA = batch["labels"]  # mixture of other modes
+        logitsB = batch["images"]  # the current mode
+        logitsA = batch["labels"]  # mixture of other modes
         labels = batch["cls_labels"]
-        f_real = _logitsA
-        f_init = _logitsB
+        f_real = jnp.split(logitsA, config.multi, axis=-1)
+        f_init = [logitsB]
         (
             (ens_acc, ens_nll),
             (

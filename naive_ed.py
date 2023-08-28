@@ -224,10 +224,10 @@ def launch(config, print_fn):
             if config.ens_dist == "":
                 pass
             elif config.ens_dist == "naive":
-                logits = jnp.concatenate(
+                t_logits = jnp.concatenate(
                     [pred(t, logits=True) for t in teachers])
                 teacher_pred = jax.scipy.special.logsumexp(
-                    logits, axis=0) - np.log(ensemble_num)
+                    t_logits, axis=0) - np.log(ensemble_num)
                 probs = jnp.exp(predictions)
                 kd_loss = -2*jnp.sum(probs*teacher_pred, axis=-1)
                 kd_loss = jnp.sum(
@@ -235,10 +235,10 @@ def launch(config, print_fn):
                 a = config.dist_alpha
                 loss = (1-a)*loss + a*kd_loss
             elif config.ens_dist == "mean":
-                logits = jnp.concatenate(
+                t_logits = jnp.concatenate(
                     [pred(t, logits=True) for t in teachers])
                 tau = config.dist_temp
-                predict = jax.nn.log_softmax(t/tau, axis=-1)
+                predict = jax.nn.log_softmax(t_logits/tau, axis=-1)
                 teacher_probs = jnp.exp(predict)
                 predictions = jax.nn.log_softmax(logits/tau, axis=-1)
                 kd_loss = -jnp.sum(teacher_probs *
@@ -249,19 +249,17 @@ def launch(config, print_fn):
                 a = config.dist_alpha
                 loss = (1-a)*loss + a*kd_loss
             elif config.ens_dist == "mse":
-                logits0 = pred(teacher0, logits=True)
-                logits1 = pred(teacher1, logits=True)
-                mse0 = jnp.sum((logits-logits0)**2, axis=-1)
-                mse1 = jnp.sum((logits-logits1)**2, axis=-1)
-                kd_loss = 0.5*(mse0+mse1)
+                t_logits = jnp.concatenate(
+                    [pred(t, logits=True) for t in teachers])
+                mse = jnp.sum((logits[None, ...]-t_logits)**2, axis=-1)
+                kd_loss = mse.sum(0)/ensemble_num
                 kd_loss = jnp.sum(
                     jnp.where(batch["marker"], kd_loss, 0))/jnp.sum(batch["marker"])
                 a = config.dist_alpha
                 loss = (1-a)*loss + a*kd_loss
             elif config.ens_dist == "enslogit":
-                logits0 = pred(teacher0, logits=True)
-                logits1 = pred(teacher1, logits=True)
-                ens_logits = get_ens_logits([logits0, logits1], logitmean=0)
+                t_logits = [pred(t, logits=True) for t in teachers]
+                ens_logits = get_ens_logits(t_logits, logitmean=0)
                 tau = config.dist_temp
                 ens_pred = jnp.exp(jax.nn.log_softmax(ens_logits/tau, axis=-1))
                 predictions = jax.nn.log_softmax(logits/tau, axis=-1)

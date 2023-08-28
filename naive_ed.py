@@ -235,17 +235,15 @@ def launch(config, print_fn):
                 a = config.dist_alpha
                 loss = (1-a)*loss + a*kd_loss
             elif config.ens_dist == "mean":
-                logits0 = pred(teacher0, logits=True)
-                logits1 = pred(teacher1, logits=True)
+                logits = jnp.concatenate(
+                    [pred(t, logits=True) for t in teachers])
                 tau = config.dist_temp
-                pred0 = jax.nn.log_softmax(logits0/tau, axis=-1)
-                pred1 = jax.nn.log_softmax(logits1/tau, axis=-1)
-                teacher_probs0 = jnp.exp(pred0)
-                teacher_probs1 = jnp.exp(pred1)
+                predict = jax.nn.log_softmax(t/tau, axis=-1)
+                teacher_probs = jnp.exp(predict)
                 predictions = jax.nn.log_softmax(logits/tau, axis=-1)
-                kd_loss0 = -jnp.sum(teacher_probs0*predictions, axis=-1)
-                kd_loss1 = -jnp.sum(teacher_probs1*predictions, axis=-1)
-                kd_loss = 0.5*(kd_loss0+kd_loss1)
+                kd_loss = -jnp.sum(teacher_probs *
+                                   predictions[None, ...], axis=-1)
+                kd_loss = kd_loss.sum(0)/ensemble_num
                 kd_loss = tau**2*jnp.sum(
                     jnp.where(batch["marker"], kd_loss, 0))/jnp.sum(batch["marker"])
                 a = config.dist_alpha

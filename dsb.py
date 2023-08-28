@@ -181,7 +181,7 @@ def build_featureloaders(config, rng=None):
             valid_Asupples_list.append(valid_supples)
             test_Asupples_list.append(test_supples)
 
-    if config.fat:
+    if config.fat > 1:
         assert config.context is False
         for i in range(config.fat):
             putinB(0, 0)
@@ -221,7 +221,7 @@ def build_featureloaders(config, rng=None):
                 for i in tqdm(range(n_samples_each_Amode)):
                     putinA(mode_idx, i)
 
-    if config.fat > 0:
+    if config.fat > 1:
         if config.widthwise:
             merge = -2
         else:
@@ -523,7 +523,7 @@ def build_featureloaders(config, rng=None):
         test_conflicts = get_conflict(test_logitsB, test_logitsA)
 
     def get_tfpn(logitsB, logitsA, labels):
-        if "last" in dir:
+        if "last" in dir or "layer" in dir:
             dummy = jnp.zeros_like(labels)
             tfpn = dict(
                 tp=dummy,
@@ -1154,7 +1154,7 @@ def launch(config, print_fn):
         else:
             ctx_dim = (8, 8, 128)
     logit_dim = None
-    if config.fat > 0:
+    if config.fat > 1:
         if isinstance(x_dim, Tuple):
             logit_dim = x_dim
             h, w, d = x_dim
@@ -1444,7 +1444,7 @@ def launch(config, print_fn):
         )
     clsB_rng, clsA_rng, cor_rng = jax.random.split(init_rng, 3)
 
-    if config.fat:
+    if config.fat > 1:
         h, w, z = x_dim
         if config.widthwise:
             input_dim = (h, w//config.fat, z)
@@ -1537,6 +1537,7 @@ def launch(config, print_fn):
     AtoshB = "AtoshB" in config.features_dir
     AtoshABC = "AtoshABC" in config.features_dir
     AtoABC = "AtoABC" in config.features_dir
+    layer2stride1_shared = "layer2stride1_shared" in dir
     tag = ""
     if bezier:
         tag = "bezier"
@@ -1556,6 +1557,8 @@ def launch(config, print_fn):
         tag = "AtoshABC"
     elif AtoABC:
         tag = "AtoABC"
+    elif layer2stride1_shared:
+        tag = "layer2stride1_shared"
 
     if config.diffcls:
         dirname = config.contexts_dir
@@ -1573,18 +1576,8 @@ def launch(config, print_fn):
             variables_clsA_copy = variables_clsA.copy(FrozenDict({}))
             variables_clsA_list.append(load_classifier(
                 variables_clsA_copy, model_dir_list[i], sgd_state, dirname=dirname))
-    # if AtoshB:
-    #     for k, v in variables_clsA["params"].items():
-    #         if "FilterResponseNorm" in k:
-    #             a = v["gamma"]
-    #             b = variables_clsB["params"][k]["gamma"]
-    #         else:
-    #             a = v["kernel"]
-    #             b = variables_clsB["params"][k]["kernel"]
-    #         assert jnp.all(a == b)
 
     if config.diffcls:
-        # @partial(jax.jit, static_argnums=(0,))
         def diffcls_sample(f, rng, x0, ctx, cfl):
             shape = x0.shape
             batch_size = shape[0]
@@ -1810,7 +1803,7 @@ def launch(config, print_fn):
                 feat = jax.lax.stop_gradient(feat)
             if config.corrector > 0:
                 feat = correct_feature(cparams, feat)
-        if "last" in config.features_dir or feat.shape[-1] >= 128:
+        if "last" in config.features_dir or "layer" in config.features_dir or feat.shape[-1] >= 128:
             if config.fat > 1:
                 logit_list = []
                 for var, f in zip(variables_clsA_list, feat):
@@ -1876,12 +1869,12 @@ def launch(config, print_fn):
                 acc = jnp.sum(jnp.where(marker, acc, jnp.zeros_like(acc)))
                 nll = jnp.sum(jnp.where(marker, nll, jnp.zeros_like(nll)))
                 return preds, (acc, nll)
-            if config.fat == 0:
+            if config.fat <= 1:
                 preds, (acc, nll) = accnll(logits)
                 avg_preds += preds
                 each_acc.append((acc, nll))
             else:
-                for valid, l in zip(filter,logits):
+                for valid, l in zip(filter, logits):
                     if valid:
                         preds, (acc, nll) = accnll(l)
                         avg_preds += preds
@@ -1914,7 +1907,7 @@ def launch(config, print_fn):
                     predictions, labels, log_input=True, reduction="none")
                 acc = jnp.sum(jnp.where(marker, acc, jnp.zeros_like(acc)))
                 return preds, acc
-            if config.fat == 0:
+            if config.fat <= 1:
                 preds, acc = accnll(logits)
                 avg_preds += preds
                 each_acc.append(acc)
@@ -1948,7 +1941,7 @@ def launch(config, print_fn):
                     predictions, labels, top, log_input=True, reduction="none")
                 acc = jnp.sum(jnp.where(marker, acc, jnp.zeros_like(acc)))
                 return preds, acc
-            if config.fat == 0:
+            if config.fat <= 1:
                 preds, acc = accnll(logits)
                 avg_preds += preds
                 each_acc.append(acc)
@@ -1986,7 +1979,7 @@ def launch(config, print_fn):
                     tfpn_acc[k] = jnp.sum(
                         jnp.where(v, acc, jnp.zeros_like(acc)))
                 return preds, tfpn_acc
-            if config.fat == 0:
+            if config.fat <= 1:
                 preds, tfpn_acc = accnll(logits)
                 avg_preds += preds
                 each_acc.append(tfpn_acc)
@@ -2021,7 +2014,7 @@ def launch(config, print_fn):
             loss = jnp.where(marker, loss, 0)
             return loss
 
-        if config.fat == 0:
+        if config.fat <= 1:
             loss = celoss(logits)
         else:
             loss = 0
@@ -2044,7 +2037,7 @@ def launch(config, print_fn):
             loss = -jnp.sum(soft_labels*soft_preds, axis=-1)
             loss = jnp.where(marker, loss, 0)
             return loss
-        if config.fat == 0:
+        if config.fat <= 1:
             loss = deloss(logitsA_eps, logitsA)
         else:
             loss = 0
@@ -2066,7 +2059,7 @@ def launch(config, print_fn):
                     preds = jnp.exp(jax.nn.log_softmax(logits, axis=-1))
                 return preds
 
-            if config.fat == 0:
+            if config.fat <= 1:
                 ens_preds += accnll(logits)
                 count += 1
             else:
@@ -2110,7 +2103,7 @@ def launch(config, print_fn):
             kld = jnp.sum(integrand, axis=-1)
             kld = jnp.where(marker, kld, 0)
             return jnp.sum(kld)
-        if config.fat == 0:
+        if config.fat <= 1:
             kld = accnll(logit_tar, logit_ref)
         else:
             kld = 0
@@ -2137,7 +2130,7 @@ def launch(config, print_fn):
         logp = jnp.log(p)
         integrand = q*(logq-logp)
         kld = jnp.sum(integrand, axis=-1)
-        if config.fat > 0:
+        if config.fat > 1:
             kld = jnp.mean(kld, axis=0)
         kld = jnp.where(marker, kld, 0)
         return jnp.sum(kld)
@@ -2869,7 +2862,8 @@ def launch(config, print_fn):
             (
                 (ens_acc_ab1, ens_nll_ab1), _
             ) = ensemble_accuracy(
-                [f_init, f_gen], labels, batch["marker"], ["B", "C"], ema_cparams, ema_bparams,
+                [f_init, f_gen], labels, batch["marker"], [
+                    "B", "C"], ema_cparams, ema_bparams,
                 filter=ab1_filter)
             b1b2_filter = [False]*(config.fat+1)
             b1b2_filter[1] = True
@@ -2877,7 +2871,8 @@ def launch(config, print_fn):
             (
                 (ens_acc_b1b2, ens_nll_b1b2), _
             ) = ensemble_accuracy(
-                [f_init, f_gen], labels, batch["marker"], ["B", "C"], ema_cparams, ema_bparams,
+                [f_init, f_gen], labels, batch["marker"], [
+                    "B", "C"], ema_cparams, ema_bparams,
                 filter=b1b2_filter)
         # (
         #     ens_t2acc, (b_t2acc, a_t2acc)
@@ -3604,6 +3599,8 @@ def main():
     # Fat DSB (A+A -> B1+B2)
     parser.add_argument("--fat", default=0, type=int)
     parser.add_argument("--widthwise", action="store_true")
+    # Multi DSB (A->B1, A->B2)
+    parser.add_argument("--multi", default=1, type=int)
     # ---------------------------------------------------------------------------------------
     # networks
     # ---------------------------------------------------------------------------------------

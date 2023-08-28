@@ -285,6 +285,18 @@ def model_list(data_name, model_style, shared_head=False, tag=""):
                 "./checkpoints/frn_sd3_be",
                 "./checkpoints/frn_sd5_be"
             ]
+        elif tag == "layer2stride1_shared":
+            return [
+                "./checkpoints/frn_sd2_be",
+                "./checkpoints/frn_sd23_layer2stride1",
+                "./checkpoints/frn_sd233_layer2stride1"
+            ]
+        elif tag == "layer2stride1_nonshared":
+            return [
+                "./checkpoints/frn_sd2_be",
+                "./checkpoints/frn_sd3_be",
+                "./checkpoints/frn_sd5_be"
+            ]
         elif tag == "distA":
             return [
                 "./checkpoints/frn_sd23_distill_mean2",
@@ -374,6 +386,9 @@ feature3_dir_list = [
     "features_last3_AtoB", "features_last3_AtoshB",
     "features_last3_AtoshABC",
     "features_last3_AtoABC"
+]
+layer2stride1_dir_list = [
+    "features_layer2stride1_shared"
 ]
 
 
@@ -466,7 +481,8 @@ def _get_meanstd(features_dir):
         "features_last3_AtoshABC",
         "features_AtoshABC",
         "features_AtoABC",
-        "features_last3_AtoABC"
+        "features_last3_AtoABC",
+        "features_layer2stride1_shared",
     ]:
         mean = 0
         std = 1

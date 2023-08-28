@@ -16,7 +16,7 @@ import defaults_sghmc as defaults
 import os
 import numpy as np
 from utils import expand_to_broadcast, get_info_in_dir, normalize, model_list, jprint
-from utils import logit_dir_list, feature_dir_list, feature2_dir_list, feature3_dir_list
+from utils import logit_dir_list, feature_dir_list, feature2_dir_list, feature3_dir_list, layer2stride1_dir_list
 from flax.training import common_utils
 import sgd_trainstate
 
@@ -264,6 +264,7 @@ if __name__ == "__main__":
     AtoshB = "AtoshB" in dir
     AtoshABC = "AtoshABC" in dir
     AtoABC = "AtoABC" in dir
+    layer2stride1_shared = "layer2stride1_shared" in dir
     tag = ""
     if bezier:
         tag = "bezier"
@@ -283,6 +284,8 @@ if __name__ == "__main__":
         tag = "AtoshABC"
     elif AtoABC:
         tag = "AtoABC"
+    elif layer2stride1_shared:
+        tag = "layer2stride1_shared"
     model_dir_list = model_list(
         data_name, model_style, shared_head, tag)
     config, ckpt, rng = get_ckpt_temp(
@@ -321,6 +324,9 @@ if __name__ == "__main__":
     elif dir in feature3_dir_list:
         p_get_logits = jax.pmap(
             partial(get_logits, feature_name="feature.layer3stride2"))
+    elif dir in layer2stride1_dir_list:
+        p_get_logits = jax.pmap(
+            partial(get_logits, feature_name="feature.layer2stride1"))
     else:
         raise Exception("Invalid directory for saving features")
 

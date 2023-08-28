@@ -1,4 +1,5 @@
 from functools import partial
+from this import d
 from typing import Any, Callable, Sequence, Dict, Tuple
 import flax.linen as nn
 import jax.numpy as jnp
@@ -1664,8 +1665,9 @@ class DiffusionClassifier(nn.Module):
 
 class DiffusionBridgeNetwork(nn.Module):
     base_net: nn.Module
-    score_net: nn.Module
-    cls_net: nn.Module
+    score_net: Sequence[nn.Module]
+    cls_net: Sequence[nn.Module]
+    crt_net: Sequence[nn.Module]
     dsb_stats: dict
     fat: int
 
@@ -1674,36 +1676,40 @@ class DiffusionBridgeNetwork(nn.Module):
         self.score = self.score_net()
         if self.cls_net is not None:
             self.cls = self.cls_net()
+        if self.crt_net is not None:
+            self.crt = self.crt_net()
 
-    def encode(self, x, params=None, batch_stats=None, **kwargs):
-        if params is not None:
-            params_dict = dict(params=params)
-            if batch_stats is not None:
-                params_dict["batch_stats"] = batch_stats
+    def encode(self, x, params_dict=None, **kwargs):
+        if params_dict is not None:
             return self.base.apply(params_dict, x, **kwargs)
         return self.base(x, **kwargs)
 
-    def classify(self, z, params=None, batch_stats=None, **kwargs):
-        if params is not None:
-            params_dict = dict(params=params)
-            if batch_stats is not None:
-                params_dict["batch_stats"] = batch_stats
+    def correct(self, z, **kwargs):
+        if self.crt_net is None:
+            return z
+        return self.crt(z)
+
+    def classify(self, z, params_dict=None, **kwargs):
+        if params_dict is not None:
             return self.cls.apply(params_dict, z, **kwargs)
         return self.cls(z, **kwargs)
 
     def __call__(self, rng, z0, x1, base_params=None, cls_params=None, **kwargs):
         z1 = self.encode(x1, base_params, **kwargs)
         if self.fat > 1:
-            z1 = jnp.repeat(z1, self.fat, axis=-1)
+            reps = [1]*len(z1.shape[:-1]) + [self.fat]
+            z1 = jnp.tile(z1, reps)
         z_t, t, mu_t, sigma_t = self.forward(rng, z0, z1)
         eps = self.score(z_t, t, **kwargs)
         _sigma_t = expand_to_broadcast(sigma_t, z_t, axis=1)
         z0eps = z_t - _sigma_t*eps
         if self.fat > 1:
             z0eps = jnp.split(z0eps, self.fat, axis=-1)
+            z0eps = [self.correct(z) for z in z0eps]
             logits0eps = [self.classify(z, cls_params, **kwargs)
                           for z in z0eps]
         else:
+            z0eps = self.correct(z0eps)
             logits0eps = [self.classify(z0eps, cls_params, **kwargs)]
         return (eps, z_t, t, mu_t, sigma_t), logits0eps
 
@@ -1728,3 +1734,52 @@ class DiffusionBridgeNetwork(nn.Module):
         x_t = mu_t + noise*jnp.sqrt(bigsigma_t)
         t = _ts/n_T
         return x_t, t, mu_t, sigma_t
+
+    def sample(self, rng, sampler, x):
+        zB = self.encode(x, training=False)
+        if self.fat > 1:
+            reps = [1]*len(zB.shape[:-1]) + [self.fat]
+            zB = jnp.tile(zB, reps)
+        zC = sampler(
+            partial(self.score, training=False), rng, zB)
+        if self.fat > 1:
+            zC = jnp.split(zC, self.fat, axis=-1)
+            zC = [self.correct(z) for z in zC]
+            logitsC = [self.classify(z, training=False) for z in zC]
+        else:
+            zC = self.correct(zC)
+            logitsC = [self.classify(zC, training=False)]
+        return logitsC
+
+
+class DoubleDSB(nn.Module):
+    score_net1: nn.Module
+    score_net2: nn.Module
+    cls_net1: nn.Module
+    cls_net2: nn.Module
+    crt_net1: nn.Module
+    crt_net2: nn.Module
+    dsb_state: dict
+
+    def setup(self):
+        self.score1 = self.score_net1()
+        self.score2 = self.score_net2()
+        self.cls1 = self.cls_net1()
+        self.cls2 = self.cls_net2()
+        self.crt1 = self.crt_net1()
+        self.crt2 = self.crt_net2()
+
+    def correct(self, z_list, **kwargs):
+        assert isinstance(z_list, list)
+        z1 = self.crt1(z_list[0], **kwargs)
+        z2 = self.crt2(z_list[1], **kwargs)
+
+        return [z1, z2]
+
+    def classify(self, z_list, **kwargs):
+        assert isinstance(z_list, list)
+        p1 = self.cls1(z_list[0], **kwargs)
+        p2 = self.cls2(z_list[1], **kwargs)
+
+    def __call__(self, rng, z0, z1, **kwargs):
+        pass

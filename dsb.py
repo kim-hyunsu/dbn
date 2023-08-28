@@ -1537,7 +1537,7 @@ def launch(config, print_fn):
     AtoshB = "AtoshB" in config.features_dir
     AtoshABC = "AtoshABC" in config.features_dir
     AtoABC = "AtoABC" in config.features_dir
-    layer2stride1_shared = "layer2stride1_shared" in dir
+    layer2stride1_shared = "layer2stride1_shared" in config.features_dir
     tag = ""
     if bezier:
         tag = "bezier"

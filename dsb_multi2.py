@@ -183,9 +183,10 @@ def build_featureloaders(config, rng=None):
 
     if config.multi:
         assert config.context is False
+        putinB(0, 0)
         for i in range(config.multi):
-            putinB(0, 0)
             putinA(i+1, 0)  # mode i
+        train_lambdas_checker = train_lambdas_checker[:1]
     elif config.diffcls:
         if config.checker:
             assert config.diffcls == 1
@@ -1648,16 +1649,16 @@ def launch(config, print_fn):
     state = TrainState.create(
         apply_fn=score_func.apply,
         params=(
-            (variables["params"] for variables in variables_list),
-            (variables_cor["params"] for _ in range(config.multi)),
-            ((variables_clsA["params"] if config.clsA else variables_clsB["params"])
-             for _ in range(config.multi))
+            [variables["params"] for variables in variables_list],
+            [variables_cor["params"] for _ in range(config.multi)],
+            [(variables_clsA["params"] if config.clsA else variables_clsB["params"])
+             for _ in range(config.multi)]
         ),
         ema_params=(
-            (variables["params"] for variables in variables_list),
-            (variables_cor["params"] for _ in range(config.multi)),
-            ((variables_clsA["params"] if config.clsA else variables_clsB["params"])
-             for _ in range(config.multi))
+            [variables["params"] for variables in variables_list],
+            [variables_cor["params"] for _ in range(config.multi)],
+            [(variables_clsA["params"] if config.clsA else variables_clsB["params"])
+             for _ in range(config.multi)]
         ),
         tx=optimizer,
         batch_stats=variables_list[0].get("batch_stats"),
@@ -1707,22 +1708,40 @@ def launch(config, print_fn):
     def get_logits(feat, mode, cparams=None, bparams=None, redundant=False):
         if mode.lower() == "c":
             if config.corrector > 0:
-                feat = [correct_feature(cp, f) for cp, f in zip(cparams, feat)]
+                if isinstance(feat, list):
+                    feat = [correct_feature(cp, f)
+                            for cp, f in zip(cparams, feat)]
+                else:
+                    feat = correct_feature(cparams, feat)
         if "last" in config.features_dir or feat[0].shape[-1] >= 128:
-            feat_list = []
-            for bp, f in zip(bparams, feat):
+            if isinstance(feat, list):
+                feat_list = []
+                for i, f in enumerate(feat):
+                    if mode.lower() == "a" or mode.lower() == "c":
+                        # if config.bezier and mode.lower() == "c":
+                        if mode.lower() == "c":
+                            variables_cls_params = bparams[i]
+                        else:
+                            variables_cls_params = variables_clsA["params"]
+                    elif mode.lower() == "b":
+                        variables_cls_params = variables_clsB["params"]
+                    logits = classifier.apply(
+                        {"params": variables_cls_params}, f
+                    )
+                    feat_list.append(logits)
+                logits = feat_list
+            else:
                 if mode.lower() == "a" or mode.lower() == "c":
                     # if config.bezier and mode.lower() == "c":
                     if mode.lower() == "c":
-                        variables_cls_params = bp
+                        variables_cls_params = bparams
                     else:
                         variables_cls_params = variables_clsA["params"]
                 elif mode.lower() == "b":
                     variables_cls_params = variables_clsB["params"]
                 logits = classifier.apply(
-                    {"params": variables_cls_params}, f
+                    {"params": variables_cls_params}, feat
                 )
-                feat_list.append(logits)
         else:
             logits = feat
         return logits
@@ -2157,9 +2176,9 @@ def launch(config, print_fn):
             total_rglr += coef*rglr
         return total_rglr
 
-    def dict_mean(*dicts):
+    def dict_mean(dicts):
         new_dict = OrderedDict()
-        count = list(dicts)
+        count = len(dicts)
         for d in dicts:
             for k, v in d.items():
                 new_v = new_dict.get(k)
@@ -2302,7 +2321,7 @@ def launch(config, print_fn):
         logitsB = normalize(logitsB)
         logitsA = normalize(logitsA)
         if config.multi > 1:
-            logitsA_list = jnp.split(logitsA, axis=-1)
+            logitsA_list = jnp.split(logitsA, config.multi, axis=-1)
 
         def func(ema_params, logitsA):
             ema_params, _, ema_bparams = ema_params
@@ -2330,6 +2349,7 @@ def launch(config, print_fn):
             # collect metrics
             metrics = OrderedDict({"loss": loss*count, "count": count})
             metrics = jax.lax.psum(metrics, axis_name="batch")
+            return metrics
 
         if config.multi > 1:
             params, cparams, bparams = state.ema_params
@@ -2354,11 +2374,9 @@ def launch(config, print_fn):
             logitsA = jnp.split(logitsA, config.multi, axis=-1)
         ema_params, ema_cparams, ema_bparams = state.ema_params
 
-        f_real = jnp.split(logitsA, config.multi, axis=-1)
-
         def dsample(params):
             def apply(x_n, t_n, ctx, cfl):
-                params_dict = dict(params=ema_params)
+                params_dict = dict(params=params)
                 rngs_dict = dict(dropout=state.rng)
                 if state.batch_stats is not None:
                     params_dict["batch_stats"] = state.batch_stats
@@ -2406,9 +2424,9 @@ def launch(config, print_fn):
         rkld = kl_divergence(
             f_gen, f_real, batch["marker"], "C", "A", ema_cparams, ema_bparams)
         skld = kl_divergence(
-            f_gen, f_init, batch["marker"], "C", "B", ema_cparams, ema_bparams)
+            f_gen, f_init*len(f_gen), batch["marker"], "C", "B", ema_cparams, ema_bparams)
         rskld = kl_divergence(
-            f_init, f_gen, batch["marker"], "B", "C", ema_cparams, ema_bparams)
+            f_init*len(f_gen), f_gen, batch["marker"], "B", "C", ema_cparams, ema_bparams)
 
         metrics = OrderedDict({
             "acc": a_acc, "nll": a_nll,
@@ -2434,8 +2452,9 @@ def launch(config, print_fn):
         logitsB = batch["images"]  # the current mode
         logitsA = batch["labels"]  # mixture of other modes
         labels = batch["cls_labels"]
-        f_real = jnp.split(logitsA, config.multi, axis=-1)
-        f_init = [logitsB]
+        if config.multi > 1:
+            f_real = jnp.split(logitsA, config.multi, axis=-1)
+            f_init = [logitsB]
         (
             (ens_acc, ens_nll),
             (
@@ -2460,8 +2479,10 @@ def launch(config, print_fn):
                  fn=batch["fn"], tn=batch["tn"]),
             ["B", "A"]
         )
-        rkld = kl_divergence(f_init, f_real, batch["marker"], "B", "A")
-        kld = kl_divergence(f_real, f_init, batch["marker"], "A", "B")
+        rkld = kl_divergence(f_init*len(f_real), f_real,
+                             batch["marker"], "B", "A")
+        kld = kl_divergence(f_real, f_init*len(f_real),
+                            batch["marker"], "A", "B")
         metrics = OrderedDict({
             "acc_ref": a_acc, "nll_ref": a_nll,
             "acc_from": b_acc, "nll_from": b_nll,
@@ -2721,7 +2742,8 @@ def launch(config, print_fn):
     wandb.define_metric("val/ens_acc", summary="max")
     wandb.define_metric("val/ens_nll", summary="min")
     wandb.run.summary["params"] = (
-        sum(x.size for x in jax.tree_util.tree_leaves(variables["params"]))
+        sum(x.size for x in jax.tree_util.tree_leaves(
+            variables_list[0]["params"]))
         + sum(x.size for x in jax.tree_util.tree_leaves(variables_clsB["params"]))
     )
     # params_flatten = flax.traverse_util.flatten_dict(variables_clsB["params"])

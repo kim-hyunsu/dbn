@@ -1,0 +1,12 @@
+data_name: TinyImageNet200_x32
+model_depth: 34
+model_width: 1
+model_planes: 64
+model_blocks: 3,4,6,3
+model_style: FRN-Swish
+model_name: FlaxResNet
+optim_bs: 256
+optim_ne: 200
+optim_lr: 0.1
+optim_weight_decay: 0.0005
+optim: sgd

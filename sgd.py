@@ -56,7 +56,11 @@ def launch(config, print_fn):
             dtype=model_dtype,
             pixel_mean=defaults.PIXEL_MEAN,
             pixel_std=defaults.PIXEL_STD,
-            num_classes=dataloaders['num_classes'])
+            num_classes=dataloaders['num_classes'],
+            num_planes=config.model_planes,
+            num_blocks=((int(b) for b in config.model_blocks.split(
+                ",")) if config.model_blocks is not None else None)
+        )
         _base = partial(
             FlaxResNetBase,
             depth=config.model_depth,
@@ -66,6 +70,7 @@ def launch(config, print_fn):
             pixel_std=defaults.PIXEL_STD,
             num_classes=dataloaders['num_classes'],
             out=config.shared_level)
+
     if config.model_style == 'BN-ReLU':
         model = _ResNet()
         base = _base()
@@ -648,6 +653,8 @@ def main():
         with open(config_f, 'r') as f:
             arg_defaults = yaml.safe_load(f)
 
+    parser.add_argument("--model_planes", default=16, type=int)
+    parser.add_argument("--model_blocks", default=None, type=str)
     parser.add_argument('--optim_ne', default=300, type=int,
                         help='the number of training epochs (default: 200)')
     parser.add_argument('--optim_lr', default=0.005, type=float,

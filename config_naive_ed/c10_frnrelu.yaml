@@ -4,11 +4,15 @@ model_width: 2
 model_style: FRN-Swish
 model_name: FlaxResNet
 optim_bs: 256
-optim_ne: 200
+optim_ne: 250
 optim_lr: 0.1
 optim_weight_decay: 0.001
 optim: sgd
+ens_dist: mean
+dist_alpha: 0.1
+dist_temp: 4
 teachers:
-  - "./checkpoints/frn10_sd2_be"
-  - "./checkpoints/frn10_sd3_be"
-  - "./checkpoints/frn10_sd5_be"
+  - "./checkpoints/frn_sd2_be"
+  - "./checkpoints/frn_sd3_be"
+  - "./checkpoints/frn_sd5_be"
+  - "./checkpoints/frn_sd7_be"

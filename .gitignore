@@ -4,9 +4,8 @@ checkpoints/*
 cifar/
 /cifar
 cifar
-data/
-/data
-data
+data/CIFAR*
+data/T*
 deprecated/
 /deprecated
 deprecated

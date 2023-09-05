@@ -865,7 +865,7 @@ class TrainState(train_state.TrainState):
         kwargs["training"] = training
         return mu_t, sigma_t, jnp.sqrt(bigsigma_t), kwargs
 
-    def sample(self, rng, apply, x0, ctx, cfl, stats, clock=False):
+    def sample(self, rng, apply, x0, ctx, cfl, stats, clock=False, cum=False, T=None):
         shape = x0.shape
         batch_size = shape[0]
         _sigma_t = stats["sigma_t"]
@@ -876,6 +876,8 @@ class TrainState(train_state.TrainState):
         h_arr = jax.random.normal(rng, (len(_sigma_t), *shape))
         h_arr = h_arr.at[0].set(0)
         std_arr = jnp.sqrt(_alpos_weight_t*_sigma_t_square)
+        if T is None:
+            T = self.T
 
         @jax.jit
         def body_fn(n, val):
@@ -904,6 +906,14 @@ class TrainState(train_state.TrainState):
             return x_n
         if clock:
             return f
+
+        if cum:
+            x = x0
+            x_stack = []
+            for i in range(T):
+                x = body_fn(i, x)
+                x_stack.append(x)
+            return jnp.stack(x_stack)
 
         return f()
 
@@ -1795,6 +1805,21 @@ def launch(config, print_fn):
             each_acc = (each_acc[0], each_acc[-1])
         return (acc, nll), each_acc
 
+    def accuracy(f_list, labels, marker, mode, cparams=None, bparams=None):
+        assert not isinstance(mode, list)
+        logits = get_logits(f_list, mode, cparams, bparams)
+        accnll = []
+        for l in logits:
+            prediction = jax.nn.log_softmax(l, axis=-1)
+            acc = evaluate_acc(
+                prediction, labels, log_input=True, reduction="none")
+            nll = evaluate_nll(
+                prediction, labels, log_input=True, reduction='none')
+            acc = jnp.sum(jnp.where(marker, acc, jnp.zeros_like(acc)))
+            nll = jnp.sum(jnp.where(marker, nll, jnp.zeros_like(nll)))
+            accnll.append((acc, nll))
+        return accnll
+
     def ensemble_top2accuracy(f_list, labels, marker, mode, cparams=None, bparams=None):
         avg_preds = 0
         each_acc = []
@@ -2385,11 +2410,34 @@ def launch(config, print_fn):
                     rngs=rngs_dict, training=False)
                 return output
             f_gen = state.sample(
-                state.rng, apply, logitsB, None, None, dsb_stats)
+                state.rng, apply, logitsB[0], None, None, dsb_stats, cum=config.print_diffusion, T=config.T)
             return f_gen
         f_gen = [dsample(p) for p in ema_params]
         f_real = logitsA
         f_init = logitsB
+
+        if config.print_diffusion:
+            f_temp = f_gen[0]
+            f_gen = [gen[-1] for gen in f_gen]
+            q0 = f_init[0]
+            q1 = f_temp[config.T//4-1]
+            q2 = f_temp[config.T*2//4-1]
+            q3 = f_temp[config.T*3//4-1]
+            q4 = f_temp[config.T-1]
+            q5 = f_real[0]
+            l0 = get_logits(q0, "B")
+            l1 = get_logits(q1, "C", ema_cparams[0], ema_bparams[0])
+            l2 = get_logits(q2, "C", ema_cparams[0], ema_bparams[0])
+            l3 = get_logits(q3, "C", ema_cparams[0], ema_bparams[0])
+            l4 = get_logits(q4, "C", ema_cparams[0], ema_bparams[0])
+            l5 = get_logits(q5, "A")
+            f_all = (
+                jnp.stack([q0, q1, q2, q3, q4, q5]),
+                jnp.stack([jax.nn.softmax(l, axis=-1)
+                          for l in [l0, l1, l2, l3, l4, l5]])
+            )
+        else:
+            f_all = None
 
         (
             (ens_acc, ens_nll),
@@ -2440,13 +2488,16 @@ def launch(config, print_fn):
             metrics["ens_nll_ab1"] = ens_nll_ab1
             metrics["ens_acc_b1b2"] = ens_acc_b1b2
             metrics["ens_nll_b1b2"] = ens_nll_b1b2
+            for i, (acc, nll) in enumerate(accuracy(f_gen, labels, batch["marker"], "C", ema_cparams, ema_bparams)):
+                metrics[f"acc{i+1}"] = acc
+                metrics[f"nll{i+1}"] = nll
         metrics = jax.lax.psum(metrics, axis_name='batch')
 
         C = get_logits(f_gen, "C", ema_cparams, ema_bparams)
         A = get_logits(f_real, "A", ema_cparams, ema_bparams)
         B = get_logits(f_init, "B", ema_cparams, ema_bparams)
 
-        return None, metrics, (A, B, C, labels), None
+        return f_all, metrics, (A, B, C, labels), None
 
     def step_acc_ref(state, batch):
         logitsB = batch["images"]  # the current mode
@@ -2462,23 +2513,6 @@ def launch(config, print_fn):
             )
         ) = ensemble_accuracy(
             [f_init, f_real], labels, batch["marker"], ["B", "A"])
-        (
-            ens_t2acc, (b_t2acc, a_t2acc)
-        ) = ensemble_top2accuracy(
-            [f_init, f_real], labels, batch["marker"], ["B", "A"])
-        (
-            ens_t5acc, (b_t5acc, a_t5acc)
-        ) = ensemble_topNaccuracy(
-            5, [f_init, f_real], labels, batch["marker"], ["B", "A"]
-        )
-        (
-            ens_tfpnacc, (b_tfpnacc, a_tfpnacc)
-        ) = ensemble_tfpn_accuracy(
-            [f_init, f_real], labels, batch["marker"],
-            dict(tp=batch["tp"], fp=batch["fp"],
-                 fn=batch["fn"], tn=batch["tn"]),
-            ["B", "A"]
-        )
         rkld = kl_divergence(f_init*len(f_real), f_real,
                              batch["marker"], "B", "A")
         kld = kl_divergence(f_real, f_init*len(f_real),
@@ -2486,17 +2520,13 @@ def launch(config, print_fn):
         metrics = OrderedDict({
             "acc_ref": a_acc, "nll_ref": a_nll,
             "acc_from": b_acc, "nll_from": b_nll,
-            "t2acc_ref": a_t2acc, "t2acc_from": b_t2acc,
-            "t5acc_ref": a_t5acc, "t5acc_from": b_t5acc,
             "ens_acc_ref": ens_acc, "ens_nll_ref": ens_nll,
-            "ens_t2acc_ref": ens_t2acc,
-            "ens_t5acc_ref": ens_t5acc,
             "kld_ref": kld, "rkld_ref": rkld,
-            "TPacc_ref": a_tfpnacc["tp"],
-            "FPacc_ref": a_tfpnacc["fp"],
-            "FNacc_ref": a_tfpnacc["fn"],
-            "TNacc_ref": a_tfpnacc["tn"],
         })
+        if config.multi > 1:
+            for i, (acc, nll) in enumerate(accuracy(f_real, labels, batch["marker"], "A")):
+                metrics[f"acc{i+1}_ref"] = acc
+                metrics[f"nll{i+1}_ref"] = nll
         metrics = jax.lax.psum(metrics, axis_name='batch')
         return metrics
 
@@ -2694,6 +2724,25 @@ def launch(config, print_fn):
         plot(save_maskAB, "AB")
         plot(save_mask_, "_")
 
+    def choose_what_to_print(f_all, print_bin):
+        prev_score, prev_pq = print_bin
+        (q, p) = f_all
+        # p (pmap, time, batch, D)
+        q = rearrange(q, "p t b h w d -> t (p b) h w d")
+        p = rearrange(p, "p t b d -> t (p b) d")
+        new_score = - ((p[0]-p[-1])**2).sum(1)
+        new_score_idx = jnp.argmin(new_score)
+        if jnp.any(prev_score > new_score[new_score_idx]):
+            q = q[:, new_score_idx, 0, 0, :]
+            p = p[:, new_score_idx, :]
+            new_score = new_score[new_score_idx]
+            new_pq = p
+        else:
+            new_score = prev_score
+            new_pq = prev_pq
+
+        return new_score, new_pq
+
     cross_replica_mean = jax.pmap(lambda x: jax.lax.pmean(x, 'x'), 'x')
     p_step_train = jax.pmap(
         partial(step_train, config=config), axis_name="batch")
@@ -2838,8 +2887,7 @@ def launch(config, print_fn):
                     save_samples(state, batch, epoch_idx, train=False)
             else:
                 if (epoch_idx+1) % 1 == 0:
-                    z_all, acc_metrics, _, _ = p_step_sample(state, batch)
-                    f_init, f_gen, f_real = jnp.split(z_all, 3, axis=-1)
+                    _, acc_metrics, _, _ = p_step_sample(state, batch)
                     metrics.update(acc_metrics)
                     assert jnp.all(metrics["count"] == acc_metrics["count"])
 
@@ -2883,10 +2931,12 @@ def launch(config, print_fn):
             test_metrics = []
             test_loader = dataloaders["tst_featureloader"](rng=None)
             test_loader = jax_utils.prefetch_to_device(test_loader, size=2)
+            print_bin = (float("inf"), None)
             for batch_idx, batch in enumerate(test_loader, start=1):
                 rng = jax.random.fold_in(rng, batch_idx)
                 state = state.replace(rng=jax_utils.replicate(rng))
-                _, metrics, examples, sexamples = p_step_sample(state, batch)
+                f_all, metrics, examples, sexamples = p_step_sample(
+                    state, batch)
                 if best_acc == 0:
                     acc_ref_metrics = p_step_acc_ref(state, batch)
                     metrics.update(acc_ref_metrics)
@@ -2911,7 +2961,14 @@ def launch(config, print_fn):
                     elif config.save_train_cls:
                         A, B, C, labels = save_examples
                         save_cls(A, B, C, labels, path+"trn", epoch_idx)
+                if config.print_diffusion:
+                    print_bin = choose_what_to_print(f_all, print_bin)
                 test_metrics.append(metrics)
+            if config.print_diffusion:
+                time_p = print_bin[1]
+                for j, p in enumerate(time_p):
+                    print(f"[{j}]", ",".join(
+                        [f"{float(ele):.5f}" for ele in p]))
             test_metrics = common_utils.get_metrics(test_metrics)
             tst_summarized = {
                 f'tst/{k}': v for k, v in jax.tree_util.tree_map(lambda e: e.sum(), test_metrics).items()}
@@ -3101,6 +3158,8 @@ def main():
     parser.add_argument("--widthwise", action="store_true")
     # Multi DSB (A->B1, A->B2)
     parser.add_argument("--multi", default=1, type=int)
+    # print intermediate results of diffusion
+    parser.add_argument("--print_diffusion", action="store_true")
     # ---------------------------------------------------------------------------------------
     # networks
     # ---------------------------------------------------------------------------------------

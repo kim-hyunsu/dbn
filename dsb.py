@@ -2848,6 +2848,7 @@ def launch(config, print_fn):
         f_all = jnp.stack(
             [f_init, f_gen, f_real], axis=-1)
 
+
         (
             (ens_acc, ens_nll),
             (
@@ -3569,6 +3570,8 @@ def main():
     parser.add_argument("--compare_time", action="store_true")
     # Initialize the classifier with A (target mode)
     parser.add_argument("--clsA", action="store_true")
+    # print intermediate results in diffusion process
+    parser.add_argument("--print_diffusion", action="store_true")
     # ---------------------------------------------------------------------------------------
     # diffusion
     # ---------------------------------------------------------------------------------------

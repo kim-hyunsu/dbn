@@ -289,7 +289,28 @@ def model_list(data_name, model_style, shared_head=False, tag=""):
             return [
                 "./checkpoints/frn_sd2_be",
                 "./checkpoints/frn_sd23_layer2stride1",
-                "./checkpoints/frn_sd233_layer2stride1"
+                "./checkpoints/frn_sd24_layer2stride1",
+                "./checkpoints/frn_sd25_layer2stride1",
+                "./checkpoints/frn_sd26_layer2stride1",
+                "./checkpoints/frn_sd27_layer2stride1"
+            ]
+        elif tag == "ABCtoindABC":
+            return [
+                "./checkpoints/frn_sd2_be",
+                "./checkpoints/frn_sd23_shared3",
+                "./checkpoints/frn_sd3_be",
+                "./checkpoints/frn_sd35_shared3",
+                "./checkpoints/frn_sd5_be",
+                "./checkpoints/frn_sd57_shared3"
+            ]
+        elif tag == "ABCtoindABC_layer2stride1":
+            return [
+                "./checkpoints/frn_sd2_be",
+                "./checkpoints/frn_sd23_layer2stride1",
+                "./checkpoints/frn_sd3_be",
+                "./checkpoints/frn_sd35_layer2stride1",
+                "./checkpoints/frn_sd5_be",
+                "./checkpoints/frn_sd57_layer2stride1"
             ]
         elif tag == "layer2stride1_nonshared":
             return [

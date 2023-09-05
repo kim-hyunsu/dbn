@@ -761,24 +761,6 @@ class TrainState(train_state.TrainState):
         kwargs["mu_t"] = mu_t
         return x_t, sigma_t, kwargs
 
-    # equation (11) in I2SB
-    def forward2(self, x0, x1, training=True, **kwargs):
-        # rng
-        rng = kwargs["rng"]
-        t_rng, n_rng = jax.random.split(rng, 2)
-
-        _ts = jax.random.randint(t_rng, (x0.shape[0],), 1, self.n_T)  # (B,)
-        sigma_weight_t = self.sigma_weight_t[_ts]  # (B,)
-        sigma_weight_t = expand_to_broadcast(sigma_weight_t, x0, axis=1)
-        sigma_t = self.sigma_t[_ts]
-        mu_t = (sigma_weight_t*x0+(1-sigma_weight_t)*x1)
-        bigsigma_t = self.bigsigma_t[_ts]  # (B,)
-        bigsigma_t = expand_to_broadcast(bigsigma_t, mu_t, axis=1)
-
-        kwargs["t"] = _ts/self.n_T  # (B,)
-        kwargs["training"] = training
-        return mu_t, sigma_t, jnp.sqrt(bigsigma_t), kwargs
-
     def sample(self, rng, apply, x0, ctx, cfl, stats, clock=False):
         shape = x0.shape
         batch_size = shape[0]
@@ -820,43 +802,6 @@ class TrainState(train_state.TrainState):
             return f
 
         return f()
-
-    def sample2(self, rng, apply, x0, ctx, cfl, stats):
-        shape = x0.shape
-        batch_size = shape[0]
-        x_n = x0  # (B, d)
-
-        def body_fn(n, val):
-            rng, x_n = val
-            idx = self.n_T - n
-            rng = jax.random.fold_in(rng, idx)
-            t_n = jnp.array([idx/self.n_T])  # (1,)
-            t_n = jnp.tile(t_n, [batch_size])  # (B,)
-
-            h = jnp.where(idx > 1, jax.random.normal(
-                rng, shape), jnp.zeros(shape))  # (B, d)
-            eps = apply(x_n, t_n, ctx, cfl)  # (2*B, d)
-
-            sigma_t = stats["sigma_t"][idx]
-            alpos_weight_t = stats["alpos_weight_t"][idx]
-            sigma_t_square = stats["sigma_t_square"][idx]
-            std = jnp.sqrt(alpos_weight_t*sigma_t_square)
-
-            x_0_eps = x_n - sigma_t*eps
-            mean = alpos_weight_t*x_0_eps + (1-alpos_weight_t)*x_n
-            x_n = mean + std * h  # (B, d)
-
-            return rng, x_n
-
-        extra_loop = 3
-        rng, x_n = jax.lax.fori_loop(
-            0, self.n_T-extra_loop, body_fn, (rng, x_n))
-        x_all = [x_n]
-        for i in range(extra_loop):
-            idx = self.n_T-extra_loop + i
-            x_all.append(body_fn(idx, (rng, x_all[-1]))[1])
-
-        return jnp.stack(x_all)
 
 
 class RFTrainState(train_state.TrainState):

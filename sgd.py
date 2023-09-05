@@ -58,8 +58,9 @@ def launch(config, print_fn):
             pixel_std=defaults.PIXEL_STD,
             num_classes=dataloaders['num_classes'],
             num_planes=config.model_planes,
-            num_blocks=((int(b) for b in config.model_blocks.split(
-                ",")) if config.model_blocks is not None else None)
+            num_blocks=tuple(
+                int(b) for b in config.model_blocks.split(",")
+            ) if config.model_blocks is not None else None
         )
         _base = partial(
             FlaxResNetBase,
@@ -162,6 +163,8 @@ def launch(config, print_fn):
             lambda path, v: "frozen" if include(frozen_keys, path) else "trainable", variables["params"]))
         optimizer = optax.multi_transform(
             partition_optimizer, param_partitions)
+        del shared_ckpt
+        del params
 
     elif config.shared_last3 is not None:
         assert config.model_style == "FRN-Swish"
@@ -195,6 +198,8 @@ def launch(config, print_fn):
             lambda path, v: "frozen" if include(frozen_keys, path) else "trainable", variables["params"]))
         optimizer = optax.multi_transform(
             partition_optimizer, param_partitions)
+        del shared_ckpt
+        del params
 
     elif config.shared_head:
         # load trained head
@@ -218,8 +223,8 @@ def launch(config, print_fn):
             lambda path, v: "frozen" if "Dense_0" in path else "trainable", variables["params"]))
         optimizer = optax.multi_transform(
             partition_optimizer, param_partitions)
-    del shared_ckpt
-    del params
+        del shared_ckpt
+        del params
 
     # build train state
     if not config.bezier:
@@ -673,7 +678,7 @@ def main():
     parser.add_argument("--optim", default="sgd", type=str,
                         choices=["sgd", "adam"])
     parser.add_argument("--nowandb", action="store_true")
-    parser.add_argument("--shared_head", default="", type=str)
+    parser.add_argument("--shared_head", default=None, type=str)
     parser.add_argument("--shared_last3", default=None, type=str)
     parser.add_argument("--label_smooth", default=0, type=float)
     parser.add_argument("--shared_checkpoint", default=None, type=str)

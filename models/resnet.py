@@ -1,7 +1,6 @@
 # Revised from https://github.com/cs-giung/giung2-dev/tree/main/giung2/models/resnet.py
 import inspect
 import functools
-from operator import ne
 from typing import Any, Tuple, Callable
 
 import jax
@@ -58,6 +57,7 @@ class FlaxResNetClassifier3(nn.Module):
                                                 kernel_init=jax.nn.initializers.he_normal(),
                                                 bias_init=jax.nn.initializers.zeros)
     feature_name: str = "feature.layer3stride2"
+    mimo: int = 1
 
     @nn.compact
     def __call__(self, x, **kwargs):
@@ -186,7 +186,9 @@ class FlaxResNetClassifier3(nn.Module):
         # return logits if possible
         if self.num_classes:
             if self.feature_name in necessary_levels:
-                y = self.fc(features=self.num_classes, dtype=self.dtype)(y)
+                y = self.fc(
+                    features=self.mimo*self.num_classes,
+                    dtype=self.dtype)(y)
             feature_level = "cls.logit"
             necessary_levels.append(feature_level)
 
@@ -461,6 +463,7 @@ class FlaxResNetBase(nn.Module):
                                                 kernel_init=jax.nn.initializers.he_normal(),
                                                 bias_init=jax.nn.initializers.zeros)
     out: str = "feature.layer3stride2"
+    mimo: int = 1
 
     @nn.compact
     def __call__(self, x, **kwargs):
@@ -494,9 +497,14 @@ class FlaxResNetBase(nn.Module):
         num_blocks = [(self.depth - 2) // 6,] * 3
         widen_factor = self.widen_factor
 
+        def mimo_out(out_ch, next_feature_names):
+            if self.mimo > 1 and self.out in next_feature_names:
+                return out_ch*self.mimo
+            return out_ch
+
         # define the first layer...
         y = self.conv(
-            features=num_planes,
+            features=mimo_out(num_planes, ["feature.layer0"]),
             kernel_size=(3, 3),
             strides=(1, 1),
             padding='SAME',
@@ -532,8 +540,19 @@ class FlaxResNetBase(nn.Module):
                     **batchnorm_kwargs
                 )(y)
                 y = self.relu(y)
+
+                if _stride_idx == len(_strides):
+                    next_fname1 = f"pre_relu_feature.layer{layer_idx+1}"
+                    next_fname2 = f"feature.layer{layer_idx+1}"
+                else:
+                    next_fname1 = f"pre_relu_feature.layer{layer_idx+1}stride{_stride_idx}"
+                    next_fname2 = f"feature.layer{layer_idx+1}stride{_stride_idx}"
+
                 y = self.conv(
-                    features=int(_channel * widen_factor),
+                    features=mimo_out(
+                        int(_channel * widen_factor),
+                        [next_fname1, next_fname2, "feature.vector"]
+                    ),
                     kernel_size=(3, 3),
                     strides=(1, 1),
                     padding='SAME',
@@ -544,6 +563,8 @@ class FlaxResNetBase(nn.Module):
                     **batchnorm_kwargs
                 )(y)
                 if residual.shape != y.shape:
+                    assert self.mimo <= 1 or self.out not in [
+                        next_fname1, next_fname2], "Incorrect layer layer"
                     # NOTE : we use the projection shortcut regardless of the input size,
                     #        which can make a difference compared to He et al. (2016).
                     residual = self.conv(
@@ -586,8 +607,11 @@ class FlaxResNetBase(nn.Module):
 
         # return logits if possible
         if self.num_classes:
+            y = self.fc(
+                features=mimo_out(self.num_classes, "cls.logit"),
+                dtype=self.dtype
+            )(y)
             feature_name = 'cls.logit'
-            y = self.fc(features=self.num_classes, dtype=self.dtype)(y)
             self.sow('intermediates', feature_name, y)
             if feature_name == self.out:
                 return y

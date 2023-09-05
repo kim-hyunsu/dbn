@@ -19,6 +19,7 @@ from utils import expand_to_broadcast, get_info_in_dir, normalize, model_list, j
 from utils import logit_dir_list, feature_dir_list, feature2_dir_list, feature3_dir_list, layer2stride1_dir_list
 from flax.training import common_utils
 import sgd_trainstate
+from flax.core.frozen_dict import freeze
 
 
 def get_ckpt_temp(ckpt_dir, shared_head=False, sgd=False):
@@ -92,8 +93,16 @@ def get_ckpt_temp(ckpt_dir, shared_head=False, sgd=False):
     return sghmc_config, sghmc_ckpt, rng
 
 
-def load_classifer_state(model_dir, sample_idx, template, sgd=False):
+def load_classifier_state(model_dir, sample_idx, template, sgd=False, prev_state=None):
     sghmc_ckpt_dir = model_dir
+    if prev_state is not None:
+        if sample_idx > 1:
+            return None, None
+        ckpt = checkpoints.restore_checkpoint(
+            ckpt_dir=sghmc_ckpt_dir, target=None
+        )
+        prev_state = prev_state.replace(params=freeze(ckpt["model"]["params"]))
+        return prev_state, ckpt
     if not sgd:
         sghmc_ckpt_dir = os.path.join(sghmc_ckpt_dir, "sghmc")
         sghmc_ckpt = checkpoints.restore_checkpoint(
@@ -291,7 +300,7 @@ if __name__ == "__main__":
     config, ckpt, rng = get_ckpt_temp(
         model_dir_list[0], shared_head, sgd_state)
     config.optim_bs = 512
-    n_samples_each_mode = 30
+    n_samples_each_mode = 1
     n_modes = len(model_dir_list)
     dataloaders = build_dataloaders(config)
     alpha, repeats = get_info_in_dir(dir)
@@ -406,6 +415,7 @@ if __name__ == "__main__":
     shape = None
     data_rng, rng = jax.random.split(rng)
     # temp = ckpt["model"]
+    saved_classifier_state = None
     for mode_idx in range(n_modes):
 
         model_dir = model_dir_list[mode_idx]
@@ -423,11 +433,13 @@ if __name__ == "__main__":
         #     ckpt["model"] = temp
 
         for i in tqdm(range(n_samples_each_mode)):
-            classifier_state, _ = load_classifer_state(
-                model_dir, i+1, ckpt, sgd_state)
-            if classifier_state is None:
+            _classifier_state, _ = load_classifier_state(
+                model_dir, i+1, ckpt, sgd_state, prev_state=saved_classifier_state)
+            if _classifier_state is None:
                 continue
-            classifier_state = jax_utils.replicate(classifier_state)
+            else:
+                saved_classifier_state = _classifier_state
+            classifier_state = jax_utils.replicate(_classifier_state)
             # train set
             feature_path = f"{dir}/train_features_M{mode_idx}S{i}.npy"
             if not os.path.exists(feature_path):

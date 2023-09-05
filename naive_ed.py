@@ -224,7 +224,7 @@ def launch(config, print_fn):
             if config.ens_dist == "":
                 pass
             elif config.ens_dist == "naive":
-                t_logits = jnp.concatenate(
+                t_logits = jnp.stack(
                     [pred(t, logits=True) for t in teachers])
                 teacher_pred = jax.scipy.special.logsumexp(
                     t_logits, axis=0) - np.log(ensemble_num)
@@ -235,7 +235,7 @@ def launch(config, print_fn):
                 a = config.dist_alpha
                 loss = (1-a)*loss + a*kd_loss
             elif config.ens_dist == "mean":
-                t_logits = jnp.concatenate(
+                t_logits = jnp.stack(
                     [pred(t, logits=True) for t in teachers])
                 tau = config.dist_temp
                 predict = jax.nn.log_softmax(t_logits/tau, axis=-1)
@@ -249,7 +249,7 @@ def launch(config, print_fn):
                 a = config.dist_alpha
                 loss = (1-a)*loss + a*kd_loss
             elif config.ens_dist == "mse":
-                t_logits = jnp.concatenate(
+                t_logits = jnp.stack(
                     [pred(t, logits=True) for t in teachers])
                 mse = jnp.sum((logits[None, ...]-t_logits)**2, axis=-1)
                 kd_loss = mse.sum(0)/ensemble_num
@@ -399,8 +399,6 @@ def launch(config, print_fn):
         for batch_idx, batch in enumerate(trn_loader, start=1):
             batch_rng = jax.random.fold_in(rng, batch_idx)
             state, metrics = p_step_trn(state, batch)
-            if config.bezier:
-                state = state.replace(rng=jax_utils.replicate(batch_rng))
             trn_metric.append(metrics)
         if config.shared_head or config.shared_last3:
             trainable2 = state.params["Conv_0"]

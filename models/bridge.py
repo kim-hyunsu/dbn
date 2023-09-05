@@ -117,7 +117,7 @@ class MLP(nn.Module):
         return out
 
 
-def dsb_schedules(beta1, beta2, T):
+def dsb_schedules(beta1, beta2, T, linear_noise=False):
     # TODO
     # assert beta1 < beta2 < 1.0, "beta1 and beta2 must be in (0, 1)"
 

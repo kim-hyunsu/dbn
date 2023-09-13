@@ -14,4 +14,3 @@ teachers:
   - "./checkpoints/frn_sd2_be"
   - "./checkpoints/frn_sd23_shared3"
   - "./checkpoints/frn_sd25_shared3"
-  - "./checkpoints/frn_sd27_shared3"

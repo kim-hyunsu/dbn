@@ -1,3 +1,6 @@
+from builtins import NotImplementedError
+from flax.training import common_utils
+from cmath import isfinite
 from functools import partial
 from typing import Any, Callable, Sequence, Dict, Tuple
 import flax.linen as nn
@@ -8,7 +11,7 @@ import numpy as np
 from einops import rearrange
 
 from utils import expand_to_broadcast, jprint
-from .bridge import Decoder as TinyDecoder
+from .bridge import Decoder as TinyDecoder, ResidualBlock
 
 # revised from https://github.com/NVlabs/I2SB
 
@@ -1391,6 +1394,9 @@ class ClsUnet(nn.Module):
     fc:           nn.Module = partial(nn.Dense, use_bias=True,
                                       kernel_init=jax.nn.initializers.he_normal(),
                                       bias_init=jax.nn.initializers.zeros)
+    joint: int = 1  # 1: z+l -> z+l, 2: (l,z) -> l
+    depth: int = 1
+    version: str = "v1.0"
 
     def convblock(self, p, x, t, **kwargs):
         norm_kwargs = dict(
@@ -1453,16 +1459,39 @@ class ClsUnet(nn.Module):
         p = self.fc(
             features=self.p_dim*self.num_input
         )(p)
-        x = self.conv(
-            features=self.z_dim[-1]*self.num_input,
-            kernel_size=(3, 3),
-            strides=(1, 1),
-            padding="SAME"
-        )(x)
-        return p, x
+        if self.joint == 2:
+            return p
+        elif self.joint == 1:
+            x = self.conv(
+                features=self.z_dim[-1]*self.num_input,
+                kernel_size=(3, 3),
+                strides=(1, 1),
+                padding="SAME"
+            )(x)
+            return p, x
+        else:
+            raise NotImplementedError
 
     @nn.compact
     def __call__(self, p, x, t, **kwargs):
+        if self.version == "v1.0":
+            return self._v1_0(p, x, t, **kwargs)
+        elif self.version == "v1.1":
+            return self._v1_1_0(p, x, t, **kwargs)
+        elif self.version == "v1.1.1":
+            return self._v1_1_1(p, x, t, **kwargs)
+        elif self.version == "v1.1.2":
+            return self._v1_1_2(p, x, t, **kwargs)
+        elif self.version == "v1.1.3":
+            return self._v1_1_3(p, x, t, **kwargs)
+        elif self.version == "v1.1.4":
+            return self._v1_1_4(p, x, t, **kwargs)
+        elif self.version == "v1.1.5":
+            return self._v1_1_5(p, x, t, **kwargs)
+        else:
+            raise NotImplementedError
+
+    def _v1_0(self, p, x, t, **kwargs):
         # p: logits 10*num_input (cifar10)
         # x: features (8,8,128*num_input) (resnet32x2)
         # t: time
@@ -1471,10 +1500,277 @@ class ClsUnet(nn.Module):
         t = self.silu(t)
         t = self.fc(self.ch)(t)
         p, x = self.input_layer(p, x, **kwargs)
-        x = self.convblock(p, x, t, **kwargs)
-        p, x = self.output_layer(x, **kwargs)
+        for i in range(self.depth):
+            x = self.convblock(p, x, t, **kwargs)
+        return self.output_layer(x, **kwargs)
 
-        return p, x
+    def _v1_1_0(self, p, x, t, **kwargs):
+        norm_kwargs = dict(
+            use_running_average=not kwargs["training"]
+        ) if isinstance(self.norm, nn.BatchNorm) else dict()
+        residual = x
+        x = self.conv(
+            features=self.ch,
+            kernel_size=(3, 3),
+            strides=(1, 1),
+            padding="SAME"
+        )(x)
+        x = self.norm(**norm_kwargs)(x)
+        x = self.relu(x)
+        x = self.conv(
+            features=self.ch,
+            kernel_size=(3, 3),
+            strides=(1, 1),
+            padding="SAME"
+        )(x)
+        x = self.norm(**norm_kwargs)(x)
+        x = self.relu(x+residual)
+        residual = x
+        x = self.conv(
+            features=self.ch,
+            kernel_size=(3, 3),
+            strides=(1, 1),
+            padding="SAME"
+        )(x)
+        x = self.norm(**norm_kwargs)(x)
+        x = self.relu(x)
+        x = self.conv(
+            features=self.ch,
+            kernel_size=(3, 3),
+            strides=(1, 1),
+            padding="SAME"
+        )(x)
+        x = self.norm(**norm_kwargs)(x)
+        x = self.relu(x+residual)
+        residual = x
+        x = self.conv(
+            features=self.ch,
+            kernel_size=(3, 3),
+            strides=(1, 1),
+            padding="SAME"
+        )(x)
+        x = self.norm(**norm_kwargs)(x)
+        x = self.relu(x)
+        x = self.conv(
+            features=self.ch,
+            kernel_size=(3, 3),
+            strides=(1, 1),
+            padding="SAME"
+        )(x)
+        x = self.norm(**norm_kwargs)(x)
+        x = self.relu(x+residual)
+        p = jnp.mean(x, axis=(1, 2))
+        p = self.fc(features=self.p_dim*self.num_input)(p)
+        if self.joint == 2:
+            return p
+        elif self.joint == 1:
+            return p, x
+
+    def _v1_1_1(self, p, x, t, **kwargs):
+        norm_kwargs = dict(
+            use_running_average=not kwargs["training"]
+        ) if isinstance(self.norm, nn.BatchNorm) else dict()
+        t_dim = self.ch//4  # 32
+        t = timestep_embedding(t, t_dim)
+        t = self.fc(features=t_dim)(t)
+        t = self.silu(t)
+        _t = self.fc(features=self.ch)(t)
+        _t = _t[:, None, None, :]
+        x = self.conv(
+            features=self.ch,
+            kernel_size=(3, 3),
+            strides=(1, 1),
+            padding="SAME"
+        )(x)
+        x = self.norm(**norm_kwargs)(x)
+        x = self.relu(x)
+        for _ in range(self.depth+1):
+            residual = x
+            _t = self.fc(features=self.ch)(t)
+            _t = _t[:, None, None, :]
+            x = self.conv(
+                features=self.ch,
+                kernel_size=(3, 3),
+                strides=(1, 1),
+                padding="SAME"
+            )(x+_t)
+            x = self.norm(**norm_kwargs)(x)
+            x = self.relu(x)
+            x = self.conv(
+                features=self.ch,
+                kernel_size=(3, 3),
+                strides=(1, 1),
+                padding="SAME"
+            )(x+_t)
+            x = self.norm(**norm_kwargs)(x)
+            x = self.relu(x+residual)
+        p = jnp.mean(x, axis=(1, 2))
+        p = self.fc(features=self.p_dim*self.num_input)(p)
+        if self.joint == 2:
+            return p
+        elif self.joint == 1:
+            return p, x
+
+    def _v1_1_3(self, p, x, t, **kwargs):
+        norm_kwargs = dict(
+            use_running_average=not kwargs["training"]
+        ) if isinstance(self.norm, nn.BatchNorm) else dict()
+        t_dim = self.ch//4  # 32
+        t = timestep_embedding(t, t_dim)
+        t = self.fc(features=t_dim)(t)
+        t = self.silu(t)
+
+        p = self.fc(features=self.ch//4)(p)
+        p = self.silu(p)
+        p = self.fc(features=self.ch)(p)
+        p = p[:, None, None, :]
+
+        _t = self.fc(features=self.ch)(t)
+        _t = _t[:, None, None, :]
+        x = self.conv(
+            features=self.ch,
+            kernel_size=(3, 3),
+            strides=(1, 1),
+            padding="SAME"
+        )(x)
+        x = self.norm(**norm_kwargs)(x)
+        x = self.relu(x)
+        for _ in range(self.depth+1):
+            residual = x
+            _t = self.fc(features=self.ch)(t)
+            _t = _t[:, None, None, :]
+            x = self.conv(
+                features=self.ch,
+                kernel_size=(3, 3),
+                strides=(1, 1),
+                padding="SAME"
+            )(x+p+_t)
+            x = self.norm(**norm_kwargs)(x)
+            x = self.relu(x)
+            x = self.conv(
+                features=self.ch,
+                kernel_size=(3, 3),
+                strides=(1, 1),
+                padding="SAME"
+            )(x+_t)
+            x = self.norm(**norm_kwargs)(x)
+            x = self.relu(x+residual)
+        p = jnp.mean(x, axis=(1, 2))
+        p = self.fc(features=self.p_dim*self.num_input)(p)
+        if self.joint == 2:
+            return p
+        elif self.joint == 1:
+            return p, x
+
+    def _v1_1_4(self, p, x, t, **kwargs):
+        norm_kwargs = dict(
+            use_running_average=not kwargs["training"]
+        ) if isinstance(self.norm, nn.BatchNorm) else dict()
+        t_dim = self.ch//4  # 32
+        t = timestep_embedding(t, t_dim)
+        t = self.fc(features=t_dim)(t)
+        t = self.silu(t)
+
+        p = self.fc(features=self.ch//4)(p)
+        p = self.silu(p)
+        p = self.fc(features=self.ch//2)(p)
+
+        _t = self.fc(features=self.ch//2)(t)
+        _t = jnp.concatenate([p, _t], axis=-1)
+        _t = _t[:, None, None, :]
+        x = self.conv(
+            features=self.ch,
+            kernel_size=(3, 3),
+            strides=(1, 1),
+            padding="SAME"
+        )(x)
+        x = self.norm(**norm_kwargs)(x)
+        x = self.relu(x)
+        for _ in range(self.depth+1):
+            residual = x
+            _t = self.fc(features=self.ch)(t)
+            _t = _t[:, None, None, :]
+            x = self.conv(
+                features=self.ch,
+                kernel_size=(3, 3),
+                strides=(1, 1),
+                padding="SAME"
+            )(x+_t)
+            x = self.norm(**norm_kwargs)(x)
+            x = self.relu(x)
+            x = self.conv(
+                features=self.ch,
+                kernel_size=(3, 3),
+                strides=(1, 1),
+                padding="SAME"
+            )(x+_t)
+            x = self.norm(**norm_kwargs)(x)
+            x = self.relu(x+residual)
+        p = jnp.mean(x, axis=(1, 2))
+        p = self.fc(features=self.p_dim*self.num_input)(p)
+        if self.joint == 2:
+            return p
+        elif self.joint == 1:
+            x = self.conv(
+                features=self.z_dim[-1]*self.num_input,
+                kernel_size=(3, 3),
+                strides=(1, 1),
+                padding="SAME"
+            )(x)
+            x = self.norm(**norm_kwargs)(x)
+            x = self.relu(x)
+            return p, x
+
+    def _v1_1_5(self, p, x, t, **kwargs):
+        norm_kwargs = dict(
+            use_running_average=not kwargs["training"]
+        ) if isinstance(self.norm, nn.BatchNorm) else dict()
+        t_dim = self.ch//4  # 32
+        t = timestep_embedding(t, t_dim)
+        t = self.fc(features=t_dim)(t)
+        t = self.silu(t)
+
+        p = self.fc(features=x.shape[-1])(p)
+        p = jnp.tile(p[:, None, None, :], [1, x.shape[1], x.shape[2], 1])
+        x = jnp.concatenate([x, p], axis=-1)
+
+        x = self.conv(
+            features=self.ch,
+            kernel_size=(3, 3),
+            strides=(1, 1),
+            padding="SAME"
+        )(x)
+        x = self.norm(**norm_kwargs)(x)
+        x = self.relu(x)
+        for i in range(self.depth+1):
+            residual = x
+            _t = self.fc(features=self.ch)(t)
+            _t = _t[:, None, None, :]
+            x = self.conv(
+                features=self.ch,
+                kernel_size=(3, 3),
+                strides=(1, 1),
+                padding="SAME"
+            )(x+_t)
+            x = self.norm(**norm_kwargs)(x)
+            x = self.relu(x)
+            x = self.conv(
+                features=(
+                    self.ch*self.num_input if i == self.depth else self.ch),
+                kernel_size=(3, 3),
+                strides=(1, 1),
+                padding="SAME"
+            )(x+_t)
+            if i == self.depth:
+                residual = jnp.tile(residual, [1, 1, 1, self.num_input])
+            x = self.norm(**norm_kwargs)(x)
+            x = self.relu(x+residual)
+        p = jnp.mean(x, axis=(1, 2))
+        p = self.fc(features=self.p_dim*self.num_input)(p)
+        if self.joint == 2:
+            return p
+        elif self.joint == 1:
+            return p, x
 
 
 class Decoder(nn.Module):
@@ -1775,15 +2071,21 @@ class DiffusionBridgeNetwork(nn.Module):
     cls_net: Sequence[nn.Module]
     crt_net: Sequence[nn.Module]
     dsb_stats: dict
+    z_dsb_stats: dict
     fat: int
     joint: bool
-    forget: bool = False
+    forget: int = 0
+    temp: float = 1.
+    print_inter: bool = False
 
     def setup(self):
         self.base = self.base_net()
         self.score = self.score_net()
         if self.cls_net is not None:
-            self.cls = self.cls_net()
+            if isinstance(self.cls_net, Sequence):
+                self.cls = [cls_net() for cls_net in self.cls_net]
+            else:
+                self.cls = self.cls_net()
         if self.crt_net is not None:
             self.crt = self.crt_net()
 
@@ -1798,12 +2100,21 @@ class DiffusionBridgeNetwork(nn.Module):
         return self.crt(z)
 
     def classify(self, z, params_dict=None, **kwargs):
-        if params_dict is not None:
-            return self.cls.apply(params_dict, z, **kwargs)
-        return self.cls(z, **kwargs)
+        def _classify(cls, _z):
+            if params_dict is not None:
+                return cls.apply(params_dict, _z, **kwargs)
+            return cls(_z, **kwargs)
+        if isinstance(self.cls, Sequence):
+            z = rearrange(z, "(n b) h w z -> n b h w z", n=self.fat)
+            logits = jnp.stack([_classify(_cls, _z)
+                               for _cls, _z in zip(self.cls, z)])
+            logits = rearrange(logits, "n b d -> (n b) d", n=self.fat)
+            return logits
+        else:
+            return _classify(self.cls, z)
 
     def corrected_classify(self, z, params_dict=None, **kwargs):
-        if self.fat > 1:
+        if self.fat:
             z = rearrange(
                 z, "b h w (n z) -> (n b) h w z", n=self.fat)
             z = self.correct(z)
@@ -1815,8 +2126,10 @@ class DiffusionBridgeNetwork(nn.Module):
         return logits
 
     def __call__(self, *args, **kwargs):
-        if self.joint:
+        if self.joint == 1:
             return self.joint_dbn(*args, **kwargs)
+        elif self.joint == 2:
+            return self.conditional_dbn(*args, **kwargs)
         else:
             return self.feature_dbn(*args, **kwargs)
 
@@ -1831,26 +2144,41 @@ class DiffusionBridgeNetwork(nn.Module):
         l = l[:, 0, 0, :]
         return l, z
 
-    def joint_dbn(self, rng, lz0, x1, base_params=None, cls_params=None, **kwargs):
-        # l: logits
-        # z: features
-        l0, z0 = lz0
-        lz0 = self.get_joint_tensor(l0, z0)
+    def set_logit(self, l1):
+        if self.forget == 0:
+            pass
+        elif self.forget == 1:
+            l1 = jnp.zeros_like(l1)
+        elif self.forget == 2:
+            l1 = jax.random.normal(rng, l1.shape)
+        elif self.forget == 3:
+            l1 += jax.random.normal(rng, l1.shape)
+        elif self.forget == 4:
+            l1 = jnp.zeros_like(l1)
+            label = jnp.arange(self.fat)
+            onehot = common_utils.onehot(label, num_classes=l1.shape[-1]//self.fat)
+            onehot = onehot.reshape(1,-1)
+            l1 += onehot
+        return l1
+
+    def conditional_dbn(self, rng, l0, x1, base_params=None, cls_params=None, **kwargs):
         z1 = self.encode(x1, base_params, **kwargs)
-        l1 = jnp.where(
-            self.forget, 0, self.classify(z1, cls_params, **kwargs))
-        if self.fat > 1:
-            reps = [1]*len(z1.shape[:-1]) + [self.fat]
-            z1 = jnp.tile(z1, reps)
+        l1 = self.classify(z1, cls_params, **kwargs)/self.temp
+        if self.fat:
             reps = [1]*len(l1.shape[:-1]) + [self.fat]
             l1 = jnp.tile(l1, reps)
-        lz1 = self.get_joint_tensor(l1, z1)
-        lz_t, t, mu_t, sigma_t = self.forward(rng, lz0, lz1)
-        l_t, z_t = self.get_dejoint_tensor(lz_t, [l0.shape[-1]])
-        leps, zeps = self.score(l_t, z_t, t, **kwargs)
-        l_sigma_t = expand_to_broadcast(sigma_t, l_t, axis=1)
-        l0eps = l_t - l_sigma_t*leps  # (B, cls*fat)
-        if self.fat > 1:
+        l1 = self.set_logit(l1)
+        l_t, t, mu_t, sigma_t, _ = self.forward(rng, l0, l1)
+        # ------------------------------
+        # MIMO batch mix
+        # ------------------------------
+        eps = self.score(l_t, z1, t, **kwargs)
+        # ------------------------------
+        # MIMO batch mix
+        # ------------------------------
+        _sigma_t = expand_to_broadcast(sigma_t, l_t, axis=1)
+        l0eps = l_t - _sigma_t*eps
+        if self.fat:
             l0eps = rearrange(
                 l0eps, "b (n d) -> (n b) d", n=self.fat)
             l0eps = self.correct(l0eps, **kwargs)
@@ -1858,42 +2186,62 @@ class DiffusionBridgeNetwork(nn.Module):
                 l0eps, "(n b) d -> n b d", n=self.fat)
         else:
             l0eps = self.correct(l0eps, **kwargs)
-        return ((leps, zeps), (l_t, z_t), t, mu_t, sigma_t), l0eps
+        return (eps, l_t, t, mu_t, sigma_t), l0eps
+
+    def joint_dbn(self, rng, lz0, x1, base_params=None, cls_params=None, **kwargs):
+        # l: logits
+        # z: features
+        l0, z0 = lz0
+        z1 = self.encode(x1, base_params, **kwargs)
+        l1 = self.classify(z1, cls_params, **kwargs)/self.temp
+        if self.fat:
+            reps = [1]*len(z1.shape[:-1]) + [self.fat]
+            z1 = jnp.tile(z1, reps)
+            reps = [1]*len(l1.shape[:-1]) + [self.fat]
+            l1 = jnp.tile(l1, reps)
+        l1 = self.set_logit(l1)
+        lrng, zrng = jax.random.split(rng)
+        l_t, t, l_mu_t, l_sigma_t, _ts = self.forward(lrng, l0, l1)
+        z_t, _t, z_mu_t, z_sigma_t, _ = self.forward(
+            zrng, z0, z1, _ts=_ts, dsb_stats=self.z_dsb_stats)
+        leps, zeps = self.score(l_t, z_t, t, **kwargs)
+        _l_sigma_t = expand_to_broadcast(l_sigma_t, l_t, axis=1)
+        l0eps = l_t - _l_sigma_t*leps  # (B, cls*fat)
+        if self.fat:
+            l0eps = rearrange(
+                l0eps, "b (n d) -> (n b) d", n=self.fat)
+            l0eps = self.correct(l0eps, **kwargs)
+            l0eps = rearrange(
+                l0eps, "(n b) d -> n b d", n=self.fat)
+        else:
+            l0eps = self.correct(l0eps, **kwargs)
+        return ((leps, zeps), (l_t, z_t), t, (l_mu_t, z_mu_t), (l_sigma_t, z_sigma_t)), l0eps
 
     def feature_dbn(self, rng, z0, x1, base_params=None, cls_params=None, **kwargs):
         z1 = self.encode(x1, base_params, **kwargs)
-        if self.fat > 1:
+        if self.fat:
             reps = [1]*len(z1.shape[:-1]) + [self.fat]
             z1 = jnp.tile(z1, reps)
         z_t, t, mu_t, sigma_t = self.forward(rng, z0, z1)
-        if self.fat > 1:
-            # perm = jax.random.permutation(rng, z1.shape[0]*self.fat)
-            # _z_t = rearrange(z_t, "b h w (n z) -> (n b) h w z", n=self.fat)
-            # _z_t = _z_t[perm]
-            # inv_perm = jnp.argsort(perm)
-            # _z_t = rearrange(_z_t, "(n b) h w z -> b h w (n z)", n=self.fat)
-            _z_t = z_t
-        else:
-            _z_t = z_t
-        eps = self.score(_z_t, t, **kwargs)
-        # if self.fat > 1:
-        #     eps = rearrange(eps, "b h w (n z) -> (n b) h w z", n=self.fat)
-        #     eps = eps[inv_perm]
-        #     eps = rearrange(eps, "(n b) h w z -> b h w (n z)", n=self.fat)
+        eps = self.score(z_t, t, **kwargs)
         _sigma_t = expand_to_broadcast(sigma_t, z_t, axis=1)
         z0eps = z_t - _sigma_t*eps
         logits0eps = self.corrected_classify(z0eps, cls_params, **kwargs)
         return (eps, z_t, t, mu_t, sigma_t), logits0eps
 
-    def forward(self, rng, x0, x1):
-        n_T = self.dsb_stats["n_T"]
-        _sigma_weight_t = self.dsb_stats["sigma_weight_t"]
-        _sigma_t = self.dsb_stats["sigma_t"]
-        _bigsigma_t = self.dsb_stats["bigsigma_t"]
+    def forward(self, rng, x0, x1, _ts=None, dsb_stats=None):
+        if dsb_stats is None:
+            dsb_stats = self.dsb_stats
+
+        n_T = dsb_stats["n_T"]
+        _sigma_weight_t = dsb_stats["sigma_weight_t"]
+        _sigma_t = dsb_stats["sigma_t"]
+        _bigsigma_t = dsb_stats["bigsigma_t"]
 
         t_rng, n_rng = jax.random.split(rng, 2)
 
-        _ts = jax.random.randint(t_rng, (x0.shape[0],), 1, n_T)  # (B,)
+        if _ts is None:
+            _ts = jax.random.randint(t_rng, (x0.shape[0],), 1, n_T)  # (B,)
         sigma_weight_t = _sigma_weight_t[_ts]  # (B,)
         sigma_weight_t = expand_to_broadcast(sigma_weight_t, x0, axis=1)
         sigma_t = _sigma_t[_ts]
@@ -1905,55 +2253,107 @@ class DiffusionBridgeNetwork(nn.Module):
         noise = jax.random.normal(n_rng, mu_t.shape)  # (B, d)
         x_t = mu_t + noise*jnp.sqrt(bigsigma_t)
         t = _ts/n_T
-        return x_t, t, mu_t, sigma_t
+        return x_t, t, mu_t, sigma_t, _ts
 
     def sample(self, *args, **kwargs):
-        if self.joint:
+        if self.joint == 1:
             return self.joint_sample(*args, **kwargs)
+        elif self.joint == 2:
+            return self.conditional_sample(*args, **kwargs)
         else:
             return self.feature_sample(*args, **kwargs)
 
     def feature_sample(self, rng, sampler, x):
         zB = self.encode(x, training=False)
-        if self.fat > 1:
+        if self.fat:
             reps = [1]*len(zB.shape[:-1]) + [self.fat]
             zB = jnp.tile(zB, reps)
         zC = sampler(
             partial(self.score, training=False), rng, zB)
-        if self.fat > 1:
-            # zC = jnp.split(zC, self.fat, axis=-1)
-            # zC = [self.correct(z) for z in zC]
-            # logitsC = [self.classify(z, training=False) for z in zC]
+        if self.fat:
             zC = rearrange(
                 zC, "b h w (n z) -> (n b) h w z", n=self.fat)
             zC = self.correct(zC)
+            _zC = rearrange(
+                zC, "(n b) h w z -> n b h w z", n=self.fat)[0]
             logitsC = self.classify(zC, training=False)
             logitsC = rearrange(
                 logitsC, "(n b) d -> n b d", n=self.fat)
         else:
             zC = self.correct(zC)
-            # logitsC = [self.classify(zC, training=False)]
+            _zC = zC
             logitsC = self.classify(zC, training=False)
-        return logitsC
+        return logitsC, _zC
 
     def joint_sample(self, rng, sampler, x):
         zB = self.encode(x, training=False)
-        lB = jnp.where(
-            self.forget, 0, self.classify(zB, training=False))
-        if self.fat > 1:
+        lB = self.classify(zB, training=False)/self.temp
+        if self.fat:
             reps = [1]*len(zB.shape[:-1]) + [self.fat]
             zB = jnp.tile(zB, reps)
             reps = [1]*len(lB.shape[:-1]) + [self.fat]
             lB = jnp.tile(lB, reps)
-        lC, _ = sampler(
+        lB = self.set_logit(lB)
+        out = sampler(
             partial(self.score, training=False), rng, lB, zB)
-        if self.fat > 1:
+        if self.print_inter:
+            (lC, _zC), lC_arr = out
+        else:
+            lC, _zC = out
+        if self.fat:
             lC = rearrange(lC, "b (n z) -> (n b) z", n=self.fat)
             lC = self.correct(lC)
             lC = rearrange(lC, "(n b) z -> n b z", n=self.fat)
         else:
             lC = self.correct(lC)
-        return lC
+        if self.print_inter:
+            return self.temp*lC, lC_arr
+        return self.temp*lC, _zC
+
+    def conditional_sample(self, rng, sampler, x):
+        zB = self.encode(x, training=False)
+        lB = self.classify(zB, training=False)/self.temp
+        if self.fat:
+            reps = [1]*len(lB.shape[:-1]) + [self.fat]
+            lB = jnp.tile(lB, reps)
+        lB = self.set_logit(lB)
+        lC = sampler(
+            partial(self.score, training=False), rng, lB, zB)
+        if self.print_inter:
+            lC, lC_arr = lC
+        if self.fat:
+            lC = rearrange(lC, "b (n z) -> (n b) z", n=self.fat)
+            lC = self.correct(lC)
+            lC = rearrange(lC, "(n b) z -> n b z", n=self.fat)
+        else:
+            lC = self.correct(lC)
+        if self.print_inter:
+            return self.temp*lC, lC_arr
+        return self.temp*lC, None
+
+    def feature_dbn_deprecated(self, rng, z0, x1, base_params=None, cls_params=None, **kwargs):
+        z1 = self.encode(x1, base_params, **kwargs)
+        if self.fat:
+            reps = [1]*len(z1.shape[:-1]) + [self.fat]
+            z1 = jnp.tile(z1, reps)
+        z_t, t, mu_t, sigma_t, _ = self.forward(rng, z0, z1)
+        if self.fat:
+            perm = jax.random.permutation(rng, z1.shape[0]*self.fat)
+            _z_t = rearrange(z_t, "b h w (n z) -> (n b) h w z", n=self.fat)
+            _z_t = _z_t[perm]
+            inv_perm = jnp.argsort(perm)
+            _z_t = rearrange(_z_t, "(n b) h w z -> b h w (n z)", n=self.fat)
+        else:
+            _z_t = z_t
+        eps = self.score(_z_t, t, **kwargs)
+        if self.fat:
+            eps = rearrange(eps, "b h w (n z) -> (n b) h w z", n=self.fat)
+            eps = eps[inv_perm]
+            eps = rearrange(eps, "(n b) h w z -> b h w (n z)", n=self.fat)
+        _sigma_t = expand_to_broadcast(sigma_t, z_t, axis=1)
+        z0eps = z_t - _sigma_t*eps
+        logits0eps = self.corrected_classify(z0eps, cls_params, **kwargs)
+        return (eps, z_t, t, mu_t, sigma_t), logits0eps
 
 
 class DoubleDSB(nn.Module):

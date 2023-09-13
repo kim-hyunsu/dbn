@@ -12,6 +12,5 @@ dist_alpha: 1
 dist_temp: 4
 teachers:
   - "./checkpoints/frn_sd2_be"
-  - "./checkpoints/frn_sd23_shared3"
-  - "./checkpoints/frn_sd25_shared3"
-  - "./checkpoints/frn_sd27_shared3"
+  - "./checkpoints/frn_sd3_be"
+  - "./checkpoints/frn_sd5_be"

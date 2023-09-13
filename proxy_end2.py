@@ -118,6 +118,51 @@ def launch(config, print_fn):
         optimizer = optax.adamw(learning_rate=scheduler,
                                 weight_decay=config.optim_weight_decay)
 
+    frozen_keys = []
+    if config.shared_checkpoint is not None:
+        base_variables = initialize_model(init_rng, base)
+
+        def sorter(x):
+            assert "_" in x
+            name, num = x.split("_")
+            return (name, int(num))
+        params = variables.unfreeze()
+        res_param_keys = []
+        base_param_keys = []
+        for k, v in params["params"].items():
+            res_param_keys.append(k)
+        for k, v in base_variables["params"].items():
+            base_param_keys.append(k)
+        res_param_keys = sorted(res_param_keys, key=sorter)
+        base_param_keys = sorted(base_param_keys, key=sorter)
+
+        shared_ckpt = checkpoints.restore_checkpoint(
+            ckpt_dir=config.shared_checkpoint,
+            target=None
+        )
+        for k in res_param_keys:
+            if k in base_param_keys:
+                continue
+            params["params"][k] = shared_ckpt["model"]["params"][k]
+            frozen_keys.append(k)
+        variables = freeze(params)
+        partition_optimizer = {
+            "trainable": optimizer,
+            "frozen": optax.set_to_zero()
+        }
+
+        def include(keywords, path):
+            included = False
+            for k in keywords:
+                if k in path:
+                    included = True
+                    break
+            return included
+        param_partitions = freeze(traverse_util.path_aware_map(
+            lambda path, v: "frozen" if include(frozen_keys, path) else "trainable", variables["params"]))
+        optimizer = optax.multi_transform(
+            partition_optimizer, param_partitions)
+
     # build train state
     state = TrainState.create(
         apply_fn=model.apply,
@@ -139,7 +184,7 @@ def launch(config, print_fn):
     # ---------------------------------------------------------------------- #
     # Optimization
     # ---------------------------------------------------------------------- #
-    def step_trn(state, batch, config, scheduler):
+    def loss_func(params, state, batch, train=True):
         def pred(params, logits=False):
             params_dict = dict(params=params)
             mutable = ["intermediates"]
@@ -152,96 +197,75 @@ def launch(config, print_fn):
             _, new_model_state = state.apply_fn(
                 params_dict, batch['images'],
                 rngs=None,
-                mutable=mutable,
+                **(dict(mutable=mutable) if train else dict()),
                 use_running_average=False)
             if logits:
                 return new_model_state["intermediates"]["cls.logit"][0]
             return new_model_state
+        # loss_kd
+        tau = config.dist_temp
+        new_model_state = pred(params)
+        logits= new_model_state["intermediates"]["cls.logit"][0]
+        alphas = 1.0 + jnp.exp(logits / tau) # [N, K,]
 
+        teacher_logits = jnp.stack(
+            [pred(t, logits=True) for t in teachers])
+        teacher_confs = jax.nn.softmax(teacher_logits / tau, axis=-1) # [M, N, K,]
+        teacher_confs_mean = jnp.mean(teacher_confs, axis=0) # [N, K,]
+        precision = 0.5 * (teacher_confs.shape[2] - 1) / jnp.sum(
+            teacher_confs_mean * (
+                jnp.log(teacher_confs_mean) - jnp.mean(jnp.log(teacher_confs), axis=0)
+            ), axis=1, keepdims=True) # [N, 1,]
+        betas = 1.0 + (teacher_confs_mean * precision) # [N, K,]
+
+        reconstruction_term = jnp.sum(
+            -teacher_confs_mean * (
+                jax.lax.digamma(alphas) - jax.lax.digamma(jnp.sum(alphas, axis=1, keepdims=True))
+            ), axis=-1) # [N,]
+        # reconstruction_term = jnp.sum(
+        #     -teacher_confs_mean * jax.nn.log_softmax(student_logits, axis=-1), axis=-1) # [N,]
+        
+        prior_term = ((
+            jax.lax.lgamma(jnp.sum(alphas, axis=1)) - jnp.sum(jax.lax.lgamma(alphas), axis=1)
+            + jnp.sum(jax.lax.lgamma(jnp.ones_like(betas)), axis=1) - jax.lax.lgamma(jnp.sum(jnp.ones_like(betas), axis=1))
+        ) + jnp.sum(
+            (alphas - jnp.ones_like(betas)) * (
+                jax.lax.digamma(alphas) - jax.lax.digamma(jnp.sum(alphas, axis=1, keepdims=True))
+            ), axis=1
+        )) / jnp.sum(betas, axis=1) # [N,]
+        kd_loss = jnp.mean(prior_term + reconstruction_term)
+
+        target = common_utils.onehot(
+            batch['labels'], num_classes=logits.shape[-1])  # [B, K,]
+        predictions = jax.nn.log_softmax(logits, axis=-1)
+        loss = -jnp.sum(target * predictions, axis=-1)      # [B,]
+        loss = jnp.sum(
+            jnp.where(batch['marker'], loss, jnp.zeros_like(loss))
+        ) / jnp.sum(batch['marker'])
+
+        a = config.dist_alpha
+        loss = (1-a)*loss + a*kd_loss
+
+        # accuracy
+        acc = evaluate_acc(
+            predictions, batch['labels'], log_input=True, reduction='none')          # [B,]
+        nll = evaluate_nll(
+            predictions, batch['labels'], log_input=True, reduction='none')          # [B,]
+
+        # refine and return metrics
+        acc = jnp.sum(jnp.where(batch['marker'], acc, jnp.zeros_like(acc)))
+        nll = jnp.sum(jnp.where(batch['marker'], nll, jnp.zeros_like(nll)))
+        cnt = jnp.sum(batch['marker'])
+        # log metrics
+        metrics = OrderedDict(
+            {'loss': loss, "acc": acc, "nll": nll, "cnt": cnt})
+
+        return loss, (metrics, new_model_state)
+
+    @partial(jax.pmap, axis_name="batch")
+    def step_trn(state, batch):
         def loss_fn(params):
-
-            new_model_state = pred(params)
-            # compute loss
-            # [B, K,]
-            logits = new_model_state['intermediates']['cls.logit'][0]
-            target = common_utils.onehot(
-                batch['labels'], num_classes=logits.shape[-1])  # [B, K,]
-            if config.label_smooth > 0:
-                alpha = config.label_smooth
-                n_cls = logits.shape[-1]
-                target = target*(1-alpha) + alpha/n_cls
-            predictions = jax.nn.log_softmax(logits, axis=-1)
-            loss = -jnp.sum(target * predictions, axis=-1)      # [B,]
-            loss = jnp.sum(
-                jnp.where(batch['marker'], loss, jnp.zeros_like(loss))
-            ) / jnp.sum(batch['marker'])
-            if config.ens_dist == "":
-                pass
-            elif config.ens_dist == "naive":
-                logits0 = pred(teacher0, logits=True)
-                logits1 = pred(teacher1, logits=True)
-                pred0 = jax.nn.log_softmax(logits0, axis=-1)
-                pred1 = jax.nn.log_softmax(logits1, axis=-1)
-                teacher_pred = jnp.logaddexp(pred0, pred1) - np.log(2)
-                probs = jnp.exp(predictions)
-                kd_loss = -2*jnp.sum(probs*teacher_pred, axis=-1)
-                kd_loss = jnp.sum(
-                    jnp.where(batch["marker"], kd_loss, 0))/jnp.sum(batch["marker"])
-                a = config.dist_alpha
-                loss = (1-a)*loss + a*kd_loss
-            elif config.ens_dist == "mean":
-                logits0 = pred(teacher0, logits=True)
-                logits1 = pred(teacher1, logits=True)
-                tau = config.dist_temp
-                pred0 = jax.nn.log_softmax(logits0/tau, axis=-1)
-                pred1 = jax.nn.log_softmax(logits1/tau, axis=-1)
-                teacher_probs0 = jnp.exp(pred0)
-                teacher_probs1 = jnp.exp(pred1)
-                predictions = jax.nn.log_softmax(logits/tau, axis=-1)
-                kd_loss0 = -jnp.sum(teacher_probs0*predictions, axis=-1)
-                kd_loss1 = -jnp.sum(teacher_probs1*predictions, axis=-1)
-                kd_loss = 0.5*(kd_loss0+kd_loss1)
-                kd_loss = tau**2*jnp.sum(
-                    jnp.where(batch["marker"], kd_loss, 0))/jnp.sum(batch["marker"])
-                a = config.dist_alpha
-                loss = (1-a)*loss + a*kd_loss
-            elif config.ens_dist == "mse":
-                logits0 = pred(teacher0, logits=True)
-                logits1 = pred(teacher1, logits=True)
-                mse0 = jnp.sum((logits-logits0)**2, axis=-1)
-                mse1 = jnp.sum((logits-logits1)**2, axis=-1)
-                kd_loss = 0.5*(mse0+mse1)
-                kd_loss = jnp.sum(
-                    jnp.where(batch["marker"], kd_loss, 0))/jnp.sum(batch["marker"])
-                a = config.dist_alpha
-                loss = (1-a)*loss + a*kd_loss
-            elif config.ens_dist == "enslogit":
-                logits0 = pred(teacher0, logits=True)
-                logits1 = pred(teacher1, logits=True)
-                ens_logits = get_ens_logits([logits0, logits1], logitmean=0)
-                tau = config.dist_temp
-                ens_pred = jnp.exp(jax.nn.log_softmax(ens_logits/tau, axis=-1))
-                predictions = jax.nn.log_softmax(logits/tau, axis=-1)
-                kd_loss = -jnp.sum(ens_pred*predictions, axis=-1)
-                kd_loss = tau**2*jnp.sum(
-                    jnp.where(batch["marker"], kd_loss, 0))/jnp.sum(batch["marker"])
-                a = config.dist_alpha
-                loss = (1-a)*loss + a*kd_loss
-
-            # accuracy
-            acc = evaluate_acc(
-                predictions, batch['labels'], log_input=True, reduction='none')          # [B,]
-            nll = evaluate_nll(
-                predictions, batch['labels'], log_input=True, reduction='none')          # [B,]
-
-            # refine and return metrics
-            acc = jnp.sum(jnp.where(batch['marker'], acc, jnp.zeros_like(acc)))
-            nll = jnp.sum(jnp.where(batch['marker'], nll, jnp.zeros_like(nll)))
-            cnt = jnp.sum(batch['marker'])
-            # log metrics
-            metrics = OrderedDict(
-                {'loss': loss, "acc": acc/cnt, "nll": nll/cnt})
-            return loss, (metrics, new_model_state)
+            return loss_func(params, state, batch)
 
         # compute losses and gradients
         dynamic_scale = state.dynamic_scale
@@ -281,43 +305,10 @@ def launch(config, print_fn):
 
         return new_state, metrics
 
+    @partial(jax.pmap, axis_name="batch")
     def step_val(state, batch):
-        params = state.params
-        params_dict = dict(params=params)
-        if state.image_stats is not None:
-            params_dict["image_stats"] = state.image_stats
-        if state.batch_stats is not None:
-            params_dict["batch_stats"] = state.batch_stats
-
-        begin = time.time()
-        _, new_model_state = state.apply_fn(
-            params_dict, batch['images'],
-            rngs=None,
-            mutable='intermediates',
-            use_running_average=True)
-        sec = time.time() - begin
-
-        # compute metrics
-        logits = new_model_state['intermediates']['cls.logit'][0]
-        predictions = jax.nn.log_softmax(
-            logits, axis=-1)  # [B, K,]
-        target = common_utils.onehot(
-            batch['labels'], num_classes=logits.shape[-1])  # [B, K,]
-        loss = -jnp.sum(target * predictions, axis=-1)      # [B,]
-        acc = evaluate_acc(
-            predictions, batch['labels'], log_input=True, reduction='none')          # [B,]
-        nll = evaluate_nll(
-            predictions, batch['labels'], log_input=True, reduction='none')          # [B,]
-
-        # refine and return metrics
-        loss = jnp.sum(jnp.where(batch['marker'], loss, jnp.zeros_like(loss)))
-        acc = jnp.sum(jnp.where(batch['marker'], acc, jnp.zeros_like(acc)))
-        nll = jnp.sum(jnp.where(batch['marker'], nll, jnp.zeros_like(nll)))
-        cnt = jnp.sum(batch['marker'])
-
-        metrics = OrderedDict(
-            {"loss": loss, 'acc': acc, 'nll': nll, 'cnt': cnt, "sec": sec*cnt})
-        metrics = jax.lax.psum(metrics, axis_name='batch')
+        _, (metrics, _) = loss_func(state.params, state, batch)
+        metrics = jax.lax.pmean(metrics, axis_name='batch')
         return metrics
 
     cross_replica_mean = jax.pmap(lambda x: jax.lax.pmean(x, 'x'), 'x')
@@ -343,32 +334,32 @@ def launch(config, print_fn):
     #     print(k, v.shape)
     wl = WandbLogger()
 
-    for epoch_idx, _ in enumerate(tqdm(range(config.optim_ne)), start=1):
-        rng, data_rng = jax.random.split(rng)
+    def summarize_metrics(metrics, key="trn"):
+        metrics = common_utils.get_metrics(metrics)
+        summarized = {
+            f"{key}/{k}": v for k, v in jax.tree_util.tree_map(lambda e: e.sum(0), metrics).items()}
+        for k, v in summarized.items():
+            if "cnt" in k:
+                continue
+            elif "lr" in k:
+                continue
+            summarized[k] /= summarized[f"{key}/cnt"]
+        del summarized[f"{key}/cnt"]
+        return summarized
+
+    for epoch_idx in tqdm(range(config.optim_ne)):
+        epoch_rng = jax.random.fold_in(rng, epoch_idx)
 
         # ---------------------------------------------------------------------- #
         # Train
         # ---------------------------------------------------------------------- #
         trn_metric = []
-        trn_loader = dataloaders['dataloader'](rng=data_rng)
+        trn_loader = dataloaders['dataloader'](rng=epoch_rng)
         trn_loader = jax_utils.prefetch_to_device(trn_loader, size=2)
-        if config.shared_head or config.shared_last3:
-            trainable1 = state.params["Conv_0"]
-            frozen1 = state.params[frozen_keys[0]]
-        for batch_idx, batch in enumerate(trn_loader, start=1):
-            batch_rng = jax.random.fold_in(rng, batch_idx)
-            state, metrics = p_step_trn(state, batch)
-            if config.bezier:
-                state = state.replace(rng=jax_utils.replicate(batch_rng))
+        for batch_idx, batch in enumerate(trn_loader):
+            state, metrics = step_trn(state, batch)
             trn_metric.append(metrics)
-        if config.shared_head or config.shared_last3:
-            trainable2 = state.params["Conv_0"]
-            frozen2 = state.params[frozen_keys[0]]
-            assert jnp.any(trainable1["kernel"] != trainable2["kernel"])
-            assert jnp.all(frozen1["kernel"] == frozen2["kernel"])
-        trn_metric = common_utils.get_metrics(trn_metric)
-        trn_summarized = {f'trn/{k}': v for k,
-                          v in jax.tree_util.tree_map(lambda e: e.mean(), trn_metric).items()}
+        trn_summarized = summarize_metrics(trn_metric, "trn")
         wl.log(trn_summarized)
 
         if state.batch_stats is not None:
@@ -382,18 +373,10 @@ def launch(config, print_fn):
         val_metric = []
         val_loader = dataloaders['val_loader'](rng=None)
         val_loader = jax_utils.prefetch_to_device(val_loader, size=2)
-        for batch_idx, batch in enumerate(val_loader, start=1):
-            metrics = p_step_val(state, batch)
+        for batch_idx, batch in enumerate(val_loader):
+            metrics = step_val(state, batch)
             val_metric.append(metrics)
-        val_metric = common_utils.get_metrics(val_metric)
-        val_summarized = {f'val/{k}': v for k,
-                          v in jax.tree_util.tree_map(lambda e: e.sum(), val_metric).items()}
-        val_summarized['val/loss'] /= val_summarized['val/cnt']
-        val_summarized['val/acc'] /= val_summarized['val/cnt']
-        val_summarized['val/nll'] /= val_summarized['val/cnt']
-        val_summarized['val/sec'] /= val_summarized['val/cnt']
-        del val_summarized['val/cnt']
-        val_summarized.update(trn_summarized)
+        val_summarized = summarize_metrics(val_metric, "val")
         wl.log(val_summarized)
 
         # ---------------------------------------------------------------------- #
@@ -404,28 +387,16 @@ def launch(config, print_fn):
             tst_metric = []
             tst_loader = dataloaders['tst_loader'](rng=None)
             tst_loader = jax_utils.prefetch_to_device(tst_loader, size=2)
-            for batch_idx, batch in enumerate(tst_loader, start=1):
-                metrics = p_step_val(state, batch)
-                # if best_acc == 0 and batch_idx == 1:
-                #     sbatch = get_single_batch(batch)
-                #     sstate = jax_utils.unreplicate(state)
-                #     wallclock_metrics = measure_wallclock(sstate, sbatch)
-                #     print("wall clock time", wallclock_metrics["sec"], "sec")
+            for batch_idx, batch in enumerate(tst_loader):
+                metrics = step_val(state, batch)
                 tst_metric.append(metrics)
-            tst_metric = common_utils.get_metrics(tst_metric)
-            tst_summarized = {
-                f'tst/{k}': v for k, v in jax.tree_util.tree_map(lambda e: e.sum(), tst_metric).items()}
-            tst_summarized['tst/loss'] /= tst_summarized['tst/cnt']
-            tst_summarized['tst/acc'] /= tst_summarized['tst/cnt']
-            tst_summarized['tst/nll'] /= tst_summarized['tst/cnt']
-            tst_summarized['tst/sec'] /= tst_summarized['tst/cnt']
-            del tst_summarized["tst/cnt"]
+            tst_summarized = summarize_metrics(tst_metric, "tst")
             wl.log(tst_summarized)
             best_acc = val_summarized["val/acc"]
 
             if config.save:
                 save_state = jax_utils.unreplicate(state)
-                ckpt = dict(model=save_state, config=vars(
+                ckpt = dict(model=save_state.params, config=vars(
                     config), best_acc=best_acc)
                 orbax_checkpointer = orbax.checkpoint.PyTreeCheckpointer()
                 checkpoints.save_checkpoint(ckpt_dir=config.save,
@@ -480,13 +451,11 @@ def main():
     parser.add_argument("--nowandb", action="store_true")
     parser.add_argument("--shared_head", default="", type=str)
     parser.add_argument("--shared_last3", default=None, type=str)
-    parser.add_argument("--label_smooth", default=0, type=float)
     parser.add_argument("--shared_checkpoint", default=None, type=str)
     parser.add_argument("--shared_level", default=None, type=str)
     # ---------------------------------------------------------------------
     # Ensemble distillation
     # ---------------------------------------------------------------------
-    parser.add_argument("--ens_dist", default="", type=str)
     parser.add_argument("--teach0", default="", type=str)
     parser.add_argument("--teach1", default="", type=str)
     parser.add_argument("--dist_alpha", default=0.1, type=float)

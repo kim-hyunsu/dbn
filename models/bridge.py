@@ -124,16 +124,21 @@ def dsb_schedules(beta1, beta2, T, linear_noise=False):
     t = jnp.arange(0, T+1, dtype=jnp.float32)
     tau = t/T
 
-    beta_t = jnp.where(
-        tau < 0.5,
-        2*(beta2-beta1)*tau+beta1,
-        2*(beta1-beta2)*tau+2*beta2-beta1
-    )
-    sigma_t_square = jnp.where(
-        tau < 0.5,
-        (beta2-beta1)*tau**2 + beta1*tau,
-        0.5*(beta1-beta2) + (beta1-beta2)*tau**2+(2*beta2-beta1)*tau
-    )
+    if linear_noise:
+        beta_t = (beta1-beta2)*t + beta2
+        sigma_t_square = 0.5*(beta1-beta2)*tau**2 + beta2*tau
+    else:
+        beta_t = jnp.where(
+            tau < 0.5,
+            2*(beta2-beta1)*tau+beta1,
+            2*(beta1-beta2)*tau+2*beta2-beta1
+        )
+        sigma_t_square = jnp.where(
+            tau < 0.5,
+            (beta2-beta1)*tau**2 + beta1*tau,
+            0.5*(beta1-beta2) + (beta1-beta2)*tau**2+(2*beta2-beta1)*tau
+        )
+
     sigmabar_t_square = 0.5*(beta1+beta2) - sigma_t_square
 
     sigmabar_t_square = nn.relu(sigmabar_t_square)
@@ -176,7 +181,8 @@ def dsb_schedules(beta1, beta2, T, linear_noise=False):
         "bigsigma_t": bigsigma_t,
         "alpos_t": alpos_t,
         "alpos_weight_t": alpos_weight_t,
-        "sigma_t_square": sigma_t_square
+        "sigma_t_square": sigma_t_square,
+        "n_T": T
     }
 
 

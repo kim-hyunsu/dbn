@@ -184,8 +184,7 @@ def launch(config, print_fn):
     # ---------------------------------------------------------------------- #
     # Optimization
     # ---------------------------------------------------------------------- #
-
-    def step_trn(state, batch, config, scheduler):
+    def loss_func(params, state, batch, train=True):
         def pred(params, logits=False):
             params_dict = dict(params=params)
             mutable = ["intermediates"]
@@ -198,91 +197,58 @@ def launch(config, print_fn):
             _, new_model_state = state.apply_fn(
                 params_dict, batch['images'],
                 rngs=None,
-                mutable=mutable,
+                **(dict(mutable=mutable) if train else dict()),
                 use_running_average=False)
             if logits:
                 return new_model_state["intermediates"]["cls.logit"][0]
             return new_model_state
 
+        new_model_state = pred(params)
+        # cls loss
+        logits = new_model_state['intermediates']['cls.logit'][0]
+        target = common_utils.onehot(
+            batch['labels'], num_classes=logits.shape[-1])  # [B, K,]
+        predictions = jax.nn.log_softmax(logits, axis=-1)
+        loss = -jnp.sum(target * predictions, axis=-1)      # [B,]
+        loss = jnp.sum(
+            jnp.where(batch['marker'], loss, jnp.zeros_like(loss))
+        ) / jnp.sum(batch['marker'])
+
+        # kld loss
+        t_logits = jnp.stack(
+            [pred(t, logits=True) for t in teachers])
+        tau = config.dist_temp
+        predict = jax.nn.log_softmax(t_logits/tau, axis=-1)
+        teacher_probs = jnp.exp(predict)
+        _predictions = jax.nn.log_softmax(logits/tau, axis=-1)
+        kd_loss = -jnp.sum(teacher_probs *
+                           _predictions[None, ...], axis=-1)
+        kd_loss = kd_loss.sum(0)/ensemble_num
+        kd_loss = tau**2*jnp.sum(
+            jnp.where(batch["marker"], kd_loss, 0))/jnp.sum(batch["marker"])
+        a = config.dist_alpha
+        loss = (1-a)*loss + a*kd_loss
+
+        # accuracy
+        acc = evaluate_acc(
+            predictions, batch['labels'], log_input=True, reduction='none')          # [B,]
+        nll = evaluate_nll(
+            predictions, batch['labels'], log_input=True, reduction='none')          # [B,]
+
+        # refine and return metrics
+        acc = jnp.sum(jnp.where(batch['marker'], acc, jnp.zeros_like(acc)))
+        nll = jnp.sum(jnp.where(batch['marker'], nll, jnp.zeros_like(nll)))
+        cnt = jnp.sum(batch['marker'])
+        # log metrics
+        metrics = OrderedDict(
+            {'loss': loss, "acc": acc, "nll": nll, "cnt": cnt})
+
+        return loss, (metrics, new_model_state)
+
+    @partial(jax.pmap, axis_name="batch")
+    def step_trn(state, batch):
         def loss_fn(params):
-
-            new_model_state = pred(params)
-            # compute loss
-            # [B, K,]
-            logits = new_model_state['intermediates']['cls.logit'][0]
-            target = common_utils.onehot(
-                batch['labels'], num_classes=logits.shape[-1])  # [B, K,]
-            if config.label_smooth > 0:
-                alpha = config.label_smooth
-                n_cls = logits.shape[-1]
-                target = target*(1-alpha) + alpha/n_cls
-            predictions = jax.nn.log_softmax(logits, axis=-1)
-            loss = -jnp.sum(target * predictions, axis=-1)      # [B,]
-            loss = jnp.sum(
-                jnp.where(batch['marker'], loss, jnp.zeros_like(loss))
-            ) / jnp.sum(batch['marker'])
-            if config.ens_dist == "":
-                pass
-            elif config.ens_dist == "naive":
-                t_logits = jnp.stack(
-                    [pred(t, logits=True) for t in teachers])
-                teacher_pred = jax.scipy.special.logsumexp(
-                    t_logits, axis=0) - np.log(ensemble_num)
-                probs = jnp.exp(predictions)
-                kd_loss = -2*jnp.sum(probs*teacher_pred, axis=-1)
-                kd_loss = jnp.sum(
-                    jnp.where(batch["marker"], kd_loss, 0))/jnp.sum(batch["marker"])
-                a = config.dist_alpha
-                loss = (1-a)*loss + a*kd_loss
-            elif config.ens_dist == "mean":
-                t_logits = jnp.stack(
-                    [pred(t, logits=True) for t in teachers])
-                tau = config.dist_temp
-                predict = jax.nn.log_softmax(t_logits/tau, axis=-1)
-                teacher_probs = jnp.exp(predict)
-                predictions = jax.nn.log_softmax(logits/tau, axis=-1)
-                kd_loss = -jnp.sum(teacher_probs *
-                                   predictions[None, ...], axis=-1)
-                kd_loss = kd_loss.sum(0)/ensemble_num
-                kd_loss = tau**2*jnp.sum(
-                    jnp.where(batch["marker"], kd_loss, 0))/jnp.sum(batch["marker"])
-                a = config.dist_alpha
-                loss = (1-a)*loss + a*kd_loss
-            elif config.ens_dist == "mse":
-                t_logits = jnp.stack(
-                    [pred(t, logits=True) for t in teachers])
-                mse = jnp.sum((logits[None, ...]-t_logits)**2, axis=-1)
-                kd_loss = mse.sum(0)/ensemble_num
-                kd_loss = jnp.sum(
-                    jnp.where(batch["marker"], kd_loss, 0))/jnp.sum(batch["marker"])
-                a = config.dist_alpha
-                loss = (1-a)*loss + a*kd_loss
-            elif config.ens_dist == "enslogit":
-                t_logits = [pred(t, logits=True) for t in teachers]
-                ens_logits = get_ens_logits(t_logits, logitmean=0)
-                tau = config.dist_temp
-                ens_pred = jnp.exp(jax.nn.log_softmax(ens_logits/tau, axis=-1))
-                predictions = jax.nn.log_softmax(logits/tau, axis=-1)
-                kd_loss = -jnp.sum(ens_pred*predictions, axis=-1)
-                kd_loss = tau**2*jnp.sum(
-                    jnp.where(batch["marker"], kd_loss, 0))/jnp.sum(batch["marker"])
-                a = config.dist_alpha
-                loss = (1-a)*loss + a*kd_loss
-
-            # accuracy
-            acc = evaluate_acc(
-                predictions, batch['labels'], log_input=True, reduction='none')          # [B,]
-            nll = evaluate_nll(
-                predictions, batch['labels'], log_input=True, reduction='none')          # [B,]
-
-            # refine and return metrics
-            acc = jnp.sum(jnp.where(batch['marker'], acc, jnp.zeros_like(acc)))
-            nll = jnp.sum(jnp.where(batch['marker'], nll, jnp.zeros_like(nll)))
-            cnt = jnp.sum(batch['marker'])
-            # log metrics
-            metrics = OrderedDict(
-                {'loss': loss, "acc": acc/cnt, "nll": nll/cnt})
-            return loss, (metrics, new_model_state)
+            return loss_func(params, state, batch)
 
         # compute losses and gradients
         dynamic_scale = state.dynamic_scale
@@ -301,8 +267,7 @@ def launch(config, print_fn):
 
         # get auxiliaries
         metrics, new_model_state = aux[1]
-        metrics = jax.lax.pmean(metrics, axis_name='batch')
-        metrics['lr'] = scheduler(state.step)
+        metrics = jax.lax.psum(metrics, axis_name='batch')
 
         # update train state
         if new_model_state.get("batch_stats") is not None:
@@ -322,42 +287,9 @@ def launch(config, print_fn):
 
         return new_state, metrics
 
+    @partial(jax.pmap, axis_name="batch")
     def step_val(state, batch):
-        params = state.params
-        params_dict = dict(params=params)
-        if state.image_stats is not None:
-            params_dict["image_stats"] = state.image_stats
-        if state.batch_stats is not None:
-            params_dict["batch_stats"] = state.batch_stats
-
-        begin = time.time()
-        _, new_model_state = state.apply_fn(
-            params_dict, batch['images'],
-            rngs=None,
-            mutable='intermediates',
-            use_running_average=True)
-        sec = time.time() - begin
-
-        # compute metrics
-        logits = new_model_state['intermediates']['cls.logit'][0]
-        predictions = jax.nn.log_softmax(
-            logits, axis=-1)  # [B, K,]
-        target = common_utils.onehot(
-            batch['labels'], num_classes=logits.shape[-1])  # [B, K,]
-        loss = -jnp.sum(target * predictions, axis=-1)      # [B,]
-        acc = evaluate_acc(
-            predictions, batch['labels'], log_input=True, reduction='none')          # [B,]
-        nll = evaluate_nll(
-            predictions, batch['labels'], log_input=True, reduction='none')          # [B,]
-
-        # refine and return metrics
-        loss = jnp.sum(jnp.where(batch['marker'], loss, jnp.zeros_like(loss)))
-        acc = jnp.sum(jnp.where(batch['marker'], acc, jnp.zeros_like(acc)))
-        nll = jnp.sum(jnp.where(batch['marker'], nll, jnp.zeros_like(nll)))
-        cnt = jnp.sum(batch['marker'])
-
-        metrics = OrderedDict(
-            {"loss": loss, 'acc': acc, 'nll': nll, 'cnt': cnt, "sec": sec*cnt})
+        _, (metrics, _) = loss_func(state.params, state, batch)
         metrics = jax.lax.psum(metrics, axis_name='batch')
         return metrics
 
@@ -384,30 +316,33 @@ def launch(config, print_fn):
     #     print(k, v.shape)
     wl = WandbLogger()
 
-    for epoch_idx, _ in enumerate(tqdm(range(config.optim_ne)), start=1):
-        rng, data_rng = jax.random.split(rng)
+    def summarize_metrics(metrics, key="trn"):
+        metrics = common_utils.get_metrics(metrics)
+        summarized = {
+            f"{key}/{k}": v for k, v in jax.tree_util.tree_map(lambda e: e.sum(0), metrics).items()}
+        for k, v in summarized.items():
+            if "cnt" in k:
+                continue
+            elif "lr" in k:
+                continue
+            summarized[k] /= summarized[f"{key}/cnt"]
+        del summarized[f"{key}/cnt"]
+        return summarized
+
+    for epoch_idx in tqdm(range(config.optim_ne)):
+        epoch_rng = jax.random.fold_in(rng, epoch_idx)
 
         # ---------------------------------------------------------------------- #
         # Train
         # ---------------------------------------------------------------------- #
         trn_metric = []
-        trn_loader = dataloaders['dataloader'](rng=data_rng)
+        trn_loader = dataloaders['dataloader'](rng=epoch_rng)
         trn_loader = jax_utils.prefetch_to_device(trn_loader, size=2)
-        if config.shared_head or config.shared_last3:
-            trainable1 = state.params["Conv_0"]
-            frozen1 = state.params[frozen_keys[0]]
-        for batch_idx, batch in enumerate(trn_loader, start=1):
-            batch_rng = jax.random.fold_in(rng, batch_idx)
-            state, metrics = p_step_trn(state, batch)
+        for batch_idx, batch in enumerate(trn_loader):
+            state, metrics = step_trn(state, batch)
             trn_metric.append(metrics)
-        if config.shared_head or config.shared_last3:
-            trainable2 = state.params["Conv_0"]
-            frozen2 = state.params[frozen_keys[0]]
-            assert jnp.any(trainable1["kernel"] != trainable2["kernel"])
-            assert jnp.all(frozen1["kernel"] == frozen2["kernel"])
-        trn_metric = common_utils.get_metrics(trn_metric)
-        trn_summarized = {f'trn/{k}': v for k,
-                          v in jax.tree_util.tree_map(lambda e: e.mean(), trn_metric).items()}
+        trn_summarized = summarize_metrics(trn_metric, "trn")
+        trn_summarized['lr'] = scheduler(state.step)
         wl.log(trn_summarized)
 
         if state.batch_stats is not None:
@@ -421,18 +356,10 @@ def launch(config, print_fn):
         val_metric = []
         val_loader = dataloaders['val_loader'](rng=None)
         val_loader = jax_utils.prefetch_to_device(val_loader, size=2)
-        for batch_idx, batch in enumerate(val_loader, start=1):
-            metrics = p_step_val(state, batch)
+        for batch_idx, batch in enumerate(val_loader):
+            metrics = step_val(state, batch)
             val_metric.append(metrics)
-        val_metric = common_utils.get_metrics(val_metric)
-        val_summarized = {f'val/{k}': v for k,
-                          v in jax.tree_util.tree_map(lambda e: e.sum(), val_metric).items()}
-        val_summarized['val/loss'] /= val_summarized['val/cnt']
-        val_summarized['val/acc'] /= val_summarized['val/cnt']
-        val_summarized['val/nll'] /= val_summarized['val/cnt']
-        val_summarized['val/sec'] /= val_summarized['val/cnt']
-        del val_summarized['val/cnt']
-        val_summarized.update(trn_summarized)
+        val_summarized = summarize_metrics(val_metric, "val")
         wl.log(val_summarized)
 
         # ---------------------------------------------------------------------- #
@@ -443,28 +370,16 @@ def launch(config, print_fn):
             tst_metric = []
             tst_loader = dataloaders['tst_loader'](rng=None)
             tst_loader = jax_utils.prefetch_to_device(tst_loader, size=2)
-            for batch_idx, batch in enumerate(tst_loader, start=1):
-                metrics = p_step_val(state, batch)
-                # if best_acc == 0 and batch_idx == 1:
-                #     sbatch = get_single_batch(batch)
-                #     sstate = jax_utils.unreplicate(state)
-                #     wallclock_metrics = measure_wallclock(sstate, sbatch)
-                #     print("wall clock time", wallclock_metrics["sec"], "sec")
+            for batch_idx, batch in enumerate(tst_loader):
+                metrics = step_val(state, batch)
                 tst_metric.append(metrics)
-            tst_metric = common_utils.get_metrics(tst_metric)
-            tst_summarized = {
-                f'tst/{k}': v for k, v in jax.tree_util.tree_map(lambda e: e.sum(), tst_metric).items()}
-            tst_summarized['tst/loss'] /= tst_summarized['tst/cnt']
-            tst_summarized['tst/acc'] /= tst_summarized['tst/cnt']
-            tst_summarized['tst/nll'] /= tst_summarized['tst/cnt']
-            tst_summarized['tst/sec'] /= tst_summarized['tst/cnt']
-            del tst_summarized["tst/cnt"]
+            tst_summarized = summarize_metrics(tst_metric, "tst")
             wl.log(tst_summarized)
             best_acc = val_summarized["val/acc"]
 
             if config.save:
                 save_state = jax_utils.unreplicate(state)
-                ckpt = dict(model=save_state, config=vars(
+                ckpt = dict(model=save_state.params, config=vars(
                     config), best_acc=best_acc)
                 orbax_checkpointer = orbax.checkpoint.PyTreeCheckpointer()
                 checkpoints.save_checkpoint(ckpt_dir=config.save,
@@ -519,13 +434,11 @@ def main():
     parser.add_argument("--nowandb", action="store_true")
     parser.add_argument("--shared_head", default="", type=str)
     parser.add_argument("--shared_last3", default=None, type=str)
-    parser.add_argument("--label_smooth", default=0, type=float)
     parser.add_argument("--shared_checkpoint", default=None, type=str)
     parser.add_argument("--shared_level", default=None, type=str)
     # ---------------------------------------------------------------------
     # Ensemble distillation
     # ---------------------------------------------------------------------
-    parser.add_argument("--ens_dist", default="", type=str)
     parser.add_argument("--teach0", default="", type=str)
     parser.add_argument("--teach1", default="", type=str)
     parser.add_argument("--dist_alpha", default=0.1, type=float)

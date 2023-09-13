@@ -13,5 +13,8 @@ python dsb_renewal_fat.py \
     --beta1 0.0001 \
     --beta2 0.0001 \
     --linear_noise \
-    --print_inter > no_perturb.log
+    --perturb 0.1 \
+    --perturb_mode 3 \
+    --repulsive 0.01 \
+    --kld_joint
 echo 1

@@ -618,10 +618,10 @@ def launch(config, print_fn):
         schedules=cls_scheduler,
         boundaries=cls_boundaries
     )
-    if config.optim == "adam":
+    if config.optim_base == "adam":
         optim = partial(
             optax.adamw, learning_rate=scheduler, weight_decay=config.optim_weight_decay)
-    elif config.optim == "sgd":
+    elif config.optim_base == "sgd":
         optim = partial(
             optax.sgd, learning_rate=scheduler, momentum=config.optim_momentum)
     else:
@@ -1245,7 +1245,7 @@ def main():
                         help='momentum coefficient (default: 0.9)')
     parser.add_argument('--optim_weight_decay', default=0.1, type=float,
                         help='weight decay coefficient (default: 0.0001)')
-    parser.add_argument('--optim', default="adam", type=str)
+    parser.add_argument('--optim_base', default="adam", type=str)
     parser.add_argument('--start_cls', default=-1, type=int)
     parser.add_argument('--cls_optim', default="adam", type=str)
     parser.add_argument('--start_base', default=999999999999, type=int)

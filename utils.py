@@ -283,7 +283,12 @@ def model_list(data_name, model_style, shared_head=False, tag=""):
             return [
                 "./checkpoints/frn_sd2_be",
                 "./checkpoints/frn_sd3_be",
-                "./checkpoints/frn_sd5_be"
+                "./checkpoints/frn_sd5_be",
+                "./checkpoints/frn_sd7_be",
+                "./checkpoints/frn_sd9_be",
+                "./checkpoints/frn_sd11_be",
+                "./checkpoints/frn_sd13_be",
+                "./checkpoints/frn_sd15_be",
             ]
         elif tag == "layer2stride1_shared":
             return [

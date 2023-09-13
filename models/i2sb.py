@@ -2144,7 +2144,7 @@ class DiffusionBridgeNetwork(nn.Module):
         l = l[:, 0, 0, :]
         return l, z
 
-    def set_logit(self, l1):
+    def set_logit(self, rng, l1):
         if self.forget == 0:
             pass
         elif self.forget == 1:
@@ -2156,9 +2156,14 @@ class DiffusionBridgeNetwork(nn.Module):
         elif self.forget == 4:
             l1 = jnp.zeros_like(l1)
             label = jnp.arange(self.fat)
-            onehot = common_utils.onehot(label, num_classes=l1.shape[-1]//self.fat)
-            onehot = onehot.reshape(1,-1)
+            onehot = common_utils.onehot(
+                label, num_classes=l1.shape[-1]//self.fat)
+            onehot = onehot.reshape(1, -1)
             l1 += onehot
+        elif self.forget == 5:
+            l1 = l1/8
+            mask = jax.random.bernoulli(rng, p=0.5, shape=l1.shape)
+            l1 = mask*l1
         return l1
 
     def conditional_dbn(self, rng, l0, x1, base_params=None, cls_params=None, **kwargs):
@@ -2167,7 +2172,7 @@ class DiffusionBridgeNetwork(nn.Module):
         if self.fat:
             reps = [1]*len(l1.shape[:-1]) + [self.fat]
             l1 = jnp.tile(l1, reps)
-        l1 = self.set_logit(l1)
+        l1 = self.set_logit(rng, l1)
         l_t, t, mu_t, sigma_t, _ = self.forward(rng, l0, l1)
         # ------------------------------
         # MIMO batch mix
@@ -2199,7 +2204,7 @@ class DiffusionBridgeNetwork(nn.Module):
             z1 = jnp.tile(z1, reps)
             reps = [1]*len(l1.shape[:-1]) + [self.fat]
             l1 = jnp.tile(l1, reps)
-        l1 = self.set_logit(l1)
+        l1 = self.set_logit(rng, l1)
         lrng, zrng = jax.random.split(rng)
         l_t, t, l_mu_t, l_sigma_t, _ts = self.forward(lrng, l0, l1)
         z_t, _t, z_mu_t, z_sigma_t, _ = self.forward(
@@ -2293,7 +2298,7 @@ class DiffusionBridgeNetwork(nn.Module):
             zB = jnp.tile(zB, reps)
             reps = [1]*len(lB.shape[:-1]) + [self.fat]
             lB = jnp.tile(lB, reps)
-        lB = self.set_logit(lB)
+        lB = self.set_logit(rng, lB)
         out = sampler(
             partial(self.score, training=False), rng, lB, zB)
         if self.print_inter:
@@ -2316,7 +2321,7 @@ class DiffusionBridgeNetwork(nn.Module):
         if self.fat:
             reps = [1]*len(lB.shape[:-1]) + [self.fat]
             lB = jnp.tile(lB, reps)
-        lB = self.set_logit(lB)
+        lB = self.set_logit(rng, lB)
         lC = sampler(
             partial(self.score, training=False), rng, lB, zB)
         if self.print_inter:

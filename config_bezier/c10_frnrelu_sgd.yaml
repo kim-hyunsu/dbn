@@ -3,8 +3,10 @@ model_depth: 32
 model_width: 2
 model_style: FRN-Swish
 model_name: FlaxResNet
-optim_bs: 64
-optim_ne: 400
-optim_lr: 0.0001
+optim_bs: 256
+optim_ne: 200
+optim_lr: 0.1
 optim_weight_decay: 0.001
-optim: adam
+optim: sgd
+bezier: True
+theta0: ./checkpoints/frn_sd2_be

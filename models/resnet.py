@@ -58,6 +58,8 @@ class FlaxResNetClassifier3(nn.Module):
                                                 bias_init=jax.nn.initializers.zeros)
     feature_name: str = "feature.layer3stride2"
     mimo: int = 1
+    num_planes: int = 16
+    num_blocks: Tuple[int] = None
 
     @nn.compact
     def __call__(self, x, **kwargs):
@@ -92,8 +94,9 @@ class FlaxResNetClassifier3(nn.Module):
             x = x / jnp.reshape(s.value, (1, 1, 1, -1))
 
         # specify block structure and widen factor...
-        num_planes = 16
-        num_blocks = [(self.depth - 2) // 6,] * 3
+        num_planes = self.num_planes
+        num_blocks = [(self.depth - 2) // 6,] * \
+            3 if self.num_blocks is None else self.num_blocks
         widen_factor = self.widen_factor
 
         # define the first layer...
@@ -370,6 +373,7 @@ class FlaxResNet(nn.Module):
         widen_factor = self.widen_factor
 
         # define the first layer...
+        _y = x
         y = self.conv(
             features=num_planes,
             kernel_size=(3, 3),
@@ -377,6 +381,7 @@ class FlaxResNet(nn.Module):
             padding='SAME',
             dtype=self.dtype,
         )(x)
+        # print(f"{y.shape[1]*y.shape[2]*3**2*_y.shape[-1]*y.shape[-1]}")
         y = self.norm(dtype=self.dtype)(y)
         y = self.relu(y)
         self.sow('intermediates', 'feature.layer0', y)
@@ -388,7 +393,7 @@ class FlaxResNet(nn.Module):
             for _stride_idx, _stride in enumerate(_strides, start=1):
                 _channel = num_planes * (2 ** layer_idx)
                 residual = y
-
+                _y = y
                 y = self.conv(
                     features=int(_channel * widen_factor),
                     kernel_size=(3, 3),
@@ -396,6 +401,7 @@ class FlaxResNet(nn.Module):
                     padding='SAME',
                     dtype=self.dtype,
                 )(y)
+                # print(f"{y.shape[1]*y.shape[2]*3**2*_y.shape[-1]*y.shape[-1]}")
                 y = self.norm(dtype=self.dtype)(y)
                 y = self.relu(y)
                 y = self.conv(
@@ -405,6 +411,7 @@ class FlaxResNet(nn.Module):
                     padding='SAME',
                     dtype=self.dtype,
                 )(y)
+                # print(f"{y.shape[1]*y.shape[2]*3**2*_y.shape[-1]*y.shape[-1]}")
                 y = self.norm(dtype=self.dtype)(y)
                 if residual.shape != y.shape:
                     # NOTE : we use the projection shortcut regardless of the input size,
@@ -416,6 +423,7 @@ class FlaxResNet(nn.Module):
                         padding='SAME',
                         dtype=self.dtype,
                     )(residual)
+                    # print(f"{y.shape[1]*y.shape[2]*_y.shape[-1]*y.shape[-1]}")
                     residual = self.norm(dtype=self.dtype)(residual)
 
                 if _stride_idx == len(_strides):
@@ -464,6 +472,8 @@ class FlaxResNetBase(nn.Module):
                                                 bias_init=jax.nn.initializers.zeros)
     out: str = "feature.layer3stride2"
     mimo: int = 1
+    num_planes: int = 16
+    num_blocks: Tuple[int] = None
 
     @nn.compact
     def __call__(self, x, **kwargs):
@@ -493,8 +503,10 @@ class FlaxResNetBase(nn.Module):
         x = x / jnp.reshape(s.value, (1, 1, 1, -1))
 
         # specify block structure and widen factor...
-        num_planes = 16
-        num_blocks = [(self.depth - 2) // 6,] * 3
+        num_planes = self.num_planes
+        num_blocks = (
+            [(self.depth - 2) // 6,] * 3
+        ) if self.num_blocks is None else self.num_blocks
         widen_factor = self.widen_factor
 
         def mimo_out(out_ch, next_feature_names):

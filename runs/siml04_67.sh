@@ -1,17 +1,25 @@
 echo 0
-python dsb_renewal_fat.py \
-    --config config_dsb/c10_frnrelu_AtoshABCnew.yaml \
-    --feature_name feature.layer2stride1 \
-    --tag AtoABC \
-    --fat 3 \
-    --optim_bs 128 \
-    --joint 2 \
-    --T 5 \
-    --joint_depth 6 \
-    --version v1.1.4 \
-    --forget 1 \
-    --beta1 0.0001 \
-    --beta2 0.0001 \
-    --linear_noise \
-    --print_inter > no_perturb.log
+taskset -c 72-95 python dbn.py \
+    --config config_dsb/c10_frnrelu_AtoABC_ensemble.yaml \
+    --save ./checkpoints/dbn/c10/t235
 echo 1
+taskset -c 72-95 python dbn.py \
+    --config config_dsb/c10_frnrelu_AtoABC_ensemble.yaml \
+    --save ./checkpoints/dbn/c10/t235 \
+    --seed 2734073311
+echo 2
+taskset -c 72-95 python dbn.py \
+    --config config_dsb/c10_frnrelu_AtoABC_ensemble.yaml \
+    --save ./checkpoints/dbn/c10/t235 \
+    --seed 2835375169
+echo 3
+taskset -c 72-95 python dbn.py \
+    --config config_dsb/c10_frnrelu_AtoABC_ensemble.yaml \
+    --save ./checkpoints/dbn/c10/t235 \
+    --seed 925694920
+echo 4
+taskset -c 72-95 python dbn.py \
+    --config config_dsb/c10_frnrelu_AtoABC_ensemble.yaml \
+    --save ./checkpoints/dbn/c10/t235 \
+    --seed 4200062
+echo 5

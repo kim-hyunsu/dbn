@@ -1,1 +1,2 @@
-python sgd2.py --seed 17 --save ./checkpoints/bn100_sd17 --nowandb
+python naive_ed.py \
+    --config config_naive_ed/c10_frnrelu_shX_t3.yaml

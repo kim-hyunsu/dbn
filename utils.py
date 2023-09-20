@@ -243,6 +243,25 @@ def model_list(data_name, model_style, shared_head=False, tag=""):
                 # "./checkpoints/bn100_sd13",
                 # "./checkpoints/bn100_sd17",
             ]
+    if data_name == "CIFAR100_x32" and model_style == "FRN-Swish":
+        if tag == "AtoABC":
+            return [
+                "./checkpoints/frn100_sd11_be",
+                "./checkpoints/frn100_sd13_be",
+                "./checkpoints/frn100_sd15_be",
+                "./checkpoints/frn100_sd2_be",
+                "./checkpoints/frn100_sd3_be",
+                "./checkpoints/frn100_sd5_be",
+                "./checkpoints/frn100_sd9_be",
+            ]
+    elif data_name == "TinyImageNet200_x64" and model_style == "FRN-Swish":
+        if tag == "AtoABC":
+            return [
+                "./checkpoints/frn200_sd2_be",
+                "./checkpoints/frn200_sd3_be",
+                "./checkpoints/frn200_sd5_be",
+                "./checkpoints/frn200_sd7_be"
+            ]
     elif data_name == "CIFAR10_x32" and model_style == "FRN-Swish":
         if tag == "bezier":
             return [
@@ -289,6 +308,13 @@ def model_list(data_name, model_style, shared_head=False, tag=""):
                 "./checkpoints/frn_sd11_be",
                 "./checkpoints/frn_sd13_be",
                 "./checkpoints/frn_sd15_be",
+            ]
+        elif tag == "DistoABC":
+            return [
+                "./checkpoints/naive_ed/frn_sd235_t3",
+                "./checkpoints/frn_sd2_be",
+                "./checkpoints/frn_sd3_be",
+                "./checkpoints/frn_sd5_be",
             ]
         elif tag == "layer2stride1_shared":
             return [

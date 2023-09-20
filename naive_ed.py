@@ -1,9 +1,6 @@
-from audioop import reverse
-from re import M
 import numpy as np
 from sgd_trainstate import TrainState, TrainStateRNG, get_sgd_state
 import wandb
-import time
 from tqdm import tqdm
 from giung2.metrics import evaluate_acc, evaluate_nll
 # from giung2.models.resnet import FlaxResNet
@@ -58,22 +55,13 @@ def launch(config, print_fn):
             pixel_std=defaults.PIXEL_STD,
             num_classes=dataloaders['num_classes'],
             num_planes=config.model_planes,
-            num_blocks=((int(b) for b in config.model_blocks.split(
-                ",")) if config.model_blocks is not None else None)
+            num_blocks=tuple(
+                int(b) for b in config.model_blocks.split(",")
+            ) if config.model_blocks is not None else None
         )
-        _base = partial(
-            FlaxResNetBase,
-            depth=config.model_depth,
-            widen_factor=config.model_width,
-            dtype=model_dtype,
-            pixel_mean=defaults.PIXEL_MEAN,
-            pixel_std=defaults.PIXEL_STD,
-            num_classes=dataloaders['num_classes'],
-            out=config.shared_level)
 
     if config.model_style == 'BN-ReLU':
         model = _ResNet()
-        base = _base()
     elif config.model_style == "FRN-Swish":
         model = _ResNet(
             conv=partial(
@@ -83,18 +71,10 @@ def launch(config, print_fn):
                 bias_init=jax.nn.initializers.zeros),
             norm=FilterResponseNorm,
             relu=flax.linen.swish)
-        base = _base(
-            conv=partial(
-                flax.linen.Conv,
-                use_bias=True,
-                kernel_init=jax.nn.initializers.he_normal(),
-                bias_init=jax.nn.initializers.zeros),
-            norm=FilterResponseNorm,
-            relu=flax.linen.swish)
-    # initialize model
 
+    # initialize model
     def initialize_model(key, model):
-        @jax.jit
+        @ jax.jit
         def init(*args):
             return model.init(*args)
         return init({'params': key}, jnp.ones(dataloaders['image_shape'], model.dtype))
@@ -107,8 +87,10 @@ def launch(config, print_fn):
         dynamic_scale = dynamic_scale_lib.DynamicScale()
 
     # define optimizer with scheduler
-    scheduler = optax.cosine_decay_schedule(
-        init_value=config.optim_lr,
+    scheduler = optax.warmup_cosine_decay_schedule(
+        init_value=config.warmup_factor*config.optim_lr,
+        peak_value=config.optim_lr,
+        warmup_steps=config.warmup_steps,
         decay_steps=config.optim_ne * dataloaders['trn_steps_per_epoch'])
     if config.optim == "sgd":
         optimizer = optax.sgd(
@@ -117,51 +99,6 @@ def launch(config, print_fn):
     elif config.optim == "adam":
         optimizer = optax.adamw(learning_rate=scheduler,
                                 weight_decay=config.optim_weight_decay)
-
-    frozen_keys = []
-    if config.shared_checkpoint is not None:
-        base_variables = initialize_model(init_rng, base)
-
-        def sorter(x):
-            assert "_" in x
-            name, num = x.split("_")
-            return (name, int(num))
-        params = variables.unfreeze()
-        res_param_keys = []
-        base_param_keys = []
-        for k, v in params["params"].items():
-            res_param_keys.append(k)
-        for k, v in base_variables["params"].items():
-            base_param_keys.append(k)
-        res_param_keys = sorted(res_param_keys, key=sorter)
-        base_param_keys = sorted(base_param_keys, key=sorter)
-
-        shared_ckpt = checkpoints.restore_checkpoint(
-            ckpt_dir=config.shared_checkpoint,
-            target=None
-        )
-        for k in res_param_keys:
-            if k in base_param_keys:
-                continue
-            params["params"][k] = shared_ckpt["model"]["params"][k]
-            frozen_keys.append(k)
-        variables = freeze(params)
-        partition_optimizer = {
-            "trainable": optimizer,
-            "frozen": optax.set_to_zero()
-        }
-
-        def include(keywords, path):
-            included = False
-            for k in keywords:
-                if k in path:
-                    included = True
-                    break
-            return included
-        param_partitions = freeze(traverse_util.path_aware_map(
-            lambda path, v: "frozen" if include(frozen_keys, path) else "trainable", variables["params"]))
-        optimizer = optax.multi_transform(
-            partition_optimizer, param_partitions)
 
     # build train state
     state = TrainState.create(
@@ -379,8 +316,12 @@ def launch(config, print_fn):
 
             if config.save:
                 save_state = jax_utils.unreplicate(state)
-                ckpt = dict(model=save_state.params, config=vars(
-                    config), best_acc=best_acc)
+                ckpt = dict(
+                    params=save_state.params,
+                    batch_stats=getattr(save_state, "batch_stats", None),
+                    image_stats=getattr(save_state, "image_stats", None),
+                    config=vars(config),
+                    best_acc=best_acc)
                 orbax_checkpointer = orbax.checkpoint.PyTreeCheckpointer()
                 checkpoints.save_checkpoint(ckpt_dir=config.save,
                                             target=ckpt,
@@ -422,7 +363,8 @@ def main():
                         help='momentum coefficient (default: 0.9)')
     parser.add_argument('--optim_weight_decay', default=0.001, type=float,
                         help='weight decay coefficient (default: 0.0001)')
-
+    parser.add_argument("--warmup_factor", default=0.01, type=float)
+    parser.add_argument("--warmup_steps", default=0, type=int)
     parser.add_argument('--save', default=None, type=str,
                         help='save the *.log and *.ckpt files if specified (default: False)')
     parser.add_argument('--seed', default=2023, type=int,

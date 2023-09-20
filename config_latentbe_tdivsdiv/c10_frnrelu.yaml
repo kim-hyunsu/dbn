@@ -8,9 +8,7 @@ optim_ne: 200
 optim_lr: 0.1
 optim_weight_decay: 0.001
 optim: sgd
-dist_alpha: 1
-dist_temp: 4
 teachers:
-  - "./checkpoints/frn_sd2_be"
-  - "./checkpoints/frn_sd23_shared3"
-  - "./checkpoints/frn_sd25_shared3"
+  - "./checkpoints/frn10_sd2_be"
+  - "./checkpoints/frn10_sd3_be"
+  - "./checkpoints/frn10_sd5_be"

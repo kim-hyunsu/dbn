@@ -107,8 +107,10 @@ def launch(config, print_fn):
         dynamic_scale = dynamic_scale_lib.DynamicScale()
 
     # define optimizer with scheduler
-    scheduler = optax.cosine_decay_schedule(
-        init_value=config.optim_lr,
+    scheduler = optax.warmup_cosine_decay_schedule(
+        init_value=config.warmup_factor*config.optim_lr,
+        peak_value=config.optim_lr,
+        warmup_steps=config.warmup_steps,
         decay_steps=config.optim_ne * dataloaders['trn_steps_per_epoch'])
     if config.optim == "sgd":
         optimizer = optax.sgd(
@@ -439,7 +441,8 @@ def main():
                         help='momentum coefficient (default: 0.9)')
     parser.add_argument('--optim_weight_decay', default=0.001, type=float,
                         help='weight decay coefficient (default: 0.0001)')
-
+    parser.add_argument("--warmup_factor", default=0.01, type=float)
+    parser.add_argument("--warmup_steps", default=0, type=int)
     parser.add_argument('--save', default=None, type=str,
                         help='save the *.log and *.ckpt files if specified (default: False)')
     parser.add_argument('--seed', default=2023, type=int,

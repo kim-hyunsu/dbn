@@ -751,7 +751,6 @@ def launch(config, print_fn):
                 raise NotImplementedError
     partitions = flax.core.freeze(
         flax.traverse_util.path_aware_map(tagging, variables["params"]))
-    print(partitions)
     optimizer = optax.multi_transform(partition_optimizers, partitions)
 
     # ------------------------------------------------------------------------

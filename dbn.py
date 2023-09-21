@@ -1239,6 +1239,7 @@ def launch(config, print_fn):
         # ---------------------------------------------------------------
         count = jnp.sum(batch["marker"])
         x = batch["images"]
+        y = batch["labels"]
         batch_size = x.shape[0]
         a = config.mixup_alpha
         beta_rng, perm_rng = jax.random.split(state.rng)
@@ -1246,10 +1247,14 @@ def launch(config, print_fn):
         lamda = jnp.where(a > 0, jax.random.beta(beta_rng, a, a), 1)
 
         perm_x = jax.random.permutation(perm_rng, x)
+        perm_y = jax.random.permutation(perm_rng, y)
         mixed_x = (1-lamda)*x+lamda*perm_x
+        mixed_y = (1-lamda)*y+lamda*perm_y
         mixed_x = jnp.where(count == batch_size, mixed_x, x)
+        mixed_y = jnp.where(count == batch_size, mixed_y, y)
 
         batch["images"] = mixed_x
+        batch["labels"] = mixed_y
         return batch
 
     def choose_what_to_print(print_bin, inter):

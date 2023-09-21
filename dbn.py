@@ -569,7 +569,7 @@ def dsb_sample_cont(score, rng, x0, config, dsb_stats, steps, y0=None):
         mean = batch_mul(coeffs['x0'], x_0_eps) + batch_mul(coeffs['x1'], val)
         
         rng, step_rng = jax.random.split(rng)
-        h = jax.randon.normal(step_rng, x_n.shape)
+        h = jax.random.normal(step_rng, x_n.shape)
         x_n = mean + batch_mul(coeffs['n'], h)
 
         x_list.pop(0)

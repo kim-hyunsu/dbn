@@ -524,7 +524,7 @@ def build_dbn(config):
     cls_net = get_classifier(config)
     base_net = get_resnet(config, head=False)
     dsb_stats = dsb_schedules(
-        config.beta1, config.beta2, config.T, linear_noise=config.linear_noise)
+        config.beta1, config.beta2, config.T, linear_noise=config.linear_noise, continuous=config.dsb_continuous)
     score_net = get_scorenet(config)
     crt_net = partial(CorrectionModel, layers=1) if config.crt > 0 else None
     dbn = DiffusionBridgeNetwork(
@@ -541,7 +541,8 @@ def build_dbn(config):
         print_inter=False,
         mimo_cond=config.mimo_cond,
         start_temp=config.start_temp,
-        multi_mixup=False
+        multi_mixup=False,
+        continuous=config.dsb_continuous
     )
     return dbn, (dsb_stats, None)
 
@@ -589,6 +590,45 @@ def dsb_sample(score, rng, x0, y0=None, config=None, dsb_stats=None, z_dsb_stats
         x_list.append(val)
     x_n = val
 
+    return jnp.concatenate(x_list, axis=0)
+
+
+def dsb_sample_cont(score, rng, x0, y0=None, config=None, dsb_stats=None, z_dsb_stats=None, steps=None):
+    shape = x0.shape
+    batch_size = shape[0]
+
+    timesteps = jnp.concatenate(
+        [jnp.linspace(1.0, 0.001, steps), jnp.zeros([1])])
+
+    @jax.jit
+    def body_fn(n, val):
+        rng, x_n, x_list = val
+        t, next_t = timesteps[n], timesteps[n+1]
+        vec_t = jnp.ones([batch_size]) * t
+        vec_next_t = jnp.ones([batch_size]) * next_t
+
+        if config.mimo_cond:
+            vec_t = jnp.tile(vec_t[:, None], reps=[1, config.fat])
+        eps = score(x_n, y0, t=vec_t)
+
+        coeffs = dsb_stats((vec_next_t, vec_t), mode='sampling')
+        x_0_eps = x_n - batch_mul(coeffs['sigma_t'], eps)
+        mean = batch_mul(coeffs['x0'], x_0_eps) + batch_mul(coeffs['x1'], x_n)
+
+        rng, step_rng = jax.random.split(rng)
+        h = jax.random.normal(step_rng, x_n.shape)
+        x_n = mean + batch_mul(coeffs['noise'], h)
+
+        x_list.pop(0)
+        x_list.append(x_n)
+        return rng, x_n, x_list
+
+    x_list = [x0] * (steps + 1)
+    # _, _, x_list = jax.lax.fori_loop(0, steps, body_fn, (rng, x0, x_list))
+    val = (rng, x0, x_list)
+    for i in range(0, steps):
+        val = body_fn(i, val)
+    _, _, x_list = val
     return jnp.concatenate(x_list, axis=0)
 
 
@@ -724,8 +764,7 @@ def launch(config, print_fn):
         "base": optax.set_to_zero() if not config.train_base else base_optim(),
         "score": base_optim(),
         "cls": optax.set_to_zero(),
-        "crt": base_optim(),
-        "FilterNet": base_optim(learning_rate=refer_fn)
+        "crt": base_optim()
     }
 
     def tagging(path, v):
@@ -734,21 +773,18 @@ def launch(config, print_fn):
                 if f"cls_{i}" in path:
                     return True
             return False
-        if "FilterNet_0" in path:
-            return "FilterNet"
+        if "base" in path:
+            return "base"
+        elif "score" in path:
+            return "score"
+        elif "cls" in path:
+            return "cls"
+        elif "crt" in path:
+            return "crt"
+        elif cls_list():
+            return "cls"
         else:
-            if "base" in path:
-                return "base"
-            elif "score" in path:
-                return "score"
-            elif "cls" in path:
-                return "cls"
-            elif "crt" in path:
-                return "crt"
-            elif cls_list():
-                return "cls"
-            else:
-                raise NotImplementedError
+            raise NotImplementedError
     partitions = flax.core.freeze(
         flax.traverse_util.path_aware_map(tagging, variables["params"]))
     optimizer = optax.multi_transform(partition_optimizers, partitions)
@@ -848,7 +884,10 @@ def launch(config, print_fn):
         z0_list = []
         logitsA = []
         for i, res_params_dict in enumerate(resnet_param_list):
-            images = batch["images"]
+            if i == 0 or batch.get("images_tar") is None:
+                images = batch["images"]
+            else:
+                images = batch["images_tar"]
             z0, logits0 = forward_resnet(res_params_dict, images)
             z0_list.append(z0)
             # logits0: (B, d)
@@ -905,18 +944,17 @@ def launch(config, print_fn):
         (
             epsilon, l_t, t, mu_t, sigma_t
         ), logits0eps = output[0] if train else output
+
+        _sigma_t = expand_to_broadcast(sigma_t, l_t, axis=1)
+        diff = (l_t-_logitsA) / _sigma_t
+        score_loss = mse_loss(epsilon, diff)
         if config.prob_loss:
             pA = jnp.concatenate([jax.nn.softmax(l, axis=-1)
                                  for l in logitsA], axis=-1)
-            p0eps = jax.nn.log_softmax(logits0eps, axis=-1)
-            p0eps = jnp.exp(p0eps)
+            p0eps = jax.nn.softmax(logits0eps, axis=-1)
             p0eps = rearrange(p0eps, "n b d -> b (n d)")
             _sigma_t = expand_to_broadcast(sigma_t, p0eps, axis=1)
-            score_loss = mse_loss(p0eps/_sigma_t, pA/_sigma_t)
-        else:
-            _sigma_t = expand_to_broadcast(sigma_t, l_t, axis=1)
-            diff = (l_t-_logitsA) / _sigma_t
-            score_loss = mse_loss(epsilon, diff)
+            score_loss += mse_loss(p0eps/_sigma_t, pA/_sigma_t)
         score_loss = reduce_mean(score_loss, batch["marker"])
         if config.kld_joint:
             if config.residual_prediction:
@@ -1029,7 +1067,8 @@ def launch(config, print_fn):
         rngs_dict = dict(dropout=drop_rng)
         model_bd = dbn.bind(params_dict, rngs=rngs_dict)
         _dsb_sample = partial(
-            dsb_sample, config=config, dsb_stats=dsb_stats, z_dsb_stats=z_dsb_stats, steps=steps)
+            dsb_sample_cont if config.dsb_continuous else dsb_sample,
+            config=config, dsb_stats=dsb_stats, z_dsb_stats=z_dsb_stats, steps=steps)
         logitsC, _zC = model_bd.sample(
             score_rng, _dsb_sample, batch["images"])
         logitsC = rearrange(logitsC, "n (t b) z -> t n b z", t=steps+1)
@@ -1156,21 +1195,61 @@ def launch(config, print_fn):
     # ------------------------------------------------------------------------
     @partial(jax.pmap, axis_name="batch")
     def step_mixup(state, batch):
+        # count = jnp.sum(batch["marker"])
+        # x = batch["images"]
+        # batch_size = x.shape[0]
+        # a = config.mixup_alpha
+        # beta_rng, perm_rng = jax.random.split(state.rng)
+
+        # lamda = jnp.where(a > 0, jax.random.beta(beta_rng, a, a), 1)
+        # lamda = jnp.where(a > 0.5, 1-lamda, lamda)
+
+        # perm_rng, perm_rng_tar = jax.random.split(perm_rng)
+
+        # perm_x = jax.random.permutation(perm_rng, x)
+        # mixed_x = (1-lamda)*x+lamda*perm_x
+        # mixed_x = jnp.where(count == batch_size, mixed_x, x)
+
+        # perm_x_tar = jax.random.permutation(perm_rng_tar, x)
+        # mixed_x_tar = (1-lamda)*x+lamda*perm_x_tar
+        # mixed_x_tar = jnp.where(count == batch_size, mixed_x_tar, x)
+
+        # batch["images"] = mixed_x
+        # batch["images_tar"] = mixed_x_tar
+        # ---------------------------------------------------------------
+        # count = jnp.sum(batch["marker"])
+        # x = batch["images"]
+        # batch_size = x.shape[0]
+        # a = config.mixup_alpha
+        # beta_rng, perm_rng = jax.random.split(state.rng)
+
+        # lamda = jnp.where(a > 0, jax.random.beta(
+        #     beta_rng, a, a, shape=(2,)), 1)
+        # lamda = jnp.where(a > 0.5, 1-lamda, lamda)
+
+        # perm_x = jax.random.permutation(perm_rng, x)
+        # mixed_x = (1-lamda[0])*x+lamda[0]*perm_x
+        # mixed_x = jnp.where(count == batch_size, mixed_x, x)
+
+        # mixed_x_tar = (1-lamda[1])*x+lamda[1]*perm_x
+        # mixed_x_tar = jnp.where(count == batch_size, mixed_x_tar, x)
+
+        # batch["images"] = mixed_x
+        # batch["images_tar"] = mixed_x_tar
+        # ---------------------------------------------------------------
         count = jnp.sum(batch["marker"])
         x = batch["images"]
-        y = batch["labels"]
         batch_size = x.shape[0]
         a = config.mixup_alpha
         beta_rng, perm_rng = jax.random.split(state.rng)
+
         lamda = jnp.where(a > 0, jax.random.beta(beta_rng, a, a), 1)
+
         perm_x = jax.random.permutation(perm_rng, x)
-        perm_y = jax.random.permutation(perm_rng, y)
-        mixed_x = lamda*x+(1-lamda)*perm_x
-        mixed_y = jnp.where(lamda >= 0.5, y, perm_y)
+        mixed_x = (1-lamda)*x+lamda*perm_x
         mixed_x = jnp.where(count == batch_size, mixed_x, x)
-        mixed_y = jnp.where(count == batch_size, mixed_y, y)
+
         batch["images"] = mixed_x
-        batch["labels"] = mixed_y
         return batch
 
     def choose_what_to_print(print_bin, inter):
@@ -1453,6 +1532,8 @@ def main():
     parser.add_argument("--width_multi", default=1, type=float)
     # print intermediate samples
     parser.add_argument("--print_inter", action="store_true")
+    # continuous diffusion
+    parser.add_argument("--dsb_continuous", action="store_true")
     # ---------------------------------------------------------------------------------------
     # diffusion
     # ---------------------------------------------------------------------------------------

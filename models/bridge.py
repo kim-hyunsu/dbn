@@ -117,73 +117,117 @@ class MLP(nn.Module):
         return out
 
 
-def dsb_schedules(beta1, beta2, T, linear_noise=False):
+def dsb_schedules(beta1, beta2, T, linear_noise=False, continuous=False):
     # TODO
     # assert beta1 < beta2 < 1.0, "beta1 and beta2 must be in (0, 1)"
+    if continuous:
+        def cum_beta_t(t_end, t_start):
+            # assert t_end <= t_start
+            if linear_noise:
+                sigma_t_start = 0.5 * (beta1 - beta2) * \
+                    t_start ** 2 + beta2 * t_start
+                sigma_t_end = 0.5 * (beta1 - beta2) * \
+                    t_end ** 2 + beta2 * t_end
+            else:
+                sigma_t_start = jnp.where(
+                    t_start < 0.5,
+                    (beta2 - beta1) * t_start ** 2 + beta1 * t_start,
+                    0.5 * (beta1 - beta2) + (beta1 - beta2) *
+                    t_start ** 2 + (2 * beta2 - beta1) * t_start
+                )
+                sigma_t_end = jnp.where(
+                    t_end < 0.5,
+                    (beta2 - beta1) * t_end ** 2 + beta1 * t_end,
+                    0.5 * (beta1 - beta2) + (beta1 - beta2) *
+                    t_end ** 2 + (2 * beta2 - beta1) * t_end
+                )
+            return jnp.maximum(sigma_t_start - sigma_t_end, 0)
 
-    t = jnp.arange(0, T+1, dtype=jnp.float32)
-    tau = t/T
+        def dsb_params_t(t, mode='train'):
+            if mode == 'train':
+                t_next = t
+                t_prev = 1
+            elif mode == 'sampling':
+                # assert isinstance(t, tuple)
+                # assert len(t) == 2
+                t_next, t_prev = t
+            else:
+                raise ValueError(
+                    "mode should be either `train` or `sampling`.")
 
-    if linear_noise:
-        beta_t = (beta1-beta2)*t + beta2
-        sigma_t_square = 0.5*(beta1-beta2)*tau**2 + beta2*tau
+            A_x0 = cum_beta_t(0, t_next) / cum_beta_t(0, t_prev)
+            A_x1 = cum_beta_t(t_next, t_prev) / cum_beta_t(0, t_prev)
+            A_n = jnp.sqrt(cum_beta_t(0, t_next) *
+                           cum_beta_t(t_next, t_prev) / cum_beta_t(0, t_prev))
+            sigma = jnp.sqrt(cum_beta_t(0, t_next))
+            coeffs = {'x0': A_x0, 'x1': A_x1, 'noise': A_n, 'sigma_t': sigma}
+            return coeffs
+
+        return dsb_params_t
     else:
-        beta_t = jnp.where(
-            tau < 0.5,
-            2*(beta2-beta1)*tau+beta1,
-            2*(beta1-beta2)*tau+2*beta2-beta1
-        )
-        sigma_t_square = jnp.where(
-            tau < 0.5,
-            (beta2-beta1)*tau**2 + beta1*tau,
-            0.5*(beta1-beta2) + (beta1-beta2)*tau**2+(2*beta2-beta1)*tau
-        )
+        t = jnp.arange(0, T+1, dtype=jnp.float32)
+        tau = t/T
 
-    sigmabar_t_square = 0.5*(beta1+beta2) - sigma_t_square
+        if linear_noise:
+            beta_t = (beta1-beta2)*tau**2 + beta2
+            sigma_t_square = 0.5*(beta1-beta2)*tau**2 + beta2*tau
+        else:
+            beta_t = jnp.where(
+                tau < 0.5,
+                2*(beta2-beta1)*tau+beta1,
+                2*(beta1-beta2)*tau+2*beta2-beta1
+            )
+            sigma_t_square = jnp.where(
+                tau < 0.5,
+                (beta2-beta1)*tau**2 + beta1*tau,
+                0.5*(beta1-beta2) + (beta1-beta2)*tau**2+(2*beta2-beta1)*tau
+            )
 
-    sigmabar_t_square = nn.relu(sigmabar_t_square)
-    sigma_t = jnp.sqrt(sigma_t_square)
-    sigmabar_t = jnp.sqrt(sigmabar_t_square)
-    sigma_weight_t = sigmabar_t_square/(sigma_t_square+sigmabar_t_square)
-    bigsigma_t = sigma_t_square*sigma_weight_t
+        sigmabar_t_square = 0.5*(beta1+beta2) - sigma_t_square
 
-    sqrt_beta_t = jnp.sqrt(beta_t)
-    alpha_t = 1 - beta_t
-    log_alpha_t = jnp.log(alpha_t)
-    log_alphabar_t = jnp.cumsum(log_alpha_t, axis=0)
-    alphabar_t = jnp.exp(log_alphabar_t)
+        sigmabar_t_square = nn.relu(sigmabar_t_square)
+        sigma_t = jnp.sqrt(sigma_t_square)
+        sigmabar_t = jnp.sqrt(sigmabar_t_square)
+        sigma_weight_t = sigmabar_t_square/(sigma_t_square+sigmabar_t_square)
+        bigsigma_t = sigma_t_square*sigma_weight_t
 
-    sqrtab = jnp.sqrt(alphabar_t)
-    oneover_sqrta = 1 / jnp.sqrt(alpha_t)
+        sqrt_beta_t = jnp.sqrt(beta_t)
+        alpha_t = 1 - beta_t
+        log_alpha_t = jnp.log(alpha_t)
+        log_alphabar_t = jnp.cumsum(log_alpha_t, axis=0)
+        alphabar_t = jnp.exp(log_alphabar_t)
 
-    sqrtmab = jnp.sqrt(1 - alphabar_t)
-    mab_over_sqrtmab_inv = (1 - alpha_t) / sqrtmab
+        sqrtab = jnp.sqrt(alphabar_t)
+        oneover_sqrta = 1 / jnp.sqrt(alpha_t)
 
-    # posterior coefficients
-    alpos_t = sigma_t_square[1:] - sigma_t_square[:-1]
-    alpos_t = jnp.concatenate([jnp.zeros(1), alpos_t])
-    sigma_t_square_minus_zero = jnp.concatenate(
-        [jnp.zeros(1), sigma_t_square[:-1]])
-    alpos_weight_t = alpos_t / (alpos_t + sigma_t_square_minus_zero)
+        sqrtmab = jnp.sqrt(1 - alphabar_t)
+        mab_over_sqrtmab_inv = (1 - alpha_t) / sqrtmab
 
-    return {
-        "alpha_t": alpha_t,  # \alpha_t
-        "oneover_sqrta": oneover_sqrta,  # 1/\sqrt{\alpha_t}
-        "sqrt_beta_t": sqrt_beta_t,  # \sqrt{\beta_t}
-        "alphabar_t": alphabar_t,  # \bar{\alpha_t}
-        "sqrtab": sqrtab,  # \sqrt{\bar{\alpha_t}}
-        "sqrtmab": sqrtmab,  # \sqrt{1-\bar{\alpha_t}}
-        # (1-\alpha_t)/\sqrt{1-\bar{\alpha_t}}
-        "mab_over_sqrtmab": mab_over_sqrtmab_inv,
-        "sigma_t": sigma_t,
-        "sigmabar_t": sigmabar_t,
-        "sigma_weight_t": sigma_weight_t,
-        "bigsigma_t": bigsigma_t,
-        "alpos_t": alpos_t,
-        "alpos_weight_t": alpos_weight_t,
-        "sigma_t_square": sigma_t_square,
-        "n_T": T
-    }
+        # posterior coefficients
+        alpos_t = sigma_t_square[1:] - sigma_t_square[:-1]
+        alpos_t = jnp.concatenate([jnp.zeros(1), alpos_t])
+        sigma_t_square_minus_zero = jnp.concatenate(
+            [jnp.zeros(1), sigma_t_square[:-1]])
+        alpos_weight_t = alpos_t / (alpos_t + sigma_t_square_minus_zero)
+
+        return {
+            "alpha_t": alpha_t,  # \alpha_t
+            "oneover_sqrta": oneover_sqrta,  # 1/\sqrt{\alpha_t}
+            "sqrt_beta_t": sqrt_beta_t,  # \sqrt{\beta_t}
+            "alphabar_t": alphabar_t,  # \bar{\alpha_t}
+            "sqrtab": sqrtab,  # \sqrt{\bar{\alpha_t}}
+            "sqrtmab": sqrtmab,  # \sqrt{1-\bar{\alpha_t}}
+            # (1-\alpha_t)/\sqrt{1-\bar{\alpha_t}}
+            "mab_over_sqrtmab": mab_over_sqrtmab_inv,
+            "sigma_t": sigma_t,
+            "sigmabar_t": sigmabar_t,
+            "sigma_weight_t": sigma_weight_t,
+            "bigsigma_t": bigsigma_t,
+            "alpos_t": alpos_t,
+            "alpos_weight_t": alpos_weight_t,
+            "sigma_t_square": sigma_t_square,
+            "n_T": T
+        }
 
 
 class EmbedFC(nn.Module):

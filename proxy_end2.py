@@ -207,34 +207,40 @@ def launch(config, print_fn):
         # loss_kd
         tau = config.dist_temp
         new_model_state = pred(params)
-        logits= new_model_state["intermediates"]["cls.logit"][0]
-        alphas = 1.0 + jnp.exp(logits / tau) # [N, K,]
+        logits = new_model_state["intermediates"]["cls.logit"][0]
+        alphas = 1.0 + jnp.exp(logits / tau)  # [N, K,]
 
         teacher_logits = jnp.stack(
             [pred(t, logits=True) for t in teachers])
-        teacher_confs = jax.nn.softmax(teacher_logits / tau, axis=-1) # [M, N, K,]
-        teacher_confs_mean = jnp.mean(teacher_confs, axis=0) # [N, K,]
+        teacher_confs = jax.nn.softmax(
+            teacher_logits / tau, axis=-1)  # [M, N, K,]
+        teacher_confs_mean = jnp.mean(teacher_confs, axis=0)  # [N, K,]
         precision = 0.5 * (teacher_confs.shape[2] - 1) / jnp.sum(
             teacher_confs_mean * (
-                jnp.log(teacher_confs_mean) - jnp.mean(jnp.log(teacher_confs), axis=0)
-            ), axis=1, keepdims=True) # [N, 1,]
-        betas = 1.0 + (teacher_confs_mean * precision) # [N, K,]
+                jnp.log(teacher_confs_mean) -
+                jnp.mean(jnp.log(teacher_confs), axis=0)
+            ), axis=1, keepdims=True)  # [N, 1,]
+        betas = 1.0 + (teacher_confs_mean * precision)  # [N, K,]
 
         reconstruction_term = jnp.sum(
             -teacher_confs_mean * (
-                jax.lax.digamma(alphas) - jax.lax.digamma(jnp.sum(alphas, axis=1, keepdims=True))
-            ), axis=-1) # [N,]
+                jax.lax.digamma(
+                    alphas) - jax.lax.digamma(jnp.sum(alphas, axis=1, keepdims=True))
+            ), axis=-1)  # [N,]
         # reconstruction_term = jnp.sum(
         #     -teacher_confs_mean * jax.nn.log_softmax(student_logits, axis=-1), axis=-1) # [N,]
-        
+
         prior_term = ((
-            jax.lax.lgamma(jnp.sum(alphas, axis=1)) - jnp.sum(jax.lax.lgamma(alphas), axis=1)
-            + jnp.sum(jax.lax.lgamma(jnp.ones_like(betas)), axis=1) - jax.lax.lgamma(jnp.sum(jnp.ones_like(betas), axis=1))
+            jax.lax.lgamma(jnp.sum(alphas, axis=1)) -
+            jnp.sum(jax.lax.lgamma(alphas), axis=1)
+            + jnp.sum(jax.lax.lgamma(jnp.ones_like(betas)), axis=1) -
+            jax.lax.lgamma(jnp.sum(jnp.ones_like(betas), axis=1))
         ) + jnp.sum(
             (alphas - jnp.ones_like(betas)) * (
-                jax.lax.digamma(alphas) - jax.lax.digamma(jnp.sum(alphas, axis=1, keepdims=True))
+                jax.lax.digamma(
+                    alphas) - jax.lax.digamma(jnp.sum(alphas, axis=1, keepdims=True))
             ), axis=1
-        )) / jnp.sum(betas, axis=1) # [N,]
+        )) / jnp.sum(betas, axis=1)  # [N,]
         kd_loss = jnp.mean(prior_term + reconstruction_term)
 
         target = common_utils.onehot(
@@ -398,8 +404,12 @@ def launch(config, print_fn):
 
             if config.save:
                 save_state = jax_utils.unreplicate(state)
-                ckpt = dict(model=save_state.params, config=vars(
-                    config), best_acc=best_acc)
+                ckpt = dict(
+                    params=save_state.params,
+                    batch_stats=getattr(save_state, "batch_stats", None),
+                    image_stats=getattr(save_state, "image_stats", None),
+                    config=vars(config),
+                    best_acc=best_acc)
                 orbax_checkpointer = orbax.checkpoint.PyTreeCheckpointer()
                 checkpoints.save_checkpoint(ckpt_dir=config.save,
                                             target=ckpt,

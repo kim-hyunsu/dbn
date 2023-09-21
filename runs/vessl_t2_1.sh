@@ -1,4 +1,5 @@
 echo 0
-taskset -c 48-71 python dbn.py \
-    --config config_dsb/c100_frnrelu_AtoABC_ensemble.yaml --nowandb
+python dbn.py \
+    --config config_dsb/c10_frnrelu_AtoABC_ensemble.yaml \
+    --dsb_continuous --nowandb
 echo 1

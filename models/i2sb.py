@@ -12,7 +12,7 @@ import math
 import numpy as np
 from einops import rearrange
 
-from utils import expand_to_broadcast, jprint
+from utils import expand_to_broadcast, jprint, batch_mul
 from .bridge import Decoder as TinyDecoder, ResidualBlock
 
 # revised from https://github.com/NVlabs/I2SB
@@ -1521,6 +1521,87 @@ class InvertedResidual(nn.Module):
             return x
 
 
+class CondInvertedResidual(nn.Module):
+    in_ch: int
+    ch: int
+    st: int
+    expand: int
+    conv: nn.Module = nn.Conv
+    norm: nn.Module = nn.BatchNorm
+    relu6: Callable = nn.activation.relu6
+    fc: nn.Module = nn.Dense
+
+    @nn.compact
+    def __call__(self, x, emb, **kwargs):
+        residual = x
+        norm_kwargs = to_norm_kwargs(self.norm, kwargs)
+        hidden_dim = round(self.in_ch*self.expand)
+        identity = self.st == 1 and self.in_ch == self.ch
+        emb = self.fc(features=x.shape[-1])(emb)
+        emb = emb[:, None, None, :]
+        if self.expand == 1:
+            _x = x
+            x = self.conv(
+                features=hidden_dim,
+                kernel_size=(3, 3),
+                strides=(self.st, self.st),
+                padding=1,
+                feature_group_count=hidden_dim,
+                use_bias=False
+            )(x+emb)
+            # print(f"{x.shape[1]*x.shape[2]*3**2*hidden_dim}")
+            x = self.norm(**norm_kwargs)(x)
+            x = self.relu6(x)
+            _x = x
+            x = self.conv(
+                features=self.ch,
+                kernel_size=(1, 1),
+                strides=(1, 1),
+                padding=0,
+                use_bias=False
+            )(x)
+            # print(f"{x.shape[1]*x.shape[2]*_x.shape[-1]*x.shape[-1]}")
+            x = self.norm(**norm_kwargs)(x)
+        else:
+            _x = x
+            x = self.conv(
+                features=hidden_dim,
+                kernel_size=(1, 1),
+                strides=(1, 1),
+                padding=0,
+                use_bias=False
+            )(x+emb)
+            # print(f"{x.shape[1]*x.shape[2]*_x.shape[-1]*x.shape[-1]}")
+            x = self.norm(**norm_kwargs)(x)
+            x = self.relu6(x)
+            _x = x
+            x = self.conv(
+                features=hidden_dim,
+                kernel_size=(3, 3),
+                strides=(self.st, self.st),
+                padding=1,
+                feature_group_count=hidden_dim,
+                use_bias=False
+            )(x)
+            # print(f"{x.shape[1]*x.shape[2]*3**2*hidden_dim}")
+            x = self.norm(**norm_kwargs)(x)
+            x = self.relu6(x)
+            _x = x
+            x = self.conv(
+                features=self.ch,
+                kernel_size=(1, 1),
+                strides=(1, 1),
+                padding=0,
+                use_bias=False
+            )(x)
+            # print(f"{x.shape[1]*x.shape[2]*_x.shape[-1]*x.shape[-1]}")
+            x = self.norm(**norm_kwargs)(x)
+        if identity:
+            return residual + x
+        else:
+            return x
+
+
 class ClsUnet(nn.Module):
     num_input: int
     p_dim: int = 10
@@ -2108,13 +2189,13 @@ class ClsUnet(nn.Module):
         # p = self.relu6(p - p_m + 6) + p_m - 6
         # p = self.refer(features=in_c//2)(p)
         # p = nn.gelu(p)
-        p = FilterNet(features=in_c//2)(p)
+        p = LogitEncoder()(p)
         # p = jnp.tanh(p)
         # p = p  - 6
         # p = p[:, None, None, :]
         # p = jnp.tile(p, reps=[1,x.shape[1], x.shape[2], 1])
 
-        t = jnp.concatenate([p, t], axis=-1)
+        # t = jnp.concatenate([p, t], axis=-1)
         _x = x
         x = self.conv(
             features=in_c,
@@ -2134,12 +2215,13 @@ class ClsUnet(nn.Module):
             for i in range(n):
                 if i == 0:
                     x += _t
-                x = InvertedResidual(
+                p = jnp.where(i == 0, p, 0)
+                x = CondInvertedResidual(
                     in_ch=in_c,
                     ch=out_c,
                     st=s if i == 0 else 1,
                     expand=e
-                )(x, **kwargs)
+                )(x, p, **kwargs)
                 in_c = out_c
         out_c = _divisible(c*self.width_multi, 2)
         _x = x
@@ -2159,8 +2241,7 @@ def _divisible(v, divisor, min_value=None):
     return new_v
 
 
-class FilterNet(nn.Module):
-    features: int
+class LogitEncoder(nn.Module):
     relu6: Callable = nn.relu6
     gelu: Callable = nn.gelu
     fc: nn.Module = partial(
@@ -2172,10 +2253,11 @@ class FilterNet(nn.Module):
 
     @nn.compact
     def __call__(self, x, **kwargs):
-        x_m = jnp.median(x, axis=-1, keepdims=True)
-        x = self.relu6(x - x_m + 6) + x_m - 6
-        x = self.fc(features=self.features)(x)
-        x = self.gelu(x)
+        dim = x.shape[-1]
+        p = jax.nn.softmax(x, axis=-1)
+        x_s = jnp.std(p, axis=-1, keepdims=True)
+        x_a = jnp.mean(p, axis=-1, keepdims=True)
+        x = jnp.concatenate([x_s, x_a], axis=-1)
         return x
 
 
@@ -2476,8 +2558,8 @@ class DiffusionBridgeNetwork(nn.Module):
     score_net: Sequence[nn.Module]
     cls_net: Sequence[nn.Module]
     crt_net: Sequence[nn.Module]
-    dsb_stats: dict
-    z_dsb_stats: dict
+    dsb_stats: Any
+    z_dsb_stats: Any
     fat: int
     joint: bool
     forget: int = 0
@@ -2486,6 +2568,7 @@ class DiffusionBridgeNetwork(nn.Module):
     print_inter: bool = False
     mimo_cond: bool = False
     multi_mixup: bool = False
+    continuous: bool = False
 
     def setup(self):
         self.base = self.base_net()
@@ -2683,27 +2766,39 @@ class DiffusionBridgeNetwork(nn.Module):
         if dsb_stats is None:
             dsb_stats = self.dsb_stats
 
-        n_T = dsb_stats["n_T"]
-        _sigma_weight_t = dsb_stats["sigma_weight_t"]
-        _sigma_t = dsb_stats["sigma_t"]
-        _bigsigma_t = dsb_stats["bigsigma_t"]
+        if self.continuous:
+            t_rng, n_rng = jax.random.split(rng)
+            if _ts is None:
+                _ts = jax.random.uniform(
+                    t_rng, (x0.shape[0],), minval=0.001, maxval=1.0)
+            coeff = dsb_stats(_ts, mode='train')
+            mu_t = batch_mul(coeff['x0'], x0) + batch_mul(coeff['x1'], x1)
+            noise = jax.random.normal(n_rng, mu_t.shape)  # (B, d)
+            x_t = mu_t + batch_mul(coeff['noise'], noise)
+            return x_t, _ts, mu_t, coeff['sigma_t'], _ts
 
-        t_rng, n_rng = jax.random.split(rng, 2)
+        else:
+            n_T = dsb_stats["n_T"]
+            _sigma_weight_t = dsb_stats["sigma_weight_t"]
+            _sigma_t = dsb_stats["sigma_t"]
+            _bigsigma_t = dsb_stats["bigsigma_t"]
 
-        if _ts is None:
-            _ts = jax.random.randint(t_rng, (x0.shape[0],), 1, n_T)  # (B,)
-        sigma_weight_t = _sigma_weight_t[_ts]  # (B,)
-        sigma_weight_t = expand_to_broadcast(sigma_weight_t, x0, axis=1)
-        sigma_t = _sigma_t[_ts]
-        mu_t = (sigma_weight_t*x0+(1-sigma_weight_t)*x1)
-        bigsigma_t = _bigsigma_t[_ts]  # (B,)
-        bigsigma_t = expand_to_broadcast(bigsigma_t, mu_t, axis=1)
+            t_rng, n_rng = jax.random.split(rng, 2)
 
-        # q(X_t|X_0,X_1) = N(X_t;mu_t,bigsigma_t)
-        noise = jax.random.normal(n_rng, mu_t.shape)  # (B, d)
-        x_t = mu_t + noise*jnp.sqrt(bigsigma_t)
-        t = _ts/n_T
-        return x_t, t, mu_t, sigma_t, _ts
+            if _ts is None:
+                _ts = jax.random.randint(t_rng, (x0.shape[0],), 1, n_T)  # (B,)
+            sigma_weight_t = _sigma_weight_t[_ts]  # (B,)
+            sigma_weight_t = expand_to_broadcast(sigma_weight_t, x0, axis=1)
+            sigma_t = _sigma_t[_ts]
+            mu_t = (sigma_weight_t*x0+(1-sigma_weight_t)*x1)
+            bigsigma_t = _bigsigma_t[_ts]  # (B,)
+            bigsigma_t = expand_to_broadcast(bigsigma_t, mu_t, axis=1)
+
+            # q(X_t|X_0,X_1) = N(X_t;mu_t,bigsigma_t)
+            noise = jax.random.normal(n_rng, mu_t.shape)  # (B, d)
+            x_t = mu_t + noise*jnp.sqrt(bigsigma_t)
+            t = _ts/n_T
+            return x_t, t, mu_t, sigma_t, _ts
 
     def sample(self, *args, **kwargs):
         if self.joint == 1:

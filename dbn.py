@@ -577,7 +577,7 @@ def dsb_sample_cont(score, rng, x0, config, dsb_stats, steps, y0=None):
         return rng, x_n, x_list
 
     x_list = [x0] * (steps + 1)
-    _, x_n, x_list = jax.lax.fori_loop(0, steps, (rng, x0, x_list))
+    _, _, x_list = jax.lax.fori_loop(0, steps, body_fn, (rng, x0, x_list))
     return jnp.concatenate(x_list, axis=0)
 
 

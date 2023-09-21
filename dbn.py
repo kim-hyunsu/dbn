@@ -541,9 +541,44 @@ def build_dbn(config):
         print_inter=False,
         mimo_cond=config.mimo_cond,
         start_temp=config.start_temp,
-        multi_mixup=False
+        multi_mixup=False,
+        continuous=config.dsb_continuous
     )
     return dbn, (dsb_stats, None)
+
+
+def dsb_sample_cont(score, rng, x0, config, dsb_stats, steps, y0=None):
+    shape = x0.shape
+    batch_size = shape[0]
+
+    timesteps = jnp.concatenate([jnp.linspace(1.0, 0.001, steps), jnp.zeros([1])])
+
+    @jax.jit
+    def body_fn(n, val):
+        rng, x_n, x_list = val
+        t, next_t = timesteps[n], timesteps[n+1]
+        vec_t = jnp.ones([batch_size]) * t
+        vec_next_t = jnp.ones([batch_size]) * next_t
+
+        if config.mimo_cond:
+            vec_t = jnp.tile(vec_t[:, None], reps=[1, config.fat])
+        eps = score(x_n, y0, t=vec_t)
+
+        coeffs = dsb_stats((vec_next_t, vec_t), mode='sampling')
+        x_0_eps = x_n - batch_mul(coeffs['sigma_t'], eps)
+        mean = batch_mul(coeffs['x0'], x_0_eps) + batch_mul(coeffs['x1'], val)
+        
+        rng, step_rng = jax.random.split(rng)
+        h = jax.randon.normal(step_rng, x_n.shape)
+        x_n = mean + batch_mul(coeffs['n'], h)
+
+        x_list.pop(0)
+        x_list.append(x_n)
+        return rng, x_n, x_list
+
+    x_list = [x0] * (steps + 1)
+    _, x_n, x_list = jax.lax.fori_loop(0, steps, (rng, x0, x_list))
+    return jnp.concatenate(x_list, axis=0)
 
 
 def dsb_sample(score, rng, x0, y0=None, config=None, dsb_stats=None, z_dsb_stats=None, steps=None):
@@ -644,15 +679,15 @@ def launch(config, print_fn):
     _, h, w, d = dataloaders["image_shape"]
     x_dim = (h, w, d)
     config.x_dim = x_dim
-    print("Calculating statistics of feature z...")
+    print_fn("Calculating statistics of feature z...")
     (
         (lmean, lstd, lmax, lmin, ldim),
         (zmean, zstd, zmax, zmin, zdim)
     ) = get_stats(
         config, dataloaders, resnet, resnet_param_list[0])
-    print(
+    print_fn(
         f"l mean {lmean:.3f} std {lstd:.3f} max {lmax:.3f} min {lmin:.3f} dim {ldim}")
-    print(
+    print_fn(
         f"z mean {zmean:.3f} std {zstd:.3f} max {zmax:.3f} min {zmin:.3f} dim {zdim}")
     config.z_dim = zdim
     score_input_dim = get_score_input_dim(config)
@@ -672,13 +707,13 @@ def launch(config, print_fn):
     # ------------------------------------------------------------------------
     # define score and cls
     # ------------------------------------------------------------------------
-    print("Building Diffusion Bridge Network (DBN)...")
+    print_fn("Building Diffusion Bridge Network (DBN)...")
     dbn, (dsb_stats, z_dsb_stats) = build_dbn(config)
 
     # ------------------------------------------------------------------------
     # initialize score & cls and replace base and cls with loaded params
     # ------------------------------------------------------------------------
-    print("Initializing DBN...")
+    print_fn("Initializing DBN...")
     init_rng, sub_rng = jax.random.split(rng)
     variables = dbn.init(
         {"params": init_rng, "dropout": init_rng},
@@ -687,7 +722,7 @@ def launch(config, print_fn):
         x1=jnp.empty((1, *x_dim)),
         training=False
     )
-    print("Loading base and cls networks...")
+    print_fn("Loading base and cls networks...")
     variables = load_base_cls(
         variables, resnet_param_list,
         load_cls=not config.cls_from_scratch,
@@ -1028,10 +1063,17 @@ def launch(config, print_fn):
             batch_stats=state.batch_stats)
         rngs_dict = dict(dropout=drop_rng)
         model_bd = dbn.bind(params_dict, rngs=rngs_dict)
-        _dsb_sample = partial(
-            dsb_sample, config=config, dsb_stats=dsb_stats, z_dsb_stats=z_dsb_stats, steps=steps)
-        logitsC, _zC = model_bd.sample(
-            score_rng, _dsb_sample, batch["images"])
+        if config.dsb_continuous:
+            _dsb_sample = partial(
+                dsb_sample_cont, config=config, dsb_stats=dsb_stats, steps=steps
+            )
+            logitsC, _zC = _dsb_sample(score_rng, _dsb_sample, batch["images"])
+        else:
+            _dsb_sample = partial(
+                dsb_sample, config=config, dsb_stats=dsb_stats, z_dsb_stats=z_dsb_stats, steps=steps)
+            # _dsb_sample: input (score, rng, x0, y0=None)
+            logitsC, _zC = model_bd.sample(
+                score_rng, _dsb_sample, batch["images"])
         logitsC = rearrange(logitsC, "n (t b) z -> t n b z", t=steps+1)
         logitsC_inter = logitsC
         if config.medium:
@@ -1487,6 +1529,9 @@ def main():
     parser.add_argument("--use_new_attention_order", action="store_true")
     parser.add_argument("--large", action="store_true")
 
+    ### Added argument: dsb_continuous (default=True)
+
+
     if args.config is not None:
         parser.set_defaults(**arg_defaults)
 
@@ -1499,19 +1544,7 @@ def main():
             + int.from_bytes(os.urandom(2), 'big')
         )
 
-    # if args.save is not None:
-    #     args.save = os.path.abspath(args.save)
-    #     if os.path.exists(args.save):
-    #         raise AssertionError(f'already existing args.save = {args.save}')
-    #     os.makedirs(args.save, exist_ok=True)
-
     print_fn = partial(print, flush=True)
-    # if args.save:
-    #     def print_fn(s):
-    #         with open(os.path.join(args.save, f'{TIME_STAMP}.log'), 'a') as fp:
-    #             fp.write(s + '\n')
-    #         print(s, flush=True)
-
     log_str = tabulate([
         ('sys.platform', sys.platform),
         ('Python', sys.version.replace('\n', '')),
@@ -1544,11 +1577,4 @@ def main():
 
 
 if __name__ == '__main__':
-    # import traceback
-    # with open("error.log", "w") as log:
-    #     try:
-    #         main()
-    #     except Exception:
-    #         print("ERROR OCCURED! Check it out in error.log.")
-    #         traceback.print_exc(file=log)
     main()

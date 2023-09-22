@@ -1,6 +1,7 @@
 from builtins import NotImplementedError
 import os
 import orbax
+from copy import deepcopy
 
 
 from typing import Any, Tuple
@@ -426,6 +427,29 @@ def get_score_input_dim(config):
     return score_input_dim
 
 
+def get_base_cls(variables, resnet_param_list):
+    base_list = []
+    cls_list = []
+    for idx in range(len(resnet_param_list)):
+        _variables = load_base_cls(
+            variables, resnet_param_list, load_cls=True, base_type=idx)
+
+        base_params = _variables["params"]["base"]
+        if _variables["batch_stats"].get("base") is not None:
+            base_batch_stats = _variables["batch_stats"]["base"]
+        else:
+            base_batch_stats = None
+
+        cls_params = _variables["params"]["cls"]
+        if _variables["batch_stats"].get("cls") is not None:
+            cls_batch_stats = _variables["batch_stats"]["cls"]
+        else:
+            cls_batch_stats = None
+        base_list.append((base_params, base_batch_stats))
+        cls_list.append((cls_params, cls_batch_stats))
+    return base_list, cls_list
+
+
 def load_base_cls(variables, resnet_param_list, load_cls=True, base_type="A", mimo=1):
     def sorter(x):
         assert "_" in x
@@ -433,7 +457,10 @@ def load_base_cls(variables, resnet_param_list, load_cls=True, base_type="A", mi
         return (name, int(num))
 
     var = variables.unfreeze()
-    if base_type == "A":
+    if not isinstance(base_type, str):
+        def get(key1, key2):
+            return resnet_param_list[base_type][key1][key2]
+    elif base_type == "A":
         def get(key1, key2, idx=0):
             return resnet_param_list[idx][key1][key2]
     elif base_type == "AVG":
@@ -542,7 +569,8 @@ def build_dbn(config):
         mimo_cond=config.mimo_cond,
         start_temp=config.start_temp,
         multi_mixup=False,
-        continuous=config.dsb_continuous
+        continuous=config.dsb_continuous,
+        rand_temp=config.distribution == 3
     )
     return dbn, (dsb_stats, None)
 
@@ -735,6 +763,11 @@ def launch(config, print_fn):
         mimo=1
     )
     config.image_stats = variables["image_stats"]
+    if config.distribution == 2:
+        _variables = deepcopy(variables)
+        base_params_list, cls_params_list = get_base_cls(
+            _variables, resnet_param_list)
+        del _variables
 
     # ------------------------------------------------------------------------
     # define optimizers
@@ -883,8 +916,9 @@ def launch(config, print_fn):
     def step_label(batch):
         z0_list = []
         logitsA = []
+        zB, logitsB = forward_resnet(resnet_param_list[0], batch["images"])
         for i, res_params_dict in enumerate(resnet_param_list):
-            if i == 0 or batch.get("images_tar") is None:
+            if batch.get("images_tar") is None:
                 images = batch["images"]
             else:
                 images = batch["images_tar"]
@@ -893,7 +927,6 @@ def launch(config, print_fn):
             # logits0: (B, d)
             logits0 = logits0 - logits0.mean(-1, keepdims=True)
             logitsA.append(logits0)
-        zB = z0_list.pop(0)
         zA = jnp.concatenate(z0_list, axis=-1)
         if config.ensemble_prediction:
             if config.ensemble_exclude_a:
@@ -904,8 +937,7 @@ def launch(config, print_fn):
             ens_logprobs = jax.scipy.special.logsumexp(
                 logprobs, axis=0) - np.log(logprobs.shape[0])
             ens_logits = ens_logprobs - ens_logprobs.mean(-1, keepdims=True)
-            logitsA = [logitsA[0], ens_logits]
-        logitsB = logitsA.pop(0)
+            logitsA = [ens_logits]
         batch["zB"] = zB
         batch["zA"] = zA
         batch["logitsB"] = logitsB
@@ -913,8 +945,51 @@ def launch(config, print_fn):
         return batch
 
     # ------------------------------------------------------------------------
+    # define step sampling mode out of ensemble members
+    # ------------------------------------------------------------------------
+    def replace_base_cls(base_params, cls_params, state):
+        params = state.params.unfreeze()
+        ema_params = state.ema_params.unfreeze()
+        batch_stats = state.batch_stats
+        base_params, base_batch = base_params
+        cls_params, cls_batch = cls_params
+
+        params["base"] = base_params
+        ema_params["base"] = base_params
+        if batch_stats.get("base") is not None:
+            batch_stats["base"] = base_batch
+
+        params["cls"] = cls_params
+        ema_params["cls"] = cls_params
+        if batch_stats.get("cls") is not None:
+            batch_stats["cls"] = cls_batch
+        return state.replace(
+            params=freeze(params),
+            ema_params=freeze(ema_params),
+            batch_stats=batch_stats
+        )
+
+    def step_mode(state):
+        state = jax_utils.unreplicate(state)
+        _, idx_rng = jax.random.split(state.rng)
+        N = len(resnet_param_list)
+        idx = jax.random.randint(idx_rng, (), 0, N)
+        state = replace_base_cls(
+            base_params_list[idx], cls_params_list[idx], state)
+        state = jax_utils.replicate(state)
+        return state
+
+    def step_modeA(state):
+        state = jax_utils.unreplicate(state)
+        state = replace_base_cls(
+            base_params_list[0], cls_params_list[0], state)
+        state = jax_utils.replicate(state)
+        return state
+
+    # ------------------------------------------------------------------------
     # define train step
     # ------------------------------------------------------------------------
+
     def loss_func(params, state, batch, train=True):
         logitsA = batch["logitsA"]
         logitsA = [l for l in batch["logitsA"]]  # length fat list
@@ -1195,27 +1270,22 @@ def launch(config, print_fn):
     # ------------------------------------------------------------------------
     @partial(jax.pmap, axis_name="batch")
     def step_mixup(state, batch):
-        # count = jnp.sum(batch["marker"])
-        # x = batch["images"]
-        # batch_size = x.shape[0]
-        # a = config.mixup_alpha
-        # beta_rng, perm_rng = jax.random.split(state.rng)
+        if config.distribution == 1:
+            count = jnp.sum(batch["marker"])
+            x = batch["images"]
+            batch_size = x.shape[0]
+            a = config.mixup_alpha
+            beta_rng, perm_rng = jax.random.split(state.rng)
 
-        # lamda = jnp.where(a > 0, jax.random.beta(beta_rng, a, a), 1)
-        # lamda = jnp.where(a > 0.5, 1-lamda, lamda)
+            lamda = jax.random.beta(beta_rng, a, a)
+            lamda = jnp.where(lamda > 0.5, 1-lamda, lamda)
 
-        # perm_rng, perm_rng_tar = jax.random.split(perm_rng)
+            perm_x = jax.random.permutation(perm_rng, x)
+            mixed_x = (1-lamda)*x+lamda*perm_x
+            mixed_x = jnp.where(count == batch_size, mixed_x, x)
 
-        # perm_x = jax.random.permutation(perm_rng, x)
-        # mixed_x = (1-lamda)*x+lamda*perm_x
-        # mixed_x = jnp.where(count == batch_size, mixed_x, x)
-
-        # perm_x_tar = jax.random.permutation(perm_rng_tar, x)
-        # mixed_x_tar = (1-lamda)*x+lamda*perm_x_tar
-        # mixed_x_tar = jnp.where(count == batch_size, mixed_x_tar, x)
-
-        # batch["images"] = mixed_x
-        # batch["images_tar"] = mixed_x_tar
+            batch["images"] = mixed_x
+            batch["images_tar"] = x
         # ---------------------------------------------------------------
         # count = jnp.sum(batch["marker"])
         # x = batch["images"]
@@ -1237,24 +1307,25 @@ def launch(config, print_fn):
         # batch["images"] = mixed_x
         # batch["images_tar"] = mixed_x_tar
         # ---------------------------------------------------------------
-        count = jnp.sum(batch["marker"])
-        x = batch["images"]
-        y = batch["labels"]
-        batch_size = x.shape[0]
-        a = config.mixup_alpha
-        beta_rng, perm_rng = jax.random.split(state.rng)
+        else:
+            count = jnp.sum(batch["marker"])
+            x = batch["images"]
+            y = batch["labels"]
+            batch_size = x.shape[0]
+            a = config.mixup_alpha
+            beta_rng, perm_rng = jax.random.split(state.rng)
 
-        lamda = jnp.where(a > 0, jax.random.beta(beta_rng, a, a), 1)
+            lamda = jnp.where(a > 0, jax.random.beta(beta_rng, a, a), 1)
 
-        perm_x = jax.random.permutation(perm_rng, x)
-        perm_y = jax.random.permutation(perm_rng, y)
-        mixed_x = (1-lamda)*x+lamda*perm_x
-        mixed_y = (1-lamda)*y+lamda*perm_y
-        mixed_x = jnp.where(count == batch_size, mixed_x, x)
-        mixed_y = jnp.where(count == batch_size, mixed_y, y)
+            perm_x = jax.random.permutation(perm_rng, x)
+            perm_y = jax.random.permutation(perm_rng, y)
+            mixed_x = (1-lamda)*x+lamda*perm_x
+            mixed_y = jnp.where(lamda < 0.5, y, perm_y)
+            mixed_x = jnp.where(count == batch_size, mixed_x, x)
+            mixed_y = jnp.where(count == batch_size, mixed_y, y)
 
-        batch["images"] = mixed_x
-        batch["labels"] = mixed_y
+            batch["images"] = mixed_x
+            batch["labels"] = mixed_y
         return batch
 
     def choose_what_to_print(print_bin, inter):
@@ -1363,6 +1434,8 @@ def launch(config, print_fn):
             state = state.replace(rng=jax_utils.replicate(batch_rng))
             if config.mixup_alpha > 0:
                 batch = step_mixup(state, batch)
+            if config.distribution == 2:
+                state = step_mode(state)
             batch = step_label(batch)
             state, metrics = step_train(state, batch)
             if epoch_idx == 0:
@@ -1390,6 +1463,8 @@ def launch(config, print_fn):
         for batch_idx, batch in enumerate(valid_loader):
             batch_rng = jax.random.fold_in(valid_rng, batch_idx)
             state = state.replace(rng=jax_utils.replicate(batch_rng))
+            if config.distribution == 2:
+                state = step_modeA(state)
             batch = step_label(batch)
             metrics = step_valid(state, batch)
             if epoch_idx == 0:
@@ -1419,6 +1494,8 @@ def launch(config, print_fn):
             for batch_idx, batch in enumerate(test_loader):
                 batch_rng = jax.random.fold_in(test_rng, batch_idx)
                 state = state.replace(rng=jax_utils.replicate(batch_rng))
+                if config.distribution == 2:
+                    state = step_modeA(state)
                 batch = step_label(batch)
                 metrics = step_valid(state, batch)
                 if best_acc == -float("inf"):
@@ -1539,6 +1616,8 @@ def main():
     parser.add_argument("--print_inter", action="store_true")
     # continuous diffusion
     parser.add_argument("--dsb_continuous", action="store_true")
+    # distribution type; 0: 1to1, 1: mixup, 2: mode, 3: annealing
+    parser.add_argument("--distribution", default=0, type=int)
     # ---------------------------------------------------------------------------------------
     # diffusion
     # ---------------------------------------------------------------------------------------

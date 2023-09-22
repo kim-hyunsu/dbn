@@ -8,6 +8,8 @@ model_name: FlaxResNet
 optim_bs: 128
 optim_ne: 200
 optim_lr: 0.1
+warmup_factor: 0.01
+warmup_steps: 5
 optim_weight_decay: 0.0005
 optim: sgd
 dist_alpha: 1

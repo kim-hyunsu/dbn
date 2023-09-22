@@ -1,11 +1,3 @@
-export CUDA_VISIBLE_DEVICES=0,1
-echo 0
-taskset -c 0-23 python dbn.py \
-    --config config_dsb/c10_frnrelu_AtoABC_ensemble.yaml \
-    --prob_loss
-echo 1
-taskset -c 0-23 python dbn.py \
-    --config config_dsb/c10_frnrelu_AtoABC_ensemble.yaml \
-    --kld_joint \
-    --beta 1
-echo 2
+taskset -c 48-71 python naive_ed.py \
+    --config config_naive_ed/t200_frnrelu_shX_t3.yaml \
+    --seed 2249972020 --nowandb

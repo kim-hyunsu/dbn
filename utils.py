@@ -260,7 +260,7 @@ def model_list(data_name, model_style, shared_head=False, tag=""):
                 "./checkpoints/frn200_sd2_be",
                 "./checkpoints/frn200_sd3_be",
                 "./checkpoints/frn200_sd5_be",
-                "./checkpoints/frn200_sd7_be"
+                "./checkpoints/frn200_sd7_be",
             ]
     elif data_name == "CIFAR10_x32" and model_style == "FRN-Swish":
         if tag == "bezier":

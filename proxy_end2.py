@@ -9,7 +9,7 @@ from giung2.metrics import evaluate_acc, evaluate_nll
 # from giung2.models.resnet import FlaxResNet
 from models.resnet import FlaxResNet, FlaxResNetBase
 from giung2.models.layers import FilterResponseNorm
-from giung2.data.build import build_dataloaders
+from data.build import build_dataloaders
 import defaults_sgd as defaults
 from flax.training import dynamic_scale as dynamic_scale_lib
 from flax.training import common_utils, train_state, checkpoints

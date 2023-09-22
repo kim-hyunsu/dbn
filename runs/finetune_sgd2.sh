@@ -1,5 +1,0 @@
-python sgd.py --model_style BN-ReLU --seed 2 --optim adam --optim_bs 64 --optim_lr 1e-4 --data_name CIFAR100_x32 --model_depth 110 --optim_weight_decay 1e-5 > bs64wd1e-5.log
-python sgd.py --model_style BN-ReLU --seed 2 --optim adam --optim_bs 128 --optim_lr 1e-4 --data_name CIFAR100_x32 --model_depth 110 --optim_weight_decay 1e-5 > bs128wd1e-5.log
-python sgd.py --model_style BN-ReLU --seed 2 --optim adam --optim_bs 256 --optim_lr 1e-4 --data_name CIFAR100_x32 --model_depth 110 --optim_weight_decay 1e-5 > bs256wd1e-5.log
-python sgd.py --model_style BN-ReLU --seed 2 --optim adam --optim_bs 256 --optim_lr 5e-4 --data_name CIFAR100_x32 --model_depth 110 --optim_weight_decay 1e-5 > lr5e-4wd1e-5.log
-python sgd.py --model_style BN-ReLU --seed 2 --optim adam --optim_bs 256 --optim_lr 1e-3 --data_name CIFAR100_x32 --model_depth 110 --optim_weight_decay 1e-5 > lr1e-3wd1e-5.log

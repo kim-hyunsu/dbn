@@ -2195,7 +2195,7 @@ class ClsUnet(nn.Module):
         # p = p[:, None, None, :]
         # p = jnp.tile(p, reps=[1,x.shape[1], x.shape[2], 1])
 
-        # t = jnp.concatenate([p, t], axis=-1)
+        t = jnp.concatenate([p, t], axis=-1)
         _x = x
         x = self.conv(
             features=in_c,
@@ -2215,13 +2215,12 @@ class ClsUnet(nn.Module):
             for i in range(n):
                 if i == 0:
                     x += _t
-                p = jnp.where(i == 0, p, 0)
-                x = CondInvertedResidual(
+                x = InvertedResidual(
                     in_ch=in_c,
                     ch=out_c,
                     st=s if i == 0 else 1,
                     expand=e
-                )(x, p, **kwargs)
+                )(x, **kwargs)
                 in_c = out_c
         out_c = _divisible(c*self.width_multi, 2)
         _x = x
@@ -2244,6 +2243,7 @@ def _divisible(v, divisor, min_value=None):
 class LogitEncoder(nn.Module):
     relu6: Callable = nn.relu6
     gelu: Callable = nn.gelu
+    silu: Callable = nn.silu
     fc: nn.Module = partial(
         nn.Dense,
         use_bias=True,
@@ -2254,10 +2254,16 @@ class LogitEncoder(nn.Module):
     @nn.compact
     def __call__(self, x, **kwargs):
         dim = x.shape[-1]
-        p = jax.nn.softmax(x, axis=-1)
-        x_s = jnp.std(p, axis=-1, keepdims=True)
-        x_a = jnp.mean(p, axis=-1, keepdims=True)
-        x = jnp.concatenate([x_s, x_a], axis=-1)
+        # p = jax.nn.softmax(x, axis=-1)
+        # x_s = jnp.std(p, axis=-1, keepdims=True)
+        # x_a = jnp.mean(p, axis=-1, keepdims=True)
+        # x = jnp.concatenate([x_s, x_a], axis=-1)
+        x_l2 = jnp.sqrt((x**2).sum(axis=-1, keepdims=True))
+        x_a = jnp.sum(x, axis=-1, keepdims=True)
+        x = jnp.concatenate([x_a, x_l2], axis=-1)
+        x = x/dim
+        x = self.fc(features=dim//4)(x)
+        x = self.silu(x)
         return x
 
 
@@ -2569,6 +2575,7 @@ class DiffusionBridgeNetwork(nn.Module):
     mimo_cond: bool = False
     multi_mixup: bool = False
     continuous: bool = False
+    rand_temp: bool = False
 
     def setup(self):
         self.base = self.base_net()
@@ -2653,14 +2660,18 @@ class DiffusionBridgeNetwork(nn.Module):
         return l, z
 
     def set_logit(self, rng, l1):
+        T = self.start_temp
+        if self.rand_temp:
+            _, temp_rng = jax.random.split(rng)
+            T *= 1+0.2*jax.random.beta(temp_rng, 1, 5)
         if self.forget == 0:
-            l1 = l1/self.start_temp
+            l1 = l1/T
         elif self.forget == 1:
             l1 = jnp.zeros_like(l1)
         elif self.forget == 2:
             l1 = jax.random.normal(rng, l1.shape)
         elif self.forget == 3:
-            l1 = l1/self.start_temp
+            l1 = l1/T
             l1 += jax.random.normal(rng, l1.shape)
         elif self.forget == 4:
             l1 = jnp.zeros_like(l1)
@@ -2670,7 +2681,7 @@ class DiffusionBridgeNetwork(nn.Module):
             onehot = onehot.reshape(1, -1)
             l1 += onehot
         elif self.forget == 5:
-            l1 = l1/self.start_temp
+            l1 = l1/T
             mask = jax.random.bernoulli(rng, p=0.7, shape=l1.shape)
             l1 = mask*l1
         return l1

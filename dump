@@ -1,0 +1,96 @@
+**** DEBUG MODE OFF ****
+distillation mode
+[2023-09-23 00:11:27] Environments:
+------------  --------------------------------------------------------------------------
+sys.platform  linux
+Python        3.9.16 (main, Jan 11 2023, 16:05:54) [GCC 11.2.0]
+JAX           0.4.3 @/mnt/home/hyunsu/.conda/envs/dsb/lib/python3.9/site-packages/jax
+jaxlib        0.4.3 @/mnt/home/hyunsu/.conda/envs/dsb/lib/python3.9/site-packages/jaxlib
+Flax          0.6.5 @/mnt/home/hyunsu/.conda/envs/dsb/lib/python3.9/site-packages/flax
+Optax         0.1.4 @/mnt/home/hyunsu/.conda/envs/dsb/lib/python3.9/site-packages/optax
+------------  --------------------------------------------------------------------------
+
+[2023-09-23 00:11:27] Command line arguments:
+- args.data_root               : /mnt/gsai/hyunsu/dsb-bnn/data
+- args.data_name               : CIFAR10_x32
+- args.data_augmentation       : standard
+- args.data_proportional       : 1.0
+- args.model_depth             : 32
+- args.model_width             : 2
+- args.model_style             : FRN-Swish
+- args.optim_bs                : 128
+- args.config                  : config_dsb/c10_frnrelu_AtoABC_ensemble_distill.yaml
+- args.model_planes            : 16
+- args.model_blocks            : None
+- args.optim_ne                : 800
+- args.optim_lr                : 0.00025
+- args.warmup_factor           : 0.01
+- args.warmup_steps            : 0
+- args.optim_momentum          : 0.9
+- args.optim_weight_decay      : 0
+- args.optim_base              : adam
+- args.start_cls               : -1
+- args.cls_optim               : adam
+- args.start_base              : 999999999999
+- args.save                    : None
+- args.seed                    : 2023
+- args.tag                     : AtoABC
+- args.gamma                   : 1
+- args.lgamma                  : 1
+- args.zgamma                  : 1
+- args.beta                    : 0.5
+- args.ema_decay               : 0.99995
+- args.mse_power               : 2
+- args.crt                     : 1
+- args.cls_from_scratch        : False
+- args.mixup_alpha             : 0.4
+- args.nowandb                 : False
+- args.train_base              : False
+- args.base_type               : A
+- args.best_nll                : False
+- args.latentbe                : None
+- args.mimo_cls                : 1
+- args.ensemble_prediction     : 3
+- args.ensemble_exclude_a      : False
+- args.residual_prediction     : False
+- args.dsc                     : True
+- args.medium                  : False
+- args.frn_swish               : False
+- args.input_scaling           : 3
+- args.width_multi             : 1
+- args.print_inter             : False
+- args.dsb_continuous          : False
+- args.distribution            : 0
+- args.T                       : 5
+- args.beta1                   : 0.0001
+- args.beta2                   : 0.0001
+- args.linear_noise            : False
+- args.fat                     : 1
+- args.joint_depth             : 6
+- args.kld_joint               : False
+- args.kld_temp                : 1
+- args.forget                  : 0
+- args.prob_loss               : False
+- args.ce_loss                 : 0
+- args.mimo_cond               : False
+- args.start_temp              : 2
+- args.n_feat                  : 128
+- args.version                 : v1.1.7
+- args.droprate                : 0
+- args.feature_name            : feature.layer1stride1
+- args.learn_sigma             : False
+- args.num_res_blocks          : 1
+- args.num_heads               : 1
+- args.use_scale_shift_norm    : False
+- args.resblock_updown         : False
+- args.use_new_attention_order : False
+- args.large                   : False
+- args.dist_ckpt               : /mnt/gsai/hyunsu/dsb-bnn/checkpoints/dbn/c10/t235/cosmic-sky-838
+- args.dist_n_T                : 1
+- args.model_name              : FlaxResNet
+- args.shared_head             : False
+- args.sgd_state               : True
+- args.linear_nose             : True
+- args.distillation            : True
+
+Loaded checkpoint from /mnt/gsai/hyunsu/dsb-bnn/checkpoints/dbn/c10/t235/cosmic-sky-838 to start distillation.

@@ -20,71 +20,14 @@ from dbn import build_dbn, pdict, dsb_sample, get_resnet
 from einops import rearrange
 from easydict import EasyDict
 from giung2.metrics import evaluate_acc, evaluate_nll
-import defaults_sgd
 
-
-def get_config(ckpt_config):
-    for k, v in ckpt_config.items():
-        if isinstance(v, dict) and v.get("0") is not None:
-            l = []
-            for k1, v1 in v.items():
-                l.append(v1)
-            ckpt_config[k] = tuple(l)
-    config = EasyDict(ckpt_config)
-    model_dtype = getattr(config, "dtype", None) or "float32"
-    if "float32" in model_dtype:
-        config.dtype = jnp.float32
-    elif "float16" in model_dtype:
-        config.dtype = jnp.float16
-    else:
-        raise NotImplementedError
-    if getattr(config, "num_classes", None) is None:
-        if config.data_name == "CIFAR10_x32":
-            config.num_classes = 10
-        elif config.data_name == "CIFAR100_x32":
-            config.num_classes = 100
-        elif config.data_name == "TinyImageNet200_x64":
-            config.num_classes = 200
-    if getattr(config, "image_stats", None) is None:
-        config.image_stats = dict(
-            m=jnp.array(defaults_sgd.PIXEL_MEAN),
-            s=jnp.array(defaults_sgd.PIXEL_STD))
-    if getattr(config, "model_planes", None) is None:
-        if config.data_name == "CIFAR10_x32" and config.model_style == "FRN-Swish":
-            config.model_planes = 16
-            config.model_blocks = None
-        elif config.data_name == "CIFAR100_x32" and config.model_style == "FRN-Swish":
-            config.model_planes = 16
-            config.model_blocks = None
-        elif config.data_name == "TinyImageNet200_x64" and config.model_style == "FRN-Swish":
-            config.model_planes = 64
-            config.model_blocks = "3,4,6,3"
-    return config
-
+from utils import load_ckpt
 
 def launch(args):
     rng = jax.random.PRNGKey(args.seed)
     # ------------------------------------------------------------------------------------------------------------
     # load checkpoint and configuration
     # ------------------------------------------------------------------------------------------------------------
-
-    def load_ckpt(dirname):
-        ckpt = checkpoints.restore_checkpoint(
-            ckpt_dir=dirname,
-            target=None
-        )
-        if ckpt.get("model") is not None:
-            if ckpt.get("Dense_0") is not None:
-                params = ckpt["model"]
-                batch_stats = dict()
-            else:
-                params = ckpt["model"]["params"]
-                batch_stats = ckpt["model"]["batch_stats"]
-        else:
-            params = ckpt["params"]
-            batch_stats = ckpt["batch_stats"]
-        config = get_config(ckpt["config"])
-        return params, batch_stats, config
     if getattr(args, "checkpoints", None) is not None:
         checkpoint_list = args.checkpoints
     else:

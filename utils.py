@@ -1,18 +1,27 @@
-import jax.numpy as jnp
-import defaults_sghmc as defaults
-from jax.experimental.host_callback import call as jcall
+# generic
+from collections import OrderedDict
+from functools import partial
+from easydict import EasyDict
 import os
 import wandb
+from tqdm import tqdm
+
+# jax-related
+from jax.experimental.host_callback import call as jcall
 import jax
-from flax.training import common_utils
-from collections import OrderedDict
+from flax.training import checkpoints, common_utils
+from flax import jax_utils
+import jax.numpy as jnp
+
+# user-defined
+from default_args import defaults_sghmc, defaults_sgd
 
 debug = os.environ.get("DEBUG")
 if isinstance(debug, str):
     debug = debug.lower() == "true"
 
-pixel_mean = jnp.array(defaults.PIXEL_MEAN, dtype=jnp.float32)
-pixel_std = jnp.array(defaults.PIXEL_STD, dtype=jnp.float32)
+pixel_mean = jnp.array(defaults_sghmc.PIXEL_MEAN, dtype=jnp.float32)
+pixel_std = jnp.array(defaults_sghmc.PIXEL_STD, dtype=jnp.float32)
 
 logits_mean = jnp.array(
     [0.20203184, 0.6711326, -0.34316424, 0.55240935, -1.6872929, 0.47505122, -0.44700608, -0.33773288, -0.5277096, 1.1016572])
@@ -225,156 +234,156 @@ def model_list(data_name, model_style, shared_head=False, tag=""):
     if data_name == "CIFAR100_x32" and model_style == "BN-ReLU":
         if shared_head:
             return [
-                "./checkpoints/bn100_sd2_shared",
-                "./checkpoints/bn100_sd3_shared",
-                "./checkpoints/bn100_sd5_shared",
-                "./checkpoints/bn100_sd7_shared",
-                "./checkpoints/bn100_sd11_shared",
-                "./checkpoints/bn100_sd13_shared",
-                "./checkpoints/bn100_sd17_shared",
+                "/mnt/gsai/hyunsu/dsb-bnn/checkpoints/bn100_sd2_shared",
+                "/mnt/gsai/hyunsu/dsb-bnn/checkpoints/bn100_sd3_shared",
+                "/mnt/gsai/hyunsu/dsb-bnn/checkpoints/bn100_sd5_shared",
+                "/mnt/gsai/hyunsu/dsb-bnn/checkpoints/bn100_sd7_shared",
+                "/mnt/gsai/hyunsu/dsb-bnn/checkpoints/bn100_sd11_shared",
+                "/mnt/gsai/hyunsu/dsb-bnn/checkpoints/bn100_sd13_shared",
+                "/mnt/gsai/hyunsu/dsb-bnn/checkpoints/bn100_sd17_shared",
             ]
         else:
             return [
-                "./checkpoints/bn100_sd2",
-                "./checkpoints/bn100_sd3",
-                # "./checkpoints/bn100_sd5",
-                # "./checkpoints/bn100_sd7",
-                # "./checkpoints/bn100_sd11",
-                # "./checkpoints/bn100_sd13",
-                # "./checkpoints/bn100_sd17",
+                "/mnt/gsai/hyunsu/dsb-bnn/checkpoints/bn100_sd2",
+                "/mnt/gsai/hyunsu/dsb-bnn/checkpoints/bn100_sd3",
+                # "/mnt/gsai/hyunsu/dsb-bnn/checkpoints/bn100_sd5",
+                # "/mnt/gsai/hyunsu/dsb-bnn/checkpoints/bn100_sd7",
+                # "/mnt/gsai/hyunsu/dsb-bnn/checkpoints/bn100_sd11",
+                # "/mnt/gsai/hyunsu/dsb-bnn/checkpoints/bn100_sd13",
+                # "/mnt/gsai/hyunsu/dsb-bnn/checkpoints/bn100_sd17",
             ]
     if data_name == "CIFAR100_x32" and model_style == "FRN-Swish":
         if tag == "AtoABC":
             return [
-                "./checkpoints/frn100_sd11_be",
-                "./checkpoints/frn100_sd13_be",
-                "./checkpoints/frn100_sd15_be",
-                "./checkpoints/frn100_sd2_be",
-                "./checkpoints/frn100_sd3_be",
-                "./checkpoints/frn100_sd5_be",
-                "./checkpoints/frn100_sd9_be",
+                "/mnt/gsai/hyunsu/dsb-bnn/checkpoints/frn100_sd11_be",
+                "/mnt/gsai/hyunsu/dsb-bnn/checkpoints/frn100_sd13_be",
+                "/mnt/gsai/hyunsu/dsb-bnn/checkpoints/frn100_sd15_be",
+                "/mnt/gsai/hyunsu/dsb-bnn/checkpoints/frn100_sd2_be",
+                "/mnt/gsai/hyunsu/dsb-bnn/checkpoints/frn100_sd3_be",
+                "/mnt/gsai/hyunsu/dsb-bnn/checkpoints/frn100_sd5_be",
+                "/mnt/gsai/hyunsu/dsb-bnn/checkpoints/frn100_sd9_be",
             ]
     elif data_name == "TinyImageNet200_x64" and model_style == "FRN-Swish":
         if tag == "AtoABC":
             return [
-                "./checkpoints/frn200_sd2_be",
-                "./checkpoints/frn200_sd3_be",
-                "./checkpoints/frn200_sd5_be",
-                "./checkpoints/frn200_sd7_be",
+                "/mnt/gsai/hyunsu/dsb-bnn/checkpoints/frn200_sd2_be",
+                "/mnt/gsai/hyunsu/dsb-bnn/checkpoints/frn200_sd3_be",
+                "/mnt/gsai/hyunsu/dsb-bnn/checkpoints/frn200_sd5_be",
+                "/mnt/gsai/hyunsu/dsb-bnn/checkpoints/frn200_sd7_be",
             ]
     elif data_name == "CIFAR10_x32" and model_style == "FRN-Swish":
         if tag == "bezier":
             return [
-                "./checkpoints/frn_sd2_be",
-                "./checkpoints/frn_sd25_bezier"
+                "/mnt/gsai/hyunsu/dsb-bnn/checkpoints/frn_sd2_be",
+                "/mnt/gsai/hyunsu/dsb-bnn/checkpoints/frn_sd25_bezier"
             ]
         elif tag == "distill":
             return [
-                "./checkpoints/frn_sd23_distill_mean2",
-                "./checkpoints/frn_sd2_be",
-                "./checkpoints/frn_sd3_be"
+                "/mnt/gsai/hyunsu/dsb-bnn/checkpoints/frn_sd23_distill_mean2",
+                "/mnt/gsai/hyunsu/dsb-bnn/checkpoints/frn_sd2_be",
+                "/mnt/gsai/hyunsu/dsb-bnn/checkpoints/frn_sd3_be"
             ]
         elif tag == "distref":
             return [
-                "./checkpoints/frn_sd2_be",
-                "./checkpoints/frn_sd2_be",
-                "./checkpoints/frn_sd3_be"
+                "/mnt/gsai/hyunsu/dsb-bnn/checkpoints/frn_sd2_be",
+                "/mnt/gsai/hyunsu/dsb-bnn/checkpoints/frn_sd2_be",
+                "/mnt/gsai/hyunsu/dsb-bnn/checkpoints/frn_sd3_be"
             ]
         elif tag == "AtoB":
             return [
-                "./checkpoints/frn_sd2_be",
-                "./checkpoints/frn_sd3_be"
+                "/mnt/gsai/hyunsu/dsb-bnn/checkpoints/frn_sd2_be",
+                "/mnt/gsai/hyunsu/dsb-bnn/checkpoints/frn_sd3_be"
             ]
         elif tag == "AtoshB":
             return [
-                "./checkpoints/frn_sd2_be",
-                "./checkpoints/frn_sd23_shared3"
+                "/mnt/gsai/hyunsu/dsb-bnn/checkpoints/frn_sd2_be",
+                "/mnt/gsai/hyunsu/dsb-bnn/checkpoints/frn_sd23_shared3"
             ]
         elif tag == "AtoshABC":
             return [
-                "./checkpoints/frn_sd2_be",
-                "./checkpoints/frn_sd23_shared3",
-                "./checkpoints/frn_sd25_shared3",
-                "./checkpoints/frn_sd27_shared3",
-                "./checkpoints/frn_sd29_shared3"
+                "/mnt/gsai/hyunsu/dsb-bnn/checkpoints/frn_sd2_be",
+                "/mnt/gsai/hyunsu/dsb-bnn/checkpoints/frn_sd23_shared3",
+                "/mnt/gsai/hyunsu/dsb-bnn/checkpoints/frn_sd25_shared3",
+                "/mnt/gsai/hyunsu/dsb-bnn/checkpoints/frn_sd27_shared3",
+                "/mnt/gsai/hyunsu/dsb-bnn/checkpoints/frn_sd29_shared3"
             ]
         elif tag == "AtoABC":
             return [
-                "./checkpoints/frn_sd2_be",
-                "./checkpoints/frn_sd3_be",
-                "./checkpoints/frn_sd5_be",
-                "./checkpoints/frn_sd7_be",
-                "./checkpoints/frn_sd9_be",
-                "./checkpoints/frn_sd11_be",
-                "./checkpoints/frn_sd13_be",
-                "./checkpoints/frn_sd15_be",
+                "/mnt/gsai/hyunsu/dsb-bnn/checkpoints/frn_sd2_be",
+                "/mnt/gsai/hyunsu/dsb-bnn/checkpoints/frn_sd3_be",
+                "/mnt/gsai/hyunsu/dsb-bnn/checkpoints/frn_sd5_be",
+                "/mnt/gsai/hyunsu/dsb-bnn/checkpoints/frn_sd7_be",
+                "/mnt/gsai/hyunsu/dsb-bnn/checkpoints/frn_sd9_be",
+                "/mnt/gsai/hyunsu/dsb-bnn/checkpoints/frn_sd11_be",
+                "/mnt/gsai/hyunsu/dsb-bnn/checkpoints/frn_sd13_be",
+                "/mnt/gsai/hyunsu/dsb-bnn/checkpoints/frn_sd15_be",
             ]
         elif tag == "DistoABC":
             return [
-                "./checkpoints/naive_ed/frn_sd235_t3",
-                "./checkpoints/frn_sd2_be",
-                "./checkpoints/frn_sd3_be",
-                "./checkpoints/frn_sd5_be",
+                "/mnt/gsai/hyunsu/dsb-bnn/checkpoints/naive_ed/frn_sd235_t3",
+                "/mnt/gsai/hyunsu/dsb-bnn/checkpoints/frn_sd2_be",
+                "/mnt/gsai/hyunsu/dsb-bnn/checkpoints/frn_sd3_be",
+                "/mnt/gsai/hyunsu/dsb-bnn/checkpoints/frn_sd5_be",
             ]
         elif tag == "layer2stride1_shared":
             return [
-                "./checkpoints/frn_sd2_be",
-                "./checkpoints/frn_sd23_layer2stride1",
-                "./checkpoints/frn_sd24_layer2stride1",
-                "./checkpoints/frn_sd25_layer2stride1",
-                "./checkpoints/frn_sd26_layer2stride1",
-                "./checkpoints/frn_sd27_layer2stride1"
+                "/mnt/gsai/hyunsu/dsb-bnn/checkpoints/frn_sd2_be",
+                "/mnt/gsai/hyunsu/dsb-bnn/checkpoints/frn_sd23_layer2stride1",
+                "/mnt/gsai/hyunsu/dsb-bnn/checkpoints/frn_sd24_layer2stride1",
+                "/mnt/gsai/hyunsu/dsb-bnn/checkpoints/frn_sd25_layer2stride1",
+                "/mnt/gsai/hyunsu/dsb-bnn/checkpoints/frn_sd26_layer2stride1",
+                "/mnt/gsai/hyunsu/dsb-bnn/checkpoints/frn_sd27_layer2stride1"
             ]
         elif tag == "ABCtoindABC":
             return [
-                "./checkpoints/frn_sd2_be",
-                "./checkpoints/frn_sd23_shared3",
-                "./checkpoints/frn_sd3_be",
-                "./checkpoints/frn_sd35_shared3",
-                "./checkpoints/frn_sd5_be",
-                "./checkpoints/frn_sd57_shared3"
+                "/mnt/gsai/hyunsu/dsb-bnn/checkpoints/frn_sd2_be",
+                "/mnt/gsai/hyunsu/dsb-bnn/checkpoints/frn_sd23_shared3",
+                "/mnt/gsai/hyunsu/dsb-bnn/checkpoints/frn_sd3_be",
+                "/mnt/gsai/hyunsu/dsb-bnn/checkpoints/frn_sd35_shared3",
+                "/mnt/gsai/hyunsu/dsb-bnn/checkpoints/frn_sd5_be",
+                "/mnt/gsai/hyunsu/dsb-bnn/checkpoints/frn_sd57_shared3"
             ]
         elif tag == "ABCtoindABC_layer2stride1":
             return [
-                "./checkpoints/frn_sd2_be",
-                "./checkpoints/frn_sd23_layer2stride1",
-                "./checkpoints/frn_sd3_be",
-                "./checkpoints/frn_sd35_layer2stride1",
-                "./checkpoints/frn_sd5_be",
-                "./checkpoints/frn_sd57_layer2stride1"
+                "/mnt/gsai/hyunsu/dsb-bnn/checkpoints/frn_sd2_be",
+                "/mnt/gsai/hyunsu/dsb-bnn/checkpoints/frn_sd23_layer2stride1",
+                "/mnt/gsai/hyunsu/dsb-bnn/checkpoints/frn_sd3_be",
+                "/mnt/gsai/hyunsu/dsb-bnn/checkpoints/frn_sd35_layer2stride1",
+                "/mnt/gsai/hyunsu/dsb-bnn/checkpoints/frn_sd5_be",
+                "/mnt/gsai/hyunsu/dsb-bnn/checkpoints/frn_sd57_layer2stride1"
             ]
         elif tag == "layer2stride1_nonshared":
             return [
-                "./checkpoints/frn_sd2_be",
-                "./checkpoints/frn_sd3_be",
-                "./checkpoints/frn_sd5_be"
+                "/mnt/gsai/hyunsu/dsb-bnn/checkpoints/frn_sd2_be",
+                "/mnt/gsai/hyunsu/dsb-bnn/checkpoints/frn_sd3_be",
+                "/mnt/gsai/hyunsu/dsb-bnn/checkpoints/frn_sd5_be"
             ]
         elif tag == "distA":
             return [
-                "./checkpoints/frn_sd23_distill_mean2",
-                "./checkpoints/frn_sd2_be"
+                "/mnt/gsai/hyunsu/dsb-bnn/checkpoints/frn_sd23_distill_mean2",
+                "/mnt/gsai/hyunsu/dsb-bnn/checkpoints/frn_sd2_be"
             ]
         elif tag == "distB":
             return [
-                "./checkpoints/frn_sd23_distill_mean2",
-                "./checkpoints/frn_sd3_be"
+                "/mnt/gsai/hyunsu/dsb-bnn/checkpoints/frn_sd23_distill_mean2",
+                "/mnt/gsai/hyunsu/dsb-bnn/checkpoints/frn_sd3_be"
             ]
         return [
-            "./checkpoints/frn_sd2",
-            "./checkpoints/frn_sd3",
-            "./checkpoints/frn_sd5",
-            "./checkpoints/frn_sd7",
-            "./checkpoints/frn_sd11",
-            "./checkpoints/frn_sd13",
-            "./checkpoints/frn_sd17",
-            # "./checkpoints/frn_sd19",
+            "/mnt/gsai/hyunsu/dsb-bnn/checkpoints/frn_sd2",
+            "/mnt/gsai/hyunsu/dsb-bnn/checkpoints/frn_sd3",
+            "/mnt/gsai/hyunsu/dsb-bnn/checkpoints/frn_sd5",
+            "/mnt/gsai/hyunsu/dsb-bnn/checkpoints/frn_sd7",
+            "/mnt/gsai/hyunsu/dsb-bnn/checkpoints/frn_sd11",
+            "/mnt/gsai/hyunsu/dsb-bnn/checkpoints/frn_sd13",
+            "/mnt/gsai/hyunsu/dsb-bnn/checkpoints/frn_sd17",
+            # "/mnt/gsai/hyunsu/dsb-bnn/checkpoints/frn_sd19",
         ]
     elif data_name == "CIFAR10_x32" and model_style == "BN-ReLU":
         return [
             # "./checkpoints/bn_sd2_smooth",
-            "./checkpoints/bn_sd3_smooth",
-            "./checkpoints/bn_sd5_smooth",
-            "./checkpoints/bn_sd7_smooth",
+            "/mnt/gsai/hyunsu/dsb-bnn/checkpoints/bn_sd3_smooth",
+            "/mnt/gsai/hyunsu/dsb-bnn/checkpoints/bn_sd5_smooth",
+            "/mnt/gsai/hyunsu/dsb-bnn/checkpoints/bn_sd7_smooth",
         ]
     else:
         raise Exception("Invalid data_name and model_style.")
@@ -889,3 +898,161 @@ def get_single_batch(batch, i=0):
     for k, v in batch.items():
         new_batch[k] = v[i]
     return new_batch
+
+
+
+def get_config(ckpt_config):
+    for k, v in ckpt_config.items():
+        if isinstance(v, dict) and v.get("0") is not None:
+            l = []
+            for k1, v1 in v.items():
+                l.append(v1)
+            ckpt_config[k] = tuple(l)
+    config = EasyDict(ckpt_config)
+    model_dtype = getattr(config, "dtype", None) or "float32"
+    if "float32" in model_dtype:
+        config.dtype = jnp.float32
+    elif "float16" in model_dtype:
+        config.dtype = jnp.float16
+    else:
+        raise NotImplementedError
+    if getattr(config, "num_classes", None) is None:
+        if config.data_name == "CIFAR10_x32":
+            config.num_classes = 10
+        elif config.data_name == "CIFAR100_x32":
+            config.num_classes = 100
+        elif config.data_name == "TinyImageNet200_x64":
+            config.num_classes = 200
+    if getattr(config, "image_stats", None) is None:
+        config.image_stats = dict(
+            m=jnp.array(defaults_sgd.PIXEL_MEAN),
+            s=jnp.array(defaults_sgd.PIXEL_STD))
+    if getattr(config, "model_planes", None) is None:
+        if config.data_name == "CIFAR10_x32" and config.model_style == "FRN-Swish":
+            config.model_planes = 16
+            config.model_blocks = None
+        elif config.data_name == "CIFAR100_x32" and config.model_style == "FRN-Swish":
+            config.model_planes = 16
+            config.model_blocks = None
+        elif config.data_name == "TinyImageNet200_x64" and config.model_style == "FRN-Swish":
+            config.model_planes = 64
+            config.model_blocks = "3,4,6,3"
+    return config
+    
+
+
+
+def load_ckpt(dirname):
+    ckpt = checkpoints.restore_checkpoint(
+        ckpt_dir=dirname,
+        target=None
+    )
+    if ckpt.get("model") is not None:
+        if ckpt.get("Dense_0") is not None:
+            params = ckpt["model"]
+            batch_stats = dict()
+        else:
+            params = ckpt["model"]["params"]
+            batch_stats = ckpt["model"]["batch_stats"]
+    else:
+        params = ckpt["params"]
+        batch_stats = ckpt["batch_stats"]
+    config = get_config(ckpt["config"])
+    return params, batch_stats, config
+
+
+print_fn = partial(print, flush=True)
+
+
+def pdict(params, batch_stats=None, image_stats=None):
+    params_dict = dict(params=params)
+    if batch_stats is not None:
+        params_dict["batch_stats"] = batch_stats
+    if image_stats is not None:
+        params_dict["image_stats"] = image_stats
+    return params_dict
+
+
+def get_stats(config, dataloaders, base_net, params_dict):
+    feature_name = config.feature_name
+
+    mutable = ["intermediates"]
+
+    @partial(jax.pmap, axis_name="batch")
+    def forward(batch):
+        _, state = base_net.apply(
+            params_dict, batch["images"], rngs=None,
+            mutable=mutable,
+            training=False, use_running_average=True)
+        feature = state["intermediates"][feature_name][0]
+        logit = state["intermediates"]["cls.logit"][0]
+        logit = logit - logit.mean(axis=-1, keepdims=True)
+        return feature, logit
+
+    train_loader = dataloaders["trn_loader"](rng=None)
+    train_loader = jax_utils.prefetch_to_device(train_loader, size=2)
+    z_dim = None
+    l_dim = None
+    z_sum = 0
+    l_sum = 0
+    z_max = -float("inf")
+    l_max = -float("inf")
+    z_min = float("inf")
+    l_min = float("inf")
+    count = 0
+    for batch in tqdm(train_loader):
+        z, l = forward(batch)
+        if z_dim is None:
+            z_dim = z[0, 0].shape
+        if l_dim is None:
+            l_dim = l[0, 0].shape
+        P, B, ld = l.shape
+        P, B, h, w, zd = z.shape
+        P, B = batch["marker"].shape
+        marker = batch["marker"].reshape(-1)
+        z_sum += (z.reshape(-1, h, w, zd)[marker]).sum(0).mean()
+        l_sum += (l.reshape(-1, ld)[marker]).sum(0).mean()
+        count += jnp.sum(marker)
+        _z_max = jnp.max(z)
+        _z_min = jnp.min(z)
+        _l_max = jnp.max(l)
+        _l_min = jnp.min(l)
+        z_max = jnp.where(z_max < _z_max, _z_max, z_max)
+        z_min = jnp.where(z_min > _z_min, _z_min, z_min)
+        l_max = jnp.where(l_max < _l_max, _l_max, l_max)
+        l_min = jnp.where(l_min > _l_min, _l_min, l_min)
+    z_mean = z_sum/count
+    l_mean = l_sum/count
+    z_var = 0
+    l_var = 0
+    train_loader = dataloaders["trn_loader"](rng=None)
+    train_loader = jax_utils.prefetch_to_device(train_loader, size=2)
+    for batch in tqdm(train_loader):
+        z, l = forward(batch)
+        P, B, ld = l.shape
+        P, B, h, w, zd = z.shape
+        P, B = batch["marker"].shape
+        marker = batch["marker"].reshape(-1)
+        z_var += (
+            (z.reshape(-1, h, w, zd)[marker] -
+             z_mean[None, None, None, None])**2
+        ).sum(0).mean()
+        l_var += (
+            (l.reshape(-1, ld)[marker] - l_mean[None, None])**2
+        ).sum(0).mean()
+    z_std = jnp.sqrt(z_var/count)
+    l_std = jnp.sqrt(l_var/count)
+    return (l_mean, l_std, l_max, l_min, l_dim), (z_mean, z_std, z_max, z_min, z_dim)
+
+
+def get_score_input_dim(config):
+    if config.fat:
+        if isinstance(config.z_dim, tuple):
+            h, w, d = config.z_dim
+            score_input_dim = (h, w, config.fat*d)
+        else:
+            score_input_dim = config.fat*config.z_dim
+    else:
+        score_input_dim = config.z_dim
+
+    return score_input_dim

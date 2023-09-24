@@ -569,8 +569,7 @@ def build_dbn(config):
         mimo_cond=config.mimo_cond,
         start_temp=config.start_temp,
         multi_mixup=False,
-        continuous=config.dsb_continuous,
-        rand_temp=config.distribution == 3
+        continuous=config.dsb_continuous
     )
     return dbn, (dsb_stats, None)
 

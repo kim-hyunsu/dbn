@@ -1,0 +1,5 @@
+method: dbn
+checkpoints:
+  - ./checkpoints/dbn/c10/t235/cosmic-sky-838
+  - ./checkpoints/dbn/c10/t235/decent-tree-849
+  - ./checkpoints/dbn/c10/t235/dauntless-glitter-851

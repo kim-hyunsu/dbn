@@ -98,6 +98,7 @@ def launch(args):
         print("Building Diffusion Bridge Network (DBN)...")
         dbn, (dsb_stats, z_dsb_stats) = build_dbn(config)
     elif args.method in ["naive_ed", "proxy_end2", "de"]:
+        print("Building ResNet...")
         resnet = get_resnet(config, head=True)()
 
     # ------------------------------------------------------------------------------------------------------------
@@ -247,6 +248,39 @@ def launch(args):
         probsC = jnp.exp(logprobsC)
         ens_probsC = jnp.mean(probsC, axis=0)
         return ens_probsC
+
+    @jax.jit
+    def test_ens_dbn(state, batch):
+        sum_probs = 0
+        for m in range(args.ensemble):
+            if config.medium:
+                steps = (config.T+1)//2
+            else:
+                steps = config.T
+            drop_rng, score_rng = jax.random.split(state["rng"])
+            params_dict = pdict(
+                params=state["params"][m],
+                image_stats=config.image_stats,
+                batch_stats=state["batch_stats"][m],
+            )
+            rngs_dict = dict(dropout=drop_rng)
+            model_bd = dbn.bind(params_dict, rngs=rngs_dict)
+            _dsb_sample = partial(
+                dsb_sample, config=config, dsb_stats=dsb_stats, z_dsb_stats=z_dsb_stats, steps=steps)
+            logitsC, logitsB = model_bd.sample(
+                score_rng, _dsb_sample, batch["images"])
+            logitsC = rearrange(logitsC, "n (t b) z -> t n b z", t=steps+1)
+            if config.medium:
+                last2 = jax.nn.log_softmax(logitsC[-2:], axis=-1)
+                last2 = jax.scipy.special.logsumexp(last2, axis=0) - np.log(2)
+                logitsC = last2 - last2.mean(-1, keepdims=True)
+            else:
+                logitsC = logitsC[-1]
+            logprobsC = jax.nn.log_softmax(logitsC, axis=-1)
+            probsC = jnp.exp(logprobsC)
+            ens_probsC = jnp.mean(probsC, axis=0)
+            sum_probs += ens_probsC
+        return sum_probs/args.ensemble
 
     @jax.jit
     def test_naive_ed(state, batch):

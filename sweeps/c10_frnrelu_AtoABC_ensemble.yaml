@@ -1,0 +1,40 @@
+project: dbn
+program: dbn.py
+method: bayes
+metric:
+  name: tst/acc1
+  goal: maximize
+parameters:
+  config:
+    value: config_dsb/c10_frnrelu_AtoABC_ensemble.yaml
+  optim_ne:
+    values: [600,800, 1000]
+  optim_weight_decay:
+    values: [0,0.001]
+  beta2:
+    values: [0.0001, 0.0005]
+  optim_lr:
+    values: [0.00025, 0.0001]
+  optim_bs:
+    values: [256,128]
+  version:
+    value: v1.1.8
+  ema_decay:
+    values: [0.99995, 0.9995]
+  T:
+    value: 2
+  linear_noise:
+    values: [True, False]
+  start_temp:
+    values: [1.5, 2, 2.5]
+  input_scaling:
+    values: [1, 3]
+  
+
+  
+command:
+  - ${env}
+  - ${interpreter}
+  - ${program}
+  - ${args_no_boolean_flags}
+  

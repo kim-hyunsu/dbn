@@ -975,7 +975,7 @@ class DepthwiseSeparableConv(nn.Module):
             nn.Conv,
             use_bias=self.use_bias,
             kernel_init=self.kernel_init,
-            bias_init=self.bias_init
+            bias_init=self.bias_ini
         )
         B, H, W, C = x.shape
         x = Conv(
@@ -2130,10 +2130,8 @@ class ClsUnet(nn.Module):
         t = self.fc(features=in_c//2)(t)
         t = self.silu(t)
 
-        p = self.dropout(0.2, deterministic=not kwargs["training"])(p)
         p = self.fc(features=in_c//2)(p)
         p = self.silu(p)
-        p = self.dropout(0.5, deterministic=not kwargs["training"])(p)
 
         _t = jnp.concatenate([p, t], axis=-1)
         _x = x
@@ -2185,17 +2183,10 @@ class ClsUnet(nn.Module):
         t = self.fc(features=in_c//2)(t)
         t = self.silu(t)
 
-        # p_m = jnp.median(p, axis=-1, keepdims=True)
-        # p = self.relu6(p - p_m + 6) + p_m - 6
-        # p = self.refer(features=in_c//2)(p)
-        # p = nn.gelu(p)
         p = LogitEncoder()(p)
-        # p = jnp.tanh(p)
-        # p = p  - 6
-        # p = p[:, None, None, :]
-        # p = jnp.tile(p, reps=[1,x.shape[1], x.shape[2], 1])
+        p = p[:, None, None, :]
+        p = jnp.tile(p, reps=[1, x.shape[1], x.shape[2], 1])
 
-        t = jnp.concatenate([p, t], axis=-1)
         _x = x
         x = self.conv(
             features=in_c,
@@ -2206,8 +2197,8 @@ class ClsUnet(nn.Module):
         # print(f"{x.shape[1]*x.shape[2]*3**2*_x.shape[-1]*x.shape[-1]}")
         x = self.norm(**norm_kwargs)(x)
         x = self.relu6(x)
-        # x = jnp.concatenate([x, p], axis=-1)
-        # in_c = x.shape[-1]
+        x = jnp.concatenate([x, p], axis=-1)
+        in_c = x.shape[-1]
         for e, c, n, s in cfgs:
             out_c = _divisible(c*self.width_multi, 2)
             _t = self.fc(features=in_c)(t)
@@ -2247,23 +2238,22 @@ class LogitEncoder(nn.Module):
     fc: nn.Module = partial(
         nn.Dense,
         use_bias=True,
-        kernel_init=jax.nn.initializers.zeros,
+        # kernel_init=jax.nn.initializers.zeros,
         bias_init=jax.nn.initializers.zeros
     )
 
     @nn.compact
     def __call__(self, x, **kwargs):
         dim = x.shape[-1]
-        # p = jax.nn.softmax(x, axis=-1)
-        # x_s = jnp.std(p, axis=-1, keepdims=True)
-        # x_a = jnp.mean(p, axis=-1, keepdims=True)
-        # x = jnp.concatenate([x_s, x_a], axis=-1)
-        x_l2 = jnp.sqrt((x**2).sum(axis=-1, keepdims=True))
-        x_a = jnp.sum(x, axis=-1, keepdims=True)
-        x = jnp.concatenate([x_a, x_l2], axis=-1)
-        x = x/dim
-        x = self.fc(features=dim//4)(x)
-        x = self.silu(x)
+        x_l2 = jnp.sqrt((x**2).sum(axis=-1, keepdims=True)) /dim
+        x_a = jnp.sum(x, axis=-1, keepdims=True) / dim
+        x_std = jnp.std(x, axis=-1, keepdims=True) 
+        x = jnp.concatenate([x_a, x_l2, x_std], axis=-1)
+        x = self.fc(features=2)(x)
+        x = self.relu6(x)
+        x = self.fc(features=2)(x)
+        x = self.relu6(x)
+        x = self.fc(features=2)(x)
         return x
 
 
@@ -2661,9 +2651,6 @@ class DiffusionBridgeNetwork(nn.Module):
 
     def set_logit(self, rng, l1):
         T = self.start_temp
-        if self.rand_temp:
-            _, temp_rng = jax.random.split(rng)
-            T *= 1+0.2*jax.random.beta(temp_rng, 1, 5)
         if self.forget == 0:
             l1 = l1/T
         elif self.forget == 1:
@@ -2684,6 +2671,10 @@ class DiffusionBridgeNetwork(nn.Module):
             l1 = l1/T
             mask = jax.random.bernoulli(rng, p=0.7, shape=l1.shape)
             l1 = mask*l1
+        elif self.forget == 6:
+            _, temp_rng = jax.random.split(rng)
+            T += 0.4*jax.random.beta(temp_rng, 1,5)
+            l1 = l1/T
         return l1
 
     def conditional_dbn(self, rng, l0, x1, base_params=None, cls_params=None, **kwargs):

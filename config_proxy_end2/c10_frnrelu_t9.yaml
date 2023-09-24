@@ -1,0 +1,22 @@
+data_name: CIFAR10_x32
+model_depth: 32
+model_width: 2
+model_style: FRN-Swish
+model_name: FlaxResNet
+optim_bs: 128
+optim_ne: 250
+optim_lr: 0.05
+optim_weight_decay: 0.001
+optim: sgd
+dist_alpha: 1
+dist_temp: 2
+teachers:
+  - "./checkpoints/frn_sd2_be"
+  - "./checkpoints/frn_sd3_be"
+  - "./checkpoints/frn_sd5_be"
+  - "./checkpoints/frn_sd7_be"
+  - "./checkpoints/frn_sd9_be"
+  - "./checkpoints/frn_sd11_be"
+  - "./checkpoints/frn_sd13_be"
+  - "./checkpoints/frn_sd15_be"
+  - "./checkpoints/frn_sd17_be"

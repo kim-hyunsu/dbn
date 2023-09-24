@@ -22,8 +22,8 @@ sgd_state: True
 crt: 1
 cls_from_scratch: False
 mixup_alpha: 0.4
-forget: 0
-linear_nose: True
+forget: 6
+linear_noise: True
 start_temp: 2
 ensemble_prediction: 3
 dsc: True

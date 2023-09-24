@@ -1,0 +1,10 @@
+method: de
+ensemble: 1
+checkpoints:
+  - ./checkpoints/frn100_sd11_be
+  - ./checkpoints/frn100_sd13_be
+  - ./checkpoints/frn100_sd15_be
+  - ./checkpoints/frn100_sd2_be
+  - ./checkpoints/frn100_sd3_be
+  - ./checkpoints/frn100_sd5_be
+  - ./checkpoints/frn100_sd9_be

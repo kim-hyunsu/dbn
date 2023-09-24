@@ -1,0 +1,7 @@
+method: proxy_end2
+checkpoints:
+  - ./checkpoints/proxy_end2/c10/t235/230919/0
+  - ./checkpoints/proxy_end2/c10/t235/230919/1
+  - ./checkpoints/proxy_end2/c10/t235/230919/2
+  - ./checkpoints/proxy_end2/c10/t235/230919/3
+  - ./checkpoints/proxy_end2/c10/t235/230919/4

@@ -1,0 +1,20 @@
+data_name: CIFAR100_x32
+model_depth: 32
+model_width: 4
+model_style: FRN-Swish
+model_name: FlaxResNet
+optim_bs: 128
+optim_ne: 200
+optim_lr: 0.1
+warmup_factor: 0.01
+warmup_steps: 5
+optim_weight_decay: 0.0005
+optim: sgd
+dist_alpha: 1
+dist_temp: 4
+teachers:
+  - "./checkpoints/frn100_sd11_be"
+  - "./checkpoints/frn100_sd13_be"
+  - "./checkpoints/frn100_sd15_be"
+  - "./checkpoints/frn100_sd2_be"
+  - "./checkpoints/frn100_sd3_be"

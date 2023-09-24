@@ -1056,3 +1056,116 @@ def get_score_input_dim(config):
         score_input_dim = config.z_dim
 
     return score_input_dim
+
+#################### Loss functions ######################
+@jax.jit
+def mse_loss(noise, output):
+    p = config.mse_power
+    sum_axis = list(range(1, len(output.shape[1:])+1))
+    loss = jnp.sum(jnp.abs(noise-output)**p, axis=sum_axis)
+    return loss
+
+@jax.jit
+def ce_loss(logits, labels):
+    target = common_utils.onehot(labels, num_classes=logits.shape[-1])
+    pred = jax.nn.log_softmax(logits, axis=-1)
+    loss = -jnp.sum(target*pred, axis=-1)
+    return loss
+
+@jax.jit
+def kld_loss(target_list, refer_list, T=1.):
+    if not isinstance(target_list, list):
+        target_list = [target_list]
+    if not isinstance(refer_list, list):
+        refer_list = [refer_list]
+    kld_sum = 0
+    count = 0
+    for tar, ref in zip(target_list, refer_list):
+        assert len(tar.shape) == 2, f"{tar.shape}"
+        assert len(ref.shape) == 2, f"{ref.shape}"
+        logq = jax.nn.log_softmax(tar/T, axis=-1)
+        logp = jax.nn.log_softmax(ref/T, axis=-1)
+        q = jnp.exp(logq)
+        integrand = q*(logq-logp)
+        kld = jnp.sum(integrand, axis=-1)
+        kld_sum += T**2*kld
+        count += 1
+    return kld_sum/count
+
+@jax.jit
+def self_kld_loss(target_list, T=1.):
+    N = len(target_list)
+    assert N > 1
+    kld_sum = 0
+    count = N*(N-1)
+    logprob_list = [jax.nn.log_softmax(
+        tar/T, axis=-1) for tar in target_list]
+    for logq in logprob_list:
+        for logp in logprob_list:
+            q = jnp.exp(logq)
+            integrand = q*(logq-logp)
+            kld = jnp.sum(integrand, axis=-1)
+            kld_sum += T**2*kld
+    return kld_sum/count
+
+@jax.jit
+def reduce_mean(loss, marker):
+    assert len(loss.shape) == 1
+    count = jnp.sum(marker)
+    loss = jnp.where(marker, loss, 0).sum()
+    loss = jnp.where(count != 0, loss/count, loss)
+    return loss
+
+@jax.jit
+def reduce_sum(loss, marker):
+    assert len(loss.shape) == 1
+    loss = jnp.where(marker, loss, 0).sum()
+    return loss
+
+def kld_loss_fn(t, r, marker):
+    return reduce_sum(
+        kld_loss(t, r), marker)
+
+def self_kld_loss_fn(t, marker):
+    return reduce_sum(self_kld_loss(t), marker)
+
+
+
+@partial(jax.pmap, axis_name="batch")
+def step_mixup(state, batch):
+    if config.distribution == 1:
+        count = jnp.sum(batch["marker"])
+        x = batch["images"]
+        batch_size = x.shape[0]
+        a = config.mixup_alpha
+        beta_rng, perm_rng = jax.random.split(state.rng)
+
+        lamda = jax.random.beta(beta_rng, a, a)
+        lamda = jnp.where(lamda > 0.5, 1-lamda, lamda)
+
+        perm_x = jax.random.permutation(perm_rng, x)
+        mixed_x = (1-lamda)*x+lamda*perm_x
+        mixed_x = jnp.where(count == batch_size, mixed_x, x)
+
+        batch["images"] = mixed_x
+        batch["images_tar"] = x
+    else:
+        count = jnp.sum(batch["marker"])
+        x = batch["images"]
+        y = batch["labels"]
+        batch_size = x.shape[0]
+        a = config.mixup_alpha
+        beta_rng, perm_rng = jax.random.split(state.rng)
+
+        lamda = jnp.where(a > 0, jax.random.beta(beta_rng, a, a), 1)
+
+        perm_x = jax.random.permutation(perm_rng, x)
+        perm_y = jax.random.permutation(perm_rng, y)
+        mixed_x = (1-lamda)*x+lamda*perm_x
+        mixed_y = jnp.where(lamda < 0.5, y, perm_y)
+        mixed_x = jnp.where(count == batch_size, mixed_x, x)
+        mixed_y = jnp.where(count == batch_size, mixed_y, y)
+
+        batch["images"] = mixed_x
+        batch["labels"] = mixed_y
+    return batch

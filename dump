@@ -1,6 +1,6 @@
 **** DEBUG MODE OFF ****
 distillation mode
-[2023-09-23 00:11:27] Environments:
+[2023-09-23 22:35:28] Environments:
 ------------  --------------------------------------------------------------------------
 sys.platform  linux
 Python        3.9.16 (main, Jan 11 2023, 16:05:54) [GCC 11.2.0]
@@ -10,7 +10,7 @@ Flax          0.6.5 @/mnt/home/hyunsu/.conda/envs/dsb/lib/python3.9/site-package
 Optax         0.1.4 @/mnt/home/hyunsu/.conda/envs/dsb/lib/python3.9/site-packages/optax
 ------------  --------------------------------------------------------------------------
 
-[2023-09-23 00:11:27] Command line arguments:
+[2023-09-23 22:35:28] Command line arguments:
 - args.data_root               : /mnt/gsai/hyunsu/dsb-bnn/data
 - args.data_name               : CIFAR10_x32
 - args.data_augmentation       : standard
@@ -93,4 +93,12 @@ Optax         0.1.4 @/mnt/home/hyunsu/.conda/envs/dsb/lib/python3.9/site-package
 - args.linear_nose             : True
 - args.distillation            : True
 
-Loaded checkpoint from /mnt/gsai/hyunsu/dsb-bnn/checkpoints/dbn/c10/t235/cosmic-sky-838 to start distillation.
+[2023-09-23 22:35:28] Multiple local devices are detected:
+[StreamExecutorGpuDevice(id=0, process_index=0, slice_index=0), StreamExecutorGpuDevice(id=1, process_index=0, slice_index=0)]
+
+Calculating statistics of feature z...
+l mean -0.000 std 2.595 max 8.323 min -3.938 dim (10,)
+z mean 0.354 std 0.349 max 7.202 min -0.050 dim (32, 32, 32)
+Building Diffusion Bridge Network (DBN)...
+Import DBN from loaded parameters from /mnt/gsai/hyunsu/dsb-bnn/checkpoints/dbn/c10/t235/cosmic-sky-838 ...
+{'T': 5, 'base_type': 'A', 'best_nll': False, 'beta': 0.5, 'beta1': 0.0001, 'beta2': 0.0001, 'ce_loss': 0, 'cls_from_scratch': False, 'cls_optim': 'adam', 'config': 'config_dsb/c10_frnrelu_AtoABC_ensemble.yaml', 'crt': 1, 'data_augmentation': 'standard', 'data_name': 'CIFAR10_x32', 'data_proportional': 1.0, 'data_root': './data/', 'droprate': 0, 'dsc': True, 'dtype': <class 'jax.numpy.float32'>, 'ema_decay': 0.99995, 'ensemble_exclude_a': False, 'ensemble_prediction': 3, 'fat': 1, 'feature_name': 'feature.layer1stride1', 'forget': 0, 'frn_swish': False, 'gamma': 1, 'image_stats': {'base': {'m': array([0.49, 0.48, 0.44], dtype=float32), 's': array([0.2, 0.2, 0.2], dtype=float32)}}, 'input_scaling': 3, 'joint_depth': 6, 'kld_joint': False, 'kld_temp': 1, 'large': False, 'latentbe': None, 'learn_sigma': False, 'lgamma': 1, 'linear_noise': False, 'linear_nose': True, 'medium': False, 'mimo_cls': 1, 'mimo_cond': False, 'mixup_alpha': 0.4, 'model_blocks': None, 'model_depth': 32, 'model_name': 'FlaxResNet', 'model_planes': 16, 'model_style': 'FRN-Swish', 'model_width': 2, 'mse_power': 2, 'n_feat': 128, 'nowandb': False, 'num_classes': 10, 'num_heads': 1, 'num_res_blocks': 1, 'optim_base': 'adam', 'optim_bs': 128, 'optim_lr': 0.00025, 'optim_momentum': 0.9, 'optim_ne': 800, 'optim_weight_decay': 0, 'prob_loss': False, 'resblock_updown': False, 'residual_prediction': False, 'save': './checkpoints/dbn/c10/t235', 'score_input_dim': [32, 32, 32], 'seed': 2023, 'sgd_state': True, 'shared_head': False, 'start_base': 999999999999, 'start_cls': -1, 'start_temp': 2, 'tag': 'AtoABC', 'train_base': False, 'trn_steps_per_epoch': 320, 'use_new_attention_order': False, 'use_scale_shift_norm': False, 'version': 'v1.1.7', 'warmup_factor': 0.01, 'warmup_steps': 0, 'width_multi': 1, 'x_dim': [32, 32, 3], 'z_dim': [32, 32, 32], 'zgamma': 1}

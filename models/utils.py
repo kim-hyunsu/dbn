@@ -15,7 +15,8 @@ from giung2.models.layers import FilterResponseNorm
 from models.resnet import FlaxResNet, FlaxResNetBase
 from utils import model_list
 from models.resnet import FlaxResNetClassifier3
-from models.i2sb import  ClsUnet
+from models.i2sb import  ClsUnet, DiffusionBridgeNetwork
+from models.bridge import dsb_schedules, CorrectionModel
 
 
 def get_latentbe_state(config, rng):
@@ -344,3 +345,31 @@ def load_base_cls(variables, resnet_param_list, load_cls=True, base_type="A", mi
                 cls_idx += 1
 
     return freeze(var)
+
+
+def build_dbn(config):
+    cls_net = get_classifier(config)
+    base_net = get_resnet(config, head=False)
+    dsb_stats = dsb_schedules(
+        config.beta1, config.beta2, config.T, linear_noise=config.linear_noise, continuous=config.dsb_continuous)
+    score_net = get_scorenet(config)
+    crt_net = partial(CorrectionModel, layers=1) if config.crt > 0 else None
+    dbn = DiffusionBridgeNetwork(
+        base_net=base_net,
+        score_net=score_net,
+        cls_net=cls_net,
+        crt_net=crt_net,
+        dsb_stats=dsb_stats,
+        z_dsb_stats=None,
+        fat=config.fat,
+        joint=2,
+        forget=config.forget,
+        temp=1.,
+        print_inter=False,
+        mimo_cond=config.mimo_cond,
+        start_temp=config.start_temp,
+        multi_mixup=False,
+        continuous=config.dsb_continuous,
+        rand_temp=config.distribution == 3
+    )
+    return dbn, (dsb_stats, None)

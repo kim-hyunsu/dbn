@@ -19,4 +19,4 @@ teachers:
   - "./checkpoints/frn_sd11_be"
   - "./checkpoints/frn_sd13_be"
   - "./checkpoints/frn_sd15_be"
-  - "./checkpoints/frn_sd19_be"
+  - "./checkpoints/frn_sd17_be"

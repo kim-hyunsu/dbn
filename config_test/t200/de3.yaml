@@ -1,0 +1,9 @@
+method: de
+ensemble: 3
+checkpoints:
+  - ./checkpoints/frn200_sd3_be
+  - ./checkpoints/frn200_sd5_be
+  - ./checkpoints/frn200_sd9_be
+  - ./checkpoints/frn200_sd13_be
+  - ./checkpoints/frn200_sd15_be
+  - ./checkpoints/frn200_sd17_be

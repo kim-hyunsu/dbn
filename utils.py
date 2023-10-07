@@ -6,6 +6,9 @@ import wandb
 import jax
 from flax.training import common_utils
 from collections import OrderedDict
+from flax.training import checkpoints
+from easydict import EasyDict
+import defaults_sgd
 
 debug = os.environ.get("DEBUG")
 if isinstance(debug, str):
@@ -254,13 +257,40 @@ def model_list(data_name, model_style, shared_head=False, tag=""):
                 "./checkpoints/frn100_sd5_be",
                 "./checkpoints/frn100_sd9_be",
             ]
+        elif tag == "AtoABC2":
+            return [
+                "./checkpoints/frn100_sd11_be",
+                "./checkpoints/frn100_sd2_be",
+                "./checkpoints/frn100_sd3_be",
+            ]
+        elif tag == "AtoABC3":
+            return [
+                "./checkpoints/frn100_sd11_be",
+                "./checkpoints/frn100_sd5_be",
+                "./checkpoints/frn100_sd9_be",
+            ]
     elif data_name == "TinyImageNet200_x64" and model_style == "FRN-Swish":
         if tag == "AtoABC":
             return [
-                "./checkpoints/frn200_sd2_be",
                 "./checkpoints/frn200_sd3_be",
                 "./checkpoints/frn200_sd5_be",
                 "./checkpoints/frn200_sd7_be",
+                "./checkpoints/frn200_sd9_be",
+                "./checkpoints/frn200_sd13_be",
+                "./checkpoints/frn200_sd15_be",
+                "./checkpoints/frn200_sd17_be",
+            ]
+        elif tag == "AtoABC2":
+            return [
+                "./checkpoints/frn200_sd3_be",
+                "./checkpoints/frn200_sd9_be",
+                "./checkpoints/frn200_sd13_be",
+            ]
+        elif tag == "AtoABC3":
+            return [
+                "./checkpoints/frn200_sd3_be",
+                "./checkpoints/frn200_sd15_be",
+                "./checkpoints/frn200_sd17_be",
             ]
     elif data_name == "CIFAR10_x32" and model_style == "FRN-Swish":
         if tag == "bezier":
@@ -308,6 +338,25 @@ def model_list(data_name, model_style, shared_head=False, tag=""):
                 "./checkpoints/frn_sd11_be",
                 "./checkpoints/frn_sd13_be",
                 "./checkpoints/frn_sd15_be",
+                "./checkpoints/frn_sd17_be",
+            ]
+        elif tag == "AtoABC2":
+            return [
+                "./checkpoints/frn_sd2_be",
+                "./checkpoints/frn_sd7_be",
+                "./checkpoints/frn_sd9_be",
+            ]
+        elif tag == "AtoABC3":
+            return [
+                "./checkpoints/frn_sd2_be",
+                "./checkpoints/frn_sd11_be",
+                "./checkpoints/frn_sd13_be",
+            ]
+        elif tag == "AtoABC4":
+            return [
+                "./checkpoints/frn_sd2_be",
+                "./checkpoints/frn_sd15_be",
+                "./checkpoints/frn_sd17_be",
             ]
         elif tag == "DistoABC":
             return [
@@ -889,3 +938,67 @@ def get_single_batch(batch, i=0):
     for k, v in batch.items():
         new_batch[k] = v[i]
     return new_batch
+
+
+def get_config(ckpt_config):
+    for k, v in ckpt_config.items():
+        if isinstance(v, dict) and v.get("0") is not None:
+            l = []
+            for k1, v1 in v.items():
+                l.append(v1)
+            ckpt_config[k] = tuple(l)
+    config = EasyDict(ckpt_config)
+    model_dtype = getattr(config, "dtype", None) or "float32"
+    if "float32" in model_dtype:
+        config.dtype = jnp.float32
+    elif "float16" in model_dtype:
+        config.dtype = jnp.float16
+    else:
+        raise NotImplementedError
+    if getattr(config, "num_classes", None) is None:
+        if config.data_name == "CIFAR10_x32":
+            config.num_classes = 10
+        elif config.data_name == "CIFAR100_x32":
+            config.num_classes = 100
+        elif config.data_name == "TinyImageNet200_x64":
+            config.num_classes = 200
+    if getattr(config, "image_stats", None) is None:
+        config.image_stats = dict(
+            m=jnp.array(defaults_sgd.PIXEL_MEAN),
+            s=jnp.array(defaults_sgd.PIXEL_STD))
+    if getattr(config, "model_planes", None) is None:
+        if config.data_name == "CIFAR10_x32" and config.model_style == "FRN-Swish":
+            config.model_planes = 16
+            config.model_blocks = None
+        elif config.data_name == "CIFAR100_x32" and config.model_style == "FRN-Swish":
+            config.model_planes = 16
+            config.model_blocks = None
+        elif config.data_name == "TinyImageNet200_x64" and config.model_style == "FRN-Swish":
+            config.model_planes = 64
+            config.model_blocks = "3,4,6,3"
+    if getattr(config, "dsb_continuous", None) is None:
+        config.dsb_continuous = False
+    if getattr(config, "centering", None) is None:
+        config.centering = False
+    return config
+
+
+def load_ckpt(dirname):
+    ckpt = checkpoints.restore_checkpoint(
+        ckpt_dir=dirname,
+        target=None
+    )
+    if ckpt is None:
+        raise Exception(f"{dirname} does not exist")
+    if ckpt.get("model") is not None:
+        if ckpt.get("Dense_0") is not None:
+            params = ckpt["model"]
+            batch_stats = dict()
+        else:
+            params = ckpt["model"]["params"]
+            batch_stats = ckpt["model"]["batch_stats"]
+    else:
+        params = ckpt["params"]
+        batch_stats = ckpt["batch_stats"]
+    config = get_config(ckpt["config"])
+    return params, batch_stats, config

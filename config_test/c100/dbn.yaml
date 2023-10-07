@@ -1,0 +1,10 @@
+method: dbn
+ensemble: 2
+checkpoints:
+  t111315:
+    - ./checkpoints/dbn/c100/t111315dist/230925/v118/0
+    - ./checkpoints/dbn/c100/t111315dist/230925/v118/1
+  t1123dist:
+    - ./checkpoints/dbn/c100/t1123dist/230927/v118/0
+    - ./checkpoints/dbn/c100/t1123dist/230927/v118/1
+    - ./checkpoints/dbn/c100/t1123dist/230927/v118/2

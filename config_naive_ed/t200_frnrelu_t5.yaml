@@ -15,8 +15,8 @@ optim: sgd
 dist_alpha: 1
 dist_temp: 4
 teachers:
-  - "./checkpoints/frn200_sd2_be"
   - "./checkpoints/frn200_sd3_be"
   - "./checkpoints/frn200_sd5_be"
   - "./checkpoints/frn200_sd7_be"
   - "./checkpoints/frn200_sd9_be"
+  - "./checkpoints/frn200_sd13_be"

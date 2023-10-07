@@ -1,0 +1,5 @@
+method: naive_ed
+checkpoints:
+  - ./checkpoints/proxy_end2/t200/t357/230927/0
+  - ./checkpoints/proxy_end2/t200/t357/230927/1
+  - ./checkpoints/proxy_end2/t200/t357/230927/2

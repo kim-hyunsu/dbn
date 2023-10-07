@@ -2,6 +2,7 @@ from builtins import NotImplementedError
 import os
 import orbax
 from copy import deepcopy
+from easydict import EasyDict
 
 
 from typing import Any, Tuple
@@ -40,6 +41,7 @@ from utils import WandbLogger, pixelize, normalize_logits, unnormalize_logits
 from utils import model_list, logit_dir_list, feature_dir_list, feature2_dir_list, feature3_dir_list
 from utils import get_info_in_dir, jprint, expand_to_broadcast, FeatureBank, get_probs, get_logprobs
 from utils import batch_mul, batch_add, get_ens_logits, get_avg_logits
+from utils import load_ckpt
 from tqdm import tqdm
 from functools import partial
 import defaults_sgd
@@ -223,6 +225,17 @@ def load_resnet(ckpt_dir):
     return params, batch_stats, image_stats
 
 
+def load_teacher(ckpt_dir):
+    ckpt = checkpoints.restore_checkpoint(
+        ckpt_dir=ckpt_dir,
+        target=None
+    )
+    params = ckpt["params"]
+    batch_stats = ckpt.get("batch_stats")
+    config = ckpt["config"]
+    return params, batch_stats, config
+
+
 def get_model_list(config):
     name = config.data_name
     style = config.model_style
@@ -376,22 +389,6 @@ def get_scorenet(config):
         input_scaling=config.input_scaling,
         width_multi=config.width_multi
     )
-    # if config.model_style == "BN-ReLU":
-    #     score_func = score_func
-    # elif config.model_style == "FRN-Swish":
-    #     score_func = partial(
-    #         score_func,
-    #         conv=partial(
-    #             flax.linen.Conv if not config.dsc else DepthwiseSeparableConv,
-    #             use_bias=True,
-    #             kernel_init=jax.nn.initializers.he_normal(),
-    #             bias_init=jax.nn.initializers.zeros
-    #         ),
-    #         norm=FilterResponseNorm,
-    #         relu=flax.linen.swish
-    #     )
-    # else:
-    #     raise NotImplementedError
 
     if config.dsc:
         score_func = score_func
@@ -569,7 +566,8 @@ def build_dbn(config):
         mimo_cond=config.mimo_cond,
         start_temp=config.start_temp,
         multi_mixup=False,
-        continuous=config.dsb_continuous
+        continuous=config.dsb_continuous,
+        centering=config.centering
     )
     return dbn, (dsb_stats, None)
 
@@ -661,6 +659,34 @@ def dsb_sample_cont(score, rng, x0, y0=None, config=None, dsb_stats=None, z_dsb_
 
 def launch(config, print_fn):
     rng = jax.random.PRNGKey(config.seed)
+
+    # ------------------------------------------------------------------------
+    # load teacher for distillation
+    # ------------------------------------------------------------------------
+    if config.distill:
+        print(f"Loading teacher DBN {config.distill}")
+        teacher_params, teacher_batch_stats, teacher_config = load_teacher(
+            config.distill)
+        teacher_props = [
+            "crt", "ensemble_prediction", "ensemble_exclude_a",
+            "residual_prediction", "dsc", "frn_swish", "input_scaling",
+            "width_multi", "dsb_continuous", "distribution",
+            "beta1", "beta2", "linear_noise", "fat", "joint_depth",
+            "kld_temp", "forget", "mimo_cond", "start_temp", "n_feat",
+            "version", "droprate", "feature_name"
+        ]
+        for k in teacher_props:
+            if teacher_config.get(k) is None:
+                continue
+            setattr(config, k, teacher_config[k])
+        config.T = 1
+        config.optim_ne = 50
+        config.optim_lr = 0.1*teacher_config["optim_lr"]
+        teacher_dsb_stats = dsb_schedules(
+            teacher_config["beta1"], teacher_config["beta2"],
+            teacher_config["T"], teacher_config["linear_noise"]
+        )
+
     model_dtype = jnp.float32
     config.dtype = model_dtype
     config.image_stats = dict(
@@ -711,16 +737,19 @@ def launch(config, print_fn):
     _, h, w, d = dataloaders["image_shape"]
     x_dim = (h, w, d)
     config.x_dim = x_dim
-    print("Calculating statistics of feature z...")
-    (
-        (lmean, lstd, lmax, lmin, ldim),
-        (zmean, zstd, zmax, zmin, zdim)
-    ) = get_stats(
-        config, dataloaders, resnet, resnet_param_list[0])
-    print(
-        f"l mean {lmean:.3f} std {lstd:.3f} max {lmax:.3f} min {lmin:.3f} dim {ldim}")
-    print(
-        f"z mean {zmean:.3f} std {zstd:.3f} max {zmax:.3f} min {zmin:.3f} dim {zdim}")
+    if "TinyImageNet" in config.data_name:
+        zdim = (64, 64, 64)
+    else:
+        print("Calculating statistics of feature z...")
+        (
+            (lmean, lstd, lmax, lmin, ldim),
+            (zmean, zstd, zmax, zmin, zdim)
+        ) = get_stats(
+            config, dataloaders, resnet, resnet_param_list[0])
+        print(
+            f"l mean {lmean:.3f} std {lstd:.3f} max {lmax:.3f} min {lmin:.3f} dim {ldim}")
+        print(
+            f"z mean {zmean:.3f} std {zstd:.3f} max {zmax:.3f} min {zmin:.3f} dim {zdim}")
     config.z_dim = zdim
     score_input_dim = get_score_input_dim(config)
     config.score_input_dim = score_input_dim
@@ -768,14 +797,25 @@ def launch(config, print_fn):
             _variables, resnet_param_list)
         del _variables
 
+    if config.distill:
+        variables = variables.unfreeze()
+        variables["params"] = teacher_params
+        if variables.get("batch_stats") is not None:
+            variables["batch_stats"] = teacher_batch_stats
+        variables = freeze(variables)
+
     # ------------------------------------------------------------------------
     # define optimizers
     # ------------------------------------------------------------------------
+    if config.decay_steps is None:
+        decay_steps = config.optim_ne
+    else:
+        decay_steps = config.decay_steps
     scheduler = optax.warmup_cosine_decay_schedule(
         init_value=config.warmup_factor*config.optim_lr,
         peak_value=config.optim_lr,
         warmup_steps=config.warmup_steps,
-        decay_steps=config.optim_ne * config.trn_steps_per_epoch)
+        decay_steps=decay_steps * config.trn_steps_per_epoch)
     heavi_scheduler = [
         optax.constant_schedule(0), optax.constant_schedule(1)]
     refer_boundaries = [config.start_cls*config.trn_steps_per_epoch]
@@ -912,7 +952,7 @@ def launch(config, print_fn):
     # define step collecting features and logits
     # ------------------------------------------------------------------------
     @partial(jax.pmap, axis_name="batch")
-    def step_label(batch):
+    def step_label(state, batch):
         z0_list = []
         logitsA = []
         zB, logitsB = forward_resnet(resnet_param_list[0], batch["images"])
@@ -941,6 +981,27 @@ def launch(config, print_fn):
         batch["zA"] = zA
         batch["logitsB"] = logitsB
         batch["logitsA"] = logitsA
+        if config.distill:
+            drop_rng, score_rng = jax.random.split(state.rng)
+            params_dict = pdict(
+                params=teacher_params,
+                image_stats=config.image_stats,
+                batch_stats=teacher_batch_stats
+            )
+            rngs_dict = dict(dropout=drop_rng)
+            model_bd = dbn.bind(params_dict, rngs=rngs_dict)
+            teacher_steps = teacher_config["T"]
+            _dsb_sample = partial(
+                dsb_sample,
+                config=EasyDict(teacher_config),
+                dsb_stats=teacher_dsb_stats,
+                z_dsb_stats=None,
+                steps=teacher_steps)
+            logitsC, _ = model_bd.sample(
+                score_rng, _dsb_sample, batch["images"])
+            logitsC = rearrange(
+                logitsC, "n (t b) z -> t b (n z)", t=teacher_steps+1)
+            batch["logitsC"] = logitsC[-1]
         return batch
 
     # ------------------------------------------------------------------------
@@ -1020,8 +1081,21 @@ def launch(config, print_fn):
         ), logits0eps = output[0] if train else output
 
         _sigma_t = expand_to_broadcast(sigma_t, l_t, axis=1)
+        jprint("l_t", jnp.any(jnp.isinf(l_t)), jnp.any(jnp.isnan(l_t)))
         diff = (l_t-_logitsA) / _sigma_t
         score_loss = mse_loss(epsilon, diff)
+        jprint("score_loss", jnp.any(jnp.isinf(score_loss)),
+               jnp.any(jnp.isnan(score_loss)))
+        if batch.get("logitsC") is not None:
+            logitsC = batch["logitsC"]
+            jprint("logitsC", jnp.any(jnp.isinf(logitsC)),
+                   jnp.any(jnp.isnan(logitsC)))
+            a = config.distill_alpha
+            score_loss = (
+                a*mse_loss(epsilon, (l_t-logitsC)/_sigma_t) + (1-a)*score_loss
+            )
+            jprint("score_loss distill", jnp.any(jnp.isinf(score_loss)),
+                   jnp.any(jnp.isnan(score_loss)))
         if config.prob_loss:
             pA = jnp.concatenate([jax.nn.softmax(l, axis=-1)
                                  for l in logitsA], axis=-1)
@@ -1435,7 +1509,7 @@ def launch(config, print_fn):
                 batch = step_mixup(state, batch)
             if config.distribution == 2:
                 state = step_mode(state)
-            batch = step_label(batch)
+            batch = step_label(state, batch)
             state, metrics = step_train(state, batch)
             if epoch_idx == 0:
                 acc_ref_metrics = step_acc_ref(state, batch)
@@ -1464,7 +1538,7 @@ def launch(config, print_fn):
             state = state.replace(rng=jax_utils.replicate(batch_rng))
             if config.distribution == 2:
                 state = step_modeA(state)
-            batch = step_label(batch)
+            batch = step_label(state, batch)
             metrics = step_valid(state, batch)
             if epoch_idx == 0:
                 acc_ref_metrics = step_acc_ref(state, batch)
@@ -1495,7 +1569,7 @@ def launch(config, print_fn):
                 state = state.replace(rng=jax_utils.replicate(batch_rng))
                 if config.distribution == 2:
                     state = step_modeA(state)
-                batch = step_label(batch)
+                batch = step_label(state, batch)
                 metrics = step_valid(state, batch)
                 if best_acc == -float("inf"):
                     acc_ref_metrics = step_acc_ref(state, batch)
@@ -1510,7 +1584,7 @@ def launch(config, print_fn):
             best_acc = criteria
             if config.save:
                 assert not config.nowandb
-                save_path = os.path.join(config.save, wandb.run.name)
+                save_path = config.save
                 save_state = jax_utils.unreplicate(state)
                 if getattr(config, "dtype", None) is not None:
                     config.dtype = str(config.dtype)
@@ -1562,6 +1636,7 @@ def main():
                         help='base learning rate (default: 1e-4)')
     parser.add_argument('--warmup_factor', default=0.01, type=float)
     parser.add_argument('--warmup_steps', default=0, type=int)
+    parser.add_argument('--decay_steps', default=None, type=int)
     parser.add_argument('--optim_momentum', default=0.9, type=float,
                         help='momentum coefficient (default: 0.9)')
     parser.add_argument('--optim_weight_decay', default=0.1, type=float,
@@ -1617,6 +1692,8 @@ def main():
     parser.add_argument("--dsb_continuous", action="store_true")
     # distribution type; 0: 1to1, 1: mixup, 2: mode, 3: annealing
     parser.add_argument("--distribution", default=0, type=int)
+    # logit centering for logitsB
+    parser.add_argument("--centering", action="store_true")
     # ---------------------------------------------------------------------------------------
     # diffusion
     # ---------------------------------------------------------------------------------------
@@ -1635,6 +1712,9 @@ def main():
     parser.add_argument("--ce_loss", default=0, type=float)
     parser.add_argument("--mimo_cond", action="store_true")
     parser.add_argument("--start_temp", default=1, type=float)
+    # Progressive Distillation
+    parser.add_argument("--distill", default=None, type=str)
+    parser.add_argument("--distill_alpha", default=1, type=float)
     # ---------------------------------------------------------------------------------------
     # networks
     # ---------------------------------------------------------------------------------------
@@ -1708,11 +1788,11 @@ def main():
 
 
 if __name__ == '__main__':
-    # import traceback
-    # with open("error.log", "w") as log:
-    #     try:
-    #         main()
-    #     except Exception:
-    #         print("ERROR OCCURED! Check it out in error.log.")
-    #         traceback.print_exc(file=log)
-    main()
+    import traceback
+    with open("error.log", "w") as log:
+        try:
+            main()
+        except Exception:
+            print("ERROR OCCURED! Check it out in error.log.")
+            traceback.print_exc(file=log)
+    # main()

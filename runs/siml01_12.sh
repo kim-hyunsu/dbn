@@ -1,19 +1,5 @@
 echo 0
-python dsb_renewal_fat.py \
-    --config config_dsb/c10_frnrelu_AtoshABCnew.yaml \
-    --feature_name feature.layer2stride1 \
-    --tag AtoABC \
-    --fat 1 \
-    --optim_bs 128 \
-    --joint 2 \
-    --T 5 \
-    --joint_depth 6 \
-    --version v1.1.4 \
-    --forget 5 \
-    --beta1 0.0001 \
-    --beta2 0.0001 \
-    --linear_noise \
-    --mixup_alpha 0.4 \
-    --start_temp 2 \
-    --ensemble_prediction 4 --nowandb
+taskset -c 16-31 python dbn.py \
+    --config config_dsb/c10_frnrelu_AtoABC_ensemble.yaml \
+    --save ./checkpoints/dbn/c10/t235/230925/v117/0
 echo 1

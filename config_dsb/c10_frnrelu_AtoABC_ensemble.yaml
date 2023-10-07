@@ -11,7 +11,7 @@ beta: 0.5
 beta2: 0.0001
 droprate: 0
 ema_decay: 0.99995
-version: v1.1.7
+version: v1.1.8
 T: 5
 n_feat: 128
 tag: AtoABC
@@ -30,3 +30,4 @@ dsc: True
 input_scaling: 3
 joint_depth: 6
 width_multi: 1
+centering: False

@@ -1,0 +1,7 @@
+method: dbn-plot
+ensemble: 3
+checkpoint: ./checkpoints/dbn/c10/t21113/230927/v118/1
+checkpoints: 
+  - ./checkpoints/frn_sd2_be
+  - ./checkpoints/frn_sd11_be
+  - ./checkpoints/frn_sd13_be

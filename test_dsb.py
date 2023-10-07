@@ -1,6 +1,8 @@
-from random import choice
+from builtins import getattr, isinstance
 from collections import OrderedDict
+from sklearn.metrics import r2_score
 import argparse
+from re import I
 import jax
 import jaxlib
 import jax.numpy as jnp
@@ -11,55 +13,16 @@ import optax
 from functools import partial
 import flax
 from flax import jax_utils
-from flax.training import checkpoints, common_utils
+from flax.training import common_utils
 from tqdm import tqdm
 from tabulate import tabulate
+from cls_plot import dbn_plot
 from data.build import build_dataloaders
 import sys
 from dbn import build_dbn, pdict, dsb_sample, get_resnet
 from einops import rearrange
-from easydict import EasyDict
 from giung2.metrics import evaluate_acc, evaluate_nll
-import defaults_sgd
-
-
-def get_config(ckpt_config):
-    for k, v in ckpt_config.items():
-        if isinstance(v, dict) and v.get("0") is not None:
-            l = []
-            for k1, v1 in v.items():
-                l.append(v1)
-            ckpt_config[k] = tuple(l)
-    config = EasyDict(ckpt_config)
-    model_dtype = getattr(config, "dtype", None) or "float32"
-    if "float32" in model_dtype:
-        config.dtype = jnp.float32
-    elif "float16" in model_dtype:
-        config.dtype = jnp.float16
-    else:
-        raise NotImplementedError
-    if getattr(config, "num_classes", None) is None:
-        if config.data_name == "CIFAR10_x32":
-            config.num_classes = 10
-        elif config.data_name == "CIFAR100_x32":
-            config.num_classes = 100
-        elif config.data_name == "TinyImageNet200_x64":
-            config.num_classes = 200
-    if getattr(config, "image_stats", None) is None:
-        config.image_stats = dict(
-            m=jnp.array(defaults_sgd.PIXEL_MEAN),
-            s=jnp.array(defaults_sgd.PIXEL_STD))
-    if getattr(config, "model_planes", None) is None:
-        if config.data_name == "CIFAR10_x32" and config.model_style == "FRN-Swish":
-            config.model_planes = 16
-            config.model_blocks = None
-        elif config.data_name == "CIFAR100_x32" and config.model_style == "FRN-Swish":
-            config.model_planes = 16
-            config.model_blocks = None
-        elif config.data_name == "TinyImageNet200_x64" and config.model_style == "FRN-Swish":
-            config.model_planes = 64
-            config.model_blocks = "3,4,6,3"
-    return config
+from utils import load_ckpt, jprint
 
 
 def launch(args):
@@ -67,29 +30,28 @@ def launch(args):
     # ------------------------------------------------------------------------------------------------------------
     # load checkpoint and configuration
     # ------------------------------------------------------------------------------------------------------------
-
-    def load_ckpt(dirname):
-        ckpt = checkpoints.restore_checkpoint(
-            ckpt_dir=dirname,
-            target=None
-        )
-        if ckpt.get("model") is not None:
-            if ckpt.get("Dense_0") is not None:
-                params = ckpt["model"]
-                batch_stats = dict()
-            else:
-                params = ckpt["model"]["params"]
-                batch_stats = ckpt["model"]["batch_stats"]
-        else:
-            params = ckpt["params"]
-            batch_stats = ckpt["batch_stats"]
-        config = get_config(ckpt["config"])
-        return params, batch_stats, config
-    if getattr(args, "checkpoints", None) is not None:
+    rn_config = None
+    if "plot" in args.method:
         checkpoint_list = args.checkpoints
+        params, batch_stats, config = load_ckpt(args.checkpoint)
+        _, _, rn_config = load_ckpt(checkpoint_list[0])
     else:
-        checkpoint_list = [args.checkpoint]
-    params, batch_stats, config = load_ckpt(checkpoint_list[0])
+        if getattr(args, "checkpoints", None) is not None:
+            checkpoint_list = args.checkpoints
+        else:
+            checkpoint_list = [args.checkpoint]
+        if isinstance(checkpoint_list, dict):
+            print("Nested Checkpoints")
+            params, batch_stats, config = load_ckpt(
+                list(checkpoint_list.values())[0][0])
+        else:
+            print("List Checkpoints")
+            params, batch_stats, config = load_ckpt(checkpoint_list[0])
+    print(checkpoint_list)
+    if "r2" in args.method:
+        _, _, rn_config = load_ckpt(args.target_checkpoints[0])
+    if rn_config is None:
+        rn_config = config
 
     # ------------------------------------------------------------------------------------------------------------
     # define model
@@ -100,11 +62,20 @@ def launch(args):
     elif args.method in ["naive_ed", "proxy_end2", "de"]:
         print("Building ResNet...")
         resnet = get_resnet(config, head=True)()
+    elif args.method == "dbn-plot" or args.method == "dbn-r2":
+        print("Building DBN and ResNet...")
+        dbn, (dsb_stats, z_dsb_stats) = build_dbn(config)
+        resnet = get_resnet(rn_config, head=True)()
 
     # ------------------------------------------------------------------------------------------------------------
     # load dataset
     # ------------------------------------------------------------------------------------------------------------
     dataloaders = build_dataloaders(config)
+    if getattr(args, "mean", None) is None:
+        args.mean = jnp.zeros((dataloaders["num_classes"],))
+    else:
+        assert len(args.mean) == dataloaders["num_classes"]
+        args.mean = jnp.array(args.mean)
 
     # ------------------------------------------------------------------------------------------------------------
     # define metrics
@@ -251,12 +222,9 @@ def launch(args):
 
     @jax.jit
     def test_ens_dbn(state, batch):
-        sum_probs = 0
+        sum_probs = []
         for m in range(args.ensemble):
-            if config.medium:
-                steps = (config.T+1)//2
-            else:
-                steps = config.T
+            steps = config.T
             drop_rng, score_rng = jax.random.split(state["rng"])
             params_dict = pdict(
                 params=state["params"][m],
@@ -270,17 +238,21 @@ def launch(args):
             logitsC, logitsB = model_bd.sample(
                 score_rng, _dsb_sample, batch["images"])
             logitsC = rearrange(logitsC, "n (t b) z -> t n b z", t=steps+1)
-            if config.medium:
-                last2 = jax.nn.log_softmax(logitsC[-2:], axis=-1)
-                last2 = jax.scipy.special.logsumexp(last2, axis=0) - np.log(2)
-                logitsC = last2 - last2.mean(-1, keepdims=True)
-            else:
-                logitsC = logitsC[-1]
+            logitsC = logitsC[-1]
             logprobsC = jax.nn.log_softmax(logitsC, axis=-1)
             probsC = jnp.exp(logprobsC)
             ens_probsC = jnp.mean(probsC, axis=0)
-            sum_probs += ens_probsC
-        return sum_probs/args.ensemble
+            sum_probs.append(ens_probsC)
+            probsB = jax.nn.softmax(logitsB, axis=-1)
+        A = sum(sum_probs) / len(sum_probs)
+        # J = args.ensemble
+        # A = 3*J/(2J+1)*A
+        # B = (args.ensemble-1)*probsB/(3*args.ensemble)
+        # C = 3*args.ensemble/(2*args.ensemble+1)
+        # v = A-B
+        # out = jnp.where(v == 0, 1e-8, v) * C
+        out = A
+        return out
 
     @jax.jit
     def test_naive_ed(state, batch):
@@ -309,7 +281,7 @@ def launch(args):
             params_dict = dict(params=state["params"][m])
             mutable = ["intermediates"]
             if getattr(config, "image_stats", None) is not None:
-                params_dict["image_stats"] = config.image_stats
+                params_dict["image_stats"] = rn_config.image_stats
             if getattr(config, "batch_stats", None) is not None:
                 params_dict["batch_stats"] = state["batch_stats"][m]
                 mutable.append("batch_stats")
@@ -327,14 +299,37 @@ def launch(args):
 
     @partial(jax.pmap, axis_name="batch")
     def step_test(state, batch):
+        def R2score(y, y_hat):
+            # y: (B, d)
+            y_bar = args.mean[None, :]
+            SSE = (y_hat-y_bar)**2
+            SST = (y-y_bar)**2
+            return SSE, SST
 
-        if args.method == "dbn":
-            ens_probsC = test_dbn(state, batch)
+        if args.method in ["dbn", "dbn-r2"]:
+            ens_probsC = test_ens_dbn(state, batch)
         elif args.method in ["naive_ed", "proxy_end2"]:
             ens_probsC = test_naive_ed(state, batch)
         elif args.method == "de":
             ens_probsC = test_de(state, batch)
 
+        if "r2" in args.method:
+            marker = batch["marker"]
+            count = jnp.sum(marker)
+            SSE, SST = R2score(ens_probsC, batch["target"])
+            SSE = jnp.sum(jnp.where(marker[:, None], SSE, 0), axis=0)
+            SST = jnp.sum(jnp.where(marker[:, None], SST, 0), axis=0)
+
+            Mean = jnp.sum(jnp.where(marker[:, None], ens_probsC, 0), axis=0)
+
+            metrics = OrderedDict({
+                "SSE": SSE,
+                "SST": SST,
+                "count": count,
+                "mean": Mean
+            })
+            metrics = jax.lax.psum(metrics, axis_name="batch")
+            return metrics
         labels = batch["labels"]
         acc = evaluate_acc(
             ens_probsC, labels, log_input=False, reduction="none")
@@ -346,9 +341,9 @@ def launch(args):
         acc = reduce_sum(acc, marker)
         nll = reduce_sum(nll, marker)
         bs = reduce_sum(bs, marker)
-
         ece = evaluate_ece(
             ens_probsC, labels, marker, log_input=False, reduction="none")
+
         count = jnp.sum(marker)
 
         metrics = OrderedDict({
@@ -361,9 +356,34 @@ def launch(args):
         metrics = jax.lax.psum(metrics, axis_name="batch")
         return metrics
 
+    @partial(jax.pmap, axis_name="batch")
+    def get_target(state, batch):
+        ens_probsC = test_de(state, batch)
+        batch["target"] = ens_probsC
+        return batch
+
+    @partial(jax.pmap, axis_name="batch")
+    def get_sample(state, batch):
+        steps = config.T
+        drop_rng, score_rng = jax.random.split(state["rng"])
+        params_dict = pdict(
+            params=state["params"],
+            image_stats=config.image_stats,
+            batch_stats=state["batch_stats"],
+        )
+        rngs_dict = dict(dropout=drop_rng)
+        model_bd = dbn.bind(params_dict, rngs=rngs_dict)
+        _dsb_sample = partial(
+            dsb_sample, config=config, dsb_stats=dsb_stats, z_dsb_stats=z_dsb_stats, steps=steps)
+        logitsC, logitsB = model_bd.sample(
+            score_rng, _dsb_sample, batch["images"])
+        logitsC = rearrange(logitsC, "n (t b) z -> (n b) t z", t=steps+1)
+        probsC = jax.nn.softmax(logitsC, axis=-1)
+        return probsC
     # ------------------------------------------------------------------------------------------------------------
     # test model
     # ------------------------------------------------------------------------------------------------------------
+
     def eval(params, batch_stats, checkpoint_list):
         total_metrics = dict()
         state = dict(
@@ -409,6 +429,13 @@ def launch(args):
             print("-------")
             print(f"{float(arr.mean()):.5f}")
             print(f"{float(arr.std()):.5f}")
+        arr = []
+        for v in total_metrics.values():
+            arr.append(v)
+        arr = jnp.array(arr)
+        arr = rearrange(arr, "m v -> v m")
+        for a in arr:
+            print(" ".join([f"{ele:.5f}" for ele in a]))
 
     def eval_de(checkpoint_list):
         total_metrics = dict()
@@ -452,19 +479,198 @@ def launch(args):
                     total_metrics[k] = [v]
                 else:
                     total_metrics[k].append(v)
+        for comb in comb_list:
+            print(",".join(comb))
         for k, v in total_metrics.items():
             print(
                 f"--------------------{k}--------------------")
             for c, ele in enumerate(v):
-                print(f"{ele:.5f} {','.join(comb_list[c])}")
+                print(f"{ele:.5f}")
             arr = jnp.stack(v)
             print("-------")
             print(f"{float(arr.mean()):.5f}")
             print(f"{float(arr.std()):.5f}")
+        arr = []
+        for v in total_metrics.values():
+            arr.append(v)
+        arr = jnp.array(arr)
+        arr = rearrange(arr, "m v -> v m")
+        for a in arr:
+            print(" ".join([f"{ele:.5f}" for ele in a]))
 
-    if args.method == "de":
+    def eval_dbn(checkpoint_list):
+        # checkpoint_list is dictionary {"t235": ["1","2","3"], "t279": ["1","2","3"]}
+        total_metrics = dict()
+        comb_list = []
+        N = len(list(checkpoint_list.values())[0])
+        for idx in range(N):
+            sub_rng = jax.random.fold_in(rng, idx)
+            comb = [idx for _ in range(args.ensemble)]
+            if "r2" in args.method:
+                params_list = []
+                stats_list = []
+                for m in range(len(args.target_checkpoints)):
+                    params, batch_stats, _ = load_ckpt(
+                        args.target_checkpoints[m])
+                    params_list.append(params)
+                    stats_list.append(batch_stats)
+                target_state = dict(
+                    params=jax_utils.replicate(params_list),
+                    batch_stats=jax_utils.replicate(stats_list)
+                )
+            params_list = []
+            stats_list = []
+            dir_list = []
+            for m, ckpt_list in enumerate(checkpoint_list.values()):
+                if m == args.ensemble:
+                    break
+                params, batch_stats, _ = load_ckpt(ckpt_list[comb[m]])
+                params_list.append(params)
+                stats_list.append(batch_stats)
+                dir_list.append(ckpt_list[comb[m]].split("/")[-1])
+            comb_list.append(dir_list)
+            state = dict(
+                params=jax_utils.replicate(params_list),
+                batch_stats=jax_utils.replicate(stats_list)
+            )
+            test_loader = dataloaders["tst_loader"](rng=None)
+            test_loader = jax_utils.prefetch_to_device(test_loader, size=2)
+            test_metrics = []
+            for batch_idx, batch in enumerate(tqdm(test_loader)):
+                batch_rng = jax.random.fold_in(sub_rng, batch_idx)
+                state["rng"] = jax_utils.replicate(batch_rng)
+                if "r2" in args.method:
+                    batch = get_target(target_state, batch)
+                metrics = step_test(state, batch)
+                test_metrics.append(metrics)
+            del state
+            test_metrics = common_utils.get_metrics(test_metrics)
+            test_metrics = jax.tree_util.tree_map(
+                lambda e: e.sum(0), test_metrics)
+            for k, v in test_metrics.items():
+                if "count" in k:
+                    continue
+                test_metrics[k] /= test_metrics["count"]
+            del test_metrics["count"]
+            for k, v in test_metrics.items():
+                if total_metrics.get(k) is None:
+                    total_metrics[k] = [v]
+                else:
+                    total_metrics[k].append(v)
+        for comb in comb_list:
+            print(",".join(comb))
+        ignore = False
+        for k, v in total_metrics.items():
+            print(
+                f"--------------------{k}--------------------")
+            for c, ele in enumerate(v):
+                if isinstance(ele, jnp.float64):
+                    print(f"{ele:.5f}")
+                else:
+                    print(ele)
+                    ignore = True
+            arr = jnp.stack(v)
+            print("-------")
+            print(f"{float(arr.mean()):.5f}")
+            print(f"{float(arr.std()):.5f}")
+        print("R2", (total_metrics["SSE"][0]/total_metrics["SST"][0]).mean())
+        if not ignore:
+            arr = []
+            for v in total_metrics.values():
+                arr.append(v)
+            arr = jnp.array(arr)
+            arr = rearrange(arr, "m v -> v m")
+            for a in arr:
+                print(" ".join([f"{ele:.5f}" for ele in a]))
+
+    def plot_dbn(checkpoint_list):
+        def compare_sample(obj, new_obj):
+            old_probs = obj["probs"]
+            old_labels = obj["labels"]
+            old_images = obj["images"]
+            old_scores = obj["scores"]
+            new_probs = rearrange(new_obj["probs"], "p b t d -> (p b) t d")
+            new_labels = rearrange(new_obj["labels"], "p b -> (p b)")
+            new_images = rearrange(
+                new_obj["images"], "p b h w d -> (p b) h w d")
+            new_score = 0
+            new_score += ((new_probs[:, -1]-new_probs[:, -2])**2).sum(-1)
+            new_score += ((new_probs[:, 0]-new_probs[:, 1])**2).sum(-1)
+            new_score += -jnp.std(new_probs[:, 0], axis=-1)
+            new_score += -jnp.std(new_probs[:, -1], axis=-1)
+            new_score += -((new_probs[:, 0]-new_probs[:, -1])**2).sum(-1)
+            new_score_idx = jnp.argmin(new_score)
+            if jnp.any(old_scores[0] > new_score[new_score_idx]):
+                obj["probs"][0] = new_probs[new_score_idx, ...]
+                obj["labels"][0] = new_labels[new_score_idx]
+                obj["images"][0] = new_images[new_score_idx, ...]
+                obj["scores"][0] = new_score[new_score_idx]
+            elif jnp.any(old_scores[1] > new_score[new_score_idx]):
+                obj["probs"][1] = new_probs[new_score_idx, ...]
+                obj["labels"][1] = new_labels[new_score_idx]
+                obj["images"][1] = new_images[new_score_idx, ...]
+                obj["scores"][1] = new_score[new_score_idx]
+            return obj
+
+        idx = 0
+        sub_rng = jax.random.fold_in(rng, idx)
+        comb = jax.random.choice(sub_rng, len(
+            checkpoint_list), shape=(args.ensemble,), replace=False)
+        params_list = []
+        stats_list = []
+        dir_list = []
+        # ensemble target
+        for m in range(args.ensemble):
+            params, batch_stats, _ = load_ckpt(checkpoint_list[comb[m]])
+            params_list.append(params)
+            stats_list.append(batch_stats)
+            dir_list.append(checkpoint_list[comb[m]].split("/")[-1])
+        state = dict(
+            params=jax_utils.replicate(params_list),
+            batch_stats=jax_utils.replicate(stats_list)
+        )
+        # DBN
+        params, batch_stats, _ = load_ckpt(args.checkpoint)
+        dbn_state = dict(
+            params=jax_utils.replicate(params),
+            batch_stats=jax_utils.replicate(batch_stats)
+        )
+        test_loader = dataloaders["tst_loader"](rng=None)
+        test_loader = jax_utils.prefetch_to_device(test_loader, size=2)
+        obj = dict(
+            probs=[None]*2,
+            labels=[None]*2,
+            images=[None]*2,
+            scores=[float("inf")]*2
+        )
+        for batch_idx, batch in enumerate(tqdm(test_loader)):
+            batch_rng = jax.random.fold_in(sub_rng, batch_idx)
+            dbn_state["rng"] = jax_utils.replicate(batch_rng)
+            state["rng"] = jax_utils.replicate(batch_rng)
+            target_probs = jax.pmap(test_de)(state, batch)
+            probs = get_sample(dbn_state, batch)
+            # target probs (p, b, d)
+            assert len(target_probs.shape) == 3
+            # new obj probs (p, b, t, d)
+            assert len(probs.shape) == 4
+            probs = jnp.concatenate(
+                [probs, target_probs[:, :, None, :]], axis=2)
+            new_obj = dict(
+                probs=probs,
+                labels=batch["labels"],
+                images=batch["images"]
+            )
+            obj = compare_sample(obj, new_obj)
+        dbn_plot(
+            probs=obj["probs"], labels=obj["labels"], images=obj["images"])
+
+    if args.method in ["de"]:
         eval_de(checkpoint_list)
-    else:
+    elif args.method in ["dbn", "dbn-r2"]:
+        eval_dbn(checkpoint_list)
+    elif args.method == "dbn-plot":
+        plot_dbn(checkpoint_list)
+    elif args.method in ["naive_ed", "proxy_end2"]:
         eval(params, batch_stats, checkpoint_list)
 
 
@@ -478,7 +684,7 @@ def main():
         with open(args.config, "r") as f:
             arg_defaults = yaml.safe_load(f)
     parser.add_argument("--checkpoint", default=None, type=str)
-    parser.add_argument("--seed", default=2023, type=int)
+    parser.add_argument("--seed", default=1242300, type=int)
     parser.add_argument("--method", default="dbn", type=str)
     if args.config is not None:
         parser.set_defaults(**arg_defaults)

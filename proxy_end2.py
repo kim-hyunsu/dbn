@@ -58,8 +58,9 @@ def launch(config, print_fn):
             pixel_std=defaults.PIXEL_STD,
             num_classes=dataloaders['num_classes'],
             num_planes=config.model_planes,
-            num_blocks=((int(b) for b in config.model_blocks.split(
-                ",")) if config.model_blocks is not None else None)
+            num_blocks=tuple(
+                int(b) for b in config.model_blocks.split(",")
+            ) if config.model_blocks is not None else None
         )
         _base = partial(
             FlaxResNetBase,
@@ -316,7 +317,7 @@ def launch(config, print_fn):
     @partial(jax.pmap, axis_name="batch")
     def step_val(state, batch):
         _, (metrics, _) = loss_func(state.params, state, batch)
-        metrics = jax.lax.pmean(metrics, axis_name='batch')
+        metrics = jax.lax.psum(metrics, axis_name='batch')
         return metrics
 
     cross_replica_mean = jax.pmap(lambda x: jax.lax.pmean(x, 'x'), 'x')

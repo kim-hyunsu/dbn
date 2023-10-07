@@ -1735,6 +1735,10 @@ class ClsUnet(nn.Module):
             return self._v1_1_7(p, x, t, **kwargs)
         elif self.version == "v1.1.8":
             return self._v1_1_8(p, x, t, **kwargs)
+        elif self.version == "v1.1.9":
+            return self._v1_1_9(p, x, t, **kwargs)
+        elif self.version == "v1.1.10":
+            return self._v1_1_10(p, x, t, **kwargs)
         else:
             raise NotImplementedError
 
@@ -2221,6 +2225,113 @@ class ClsUnet(nn.Module):
         p = self.fc(features=self.p_dim*self.num_input)(p)
         return p
 
+    def _v1_1_9(self, p, x, t, **kwargs):
+        cfgs = [
+            # t, c, n, s
+            [1,  64, 1, 1],
+            [4,  96, 2, 2],
+            [4,  128, 3, 2],
+            [4,  192, 4, 1],
+            [4,  256, 3, 2],
+        ]
+        norm_kwargs = to_norm_kwargs(self.norm, kwargs)
+        in_c = _divisible(x.shape[-1], 8)
+
+        t_dim = in_c//4  # 32
+        t = timestep_embedding(t, t_dim)
+        t = self.fc(features=in_c//2)(t)
+        t = self.silu(t)
+        p = self.fc(features=in_c//2)(p)
+        p = self.silu(p)
+
+        _t = jnp.concatenate([p, t], axis=-1)
+        _x = x
+        x = self.conv(
+            features=in_c,
+            kernel_size=(3, 3),
+            strides=(1, 1),
+            padding="SAME"
+        )(x)
+        # print(f"{x.shape[1]*x.shape[2]*3**2*_x.shape[-1]*x.shape[-1]}")
+        x = self.norm(**norm_kwargs)(x)
+        x = self.relu6(x)
+        for e, c, n, s in cfgs:
+            out_c = _divisible(c*self.width_multi, 2)
+            _t = self.fc(features=in_c)(t)
+            _t = _t[:, None, None, :]
+            for i in range(n):
+                if i == 0:
+                    x += _t
+                x = InvertedResidual(
+                    in_ch=in_c,
+                    ch=out_c,
+                    st=s if i == 0 else 1,
+                    expand=e
+                )(x, **kwargs)
+                in_c = out_c
+        out_c = _divisible(c*self.width_multi, 2)
+        _x = x
+        x = Conv1x1(ch=out_c)(x, **kwargs)
+        # print(f"{x.shape[1]*x.shape[2]*_x.shape[-1]*x.shape[-1]}")
+        p = jnp.mean(x, axis=(1, 2))
+        p = self.fc(features=self.p_dim*self.num_input)(p)
+        return p
+
+    def _v1_1_10(self, p, x, t, **kwargs):
+        cfgs = [
+            # t, c, n, s
+            [1,  64, 1, 1],
+            [4,  96, 2, 2],
+            [4,  128, 3, 2],
+            [4,  192, 4, 1],
+            [4,  256, 3, 2],
+        ]
+        norm_kwargs = to_norm_kwargs(self.norm, kwargs)
+        in_c = _divisible(x.shape[-1], 8)
+
+        t_dim = in_c//4  # 32
+        t = timestep_embedding(t, t_dim)
+        t = self.fc(features=in_c//2)(t)
+        t = self.silu(t)
+
+        p = LogitEncoder()(p)
+        p = p[:, None, None, :]
+        p = jnp.tile(p, reps=[1, x.shape[1], x.shape[2], 1])
+
+        _x = x
+        x = self.conv(
+            features=in_c,
+            kernel_size=(3, 3),
+            strides=(1, 1),
+            padding="SAME"
+        )(x)
+        # print(f"{x.shape[1]*x.shape[2]*3**2*_x.shape[-1]*x.shape[-1]}")
+        x = self.norm(**norm_kwargs)(x)
+        x = self.relu6(x)
+        x = jnp.concatenate([x, p], axis=-1)
+        in_c = x.shape[-1]
+        for e, c, n, s in cfgs:
+            out_c = _divisible(c*self.width_multi, 2)
+            _t = self.fc(features=in_c)(t)
+            _t = _t[:, None, None, :]
+            for i in range(n):
+                if i == 0:
+                    x += _t
+                x = InvertedResidual(
+                    in_ch=in_c,
+                    ch=out_c,
+                    st=s if i == 0 else 1,
+                    expand=e
+                )(x, **kwargs)
+                in_c = out_c
+        out_c = _divisible(c*self.width_multi, 2)
+        _x = x
+        x = Conv1x1(ch=out_c)(x, **kwargs)
+        # print(f"{x.shape[1]*x.shape[2]*_x.shape[-1]*x.shape[-1]}")
+        p = jnp.mean(x, axis=(1, 2))
+        p = self.fc(features=self.p_dim*self.num_input)(p)
+        return p
+
 
 def _divisible(v, divisor, min_value=None):
     if min_value is None:
@@ -2238,22 +2349,23 @@ class LogitEncoder(nn.Module):
     fc: nn.Module = partial(
         nn.Dense,
         use_bias=True,
-        # kernel_init=jax.nn.initializers.zeros,
+        kernel_init=jax.nn.initializers.zeros,
         bias_init=jax.nn.initializers.zeros
     )
 
     @nn.compact
     def __call__(self, x, **kwargs):
         dim = x.shape[-1]
-        x_l2 = jnp.sqrt((x**2).sum(axis=-1, keepdims=True)) /dim
         x_a = jnp.sum(x, axis=-1, keepdims=True) / dim
-        x_std = jnp.std(x, axis=-1, keepdims=True) 
-        x = jnp.concatenate([x_a, x_l2, x_std], axis=-1)
+        x_std = jnp.std(x, axis=-1, keepdims=True)
+        x_dims = 1 / dim * jnp.ones_like(x_a)
+        x = jnp.concatenate([x_a, x_dims, x_std], axis=-1)
+
         x = self.fc(features=2)(x)
         x = self.relu6(x)
         x = self.fc(features=2)(x)
         x = self.relu6(x)
-        x = self.fc(features=2)(x)
+        x = self.fc(features=1)(x)
         return x
 
 
@@ -2549,7 +2661,7 @@ class DiffusionClassifier(nn.Module):
         return x_t, t, mu_t, sigma_t
 
 
-class DiffusionBridgeNetwork(nn.Module):
+class DiffusionBridgeNetworkDep(nn.Module):
     base_net: nn.Module
     score_net: Sequence[nn.Module]
     cls_net: Sequence[nn.Module]
@@ -2566,6 +2678,7 @@ class DiffusionBridgeNetwork(nn.Module):
     multi_mixup: bool = False
     continuous: bool = False
     rand_temp: bool = False
+    centering: bool = False
 
     def setup(self):
         self.base = self.base_net()
@@ -2607,6 +2720,8 @@ class DiffusionBridgeNetwork(nn.Module):
             logits = jnp.stack([_classify(_cls, _z)
                                for _cls, _z in zip(self.cls, z)])
             logits = rearrange(logits, "n b d -> (n b) d", n=self.fat)
+            if self.centering:
+                logits = logits - logits.mean(-1, keepdims=True)
             return logits
         else:
             multi_mixup = False
@@ -2616,6 +2731,8 @@ class DiffusionBridgeNetwork(nn.Module):
             out = _classify(self.cls, z)
             if multi_mixup:
                 out = rearrange(out, "(m b) d -> m b d", m=self.fat)
+            if self.centering:
+                out = out - out.mean(-1, keepdims=True)
             return out
 
     def corrected_classify(self, z, params_dict=None, **kwargs):
@@ -2649,7 +2766,7 @@ class DiffusionBridgeNetwork(nn.Module):
         l = l[:, 0, 0, :]
         return l, z
 
-    def set_logit(self, rng, l1):
+    def set_logit(self, rng, l1, training=True, **kwargs):
         T = self.start_temp
         if self.forget == 0:
             l1 = l1/T
@@ -2659,7 +2776,10 @@ class DiffusionBridgeNetwork(nn.Module):
             l1 = jax.random.normal(rng, l1.shape)
         elif self.forget == 3:
             l1 = l1/T
-            l1 += jax.random.normal(rng, l1.shape)
+            if training:
+                l1 += jax.random.normal(rng, l1.shape)
+            else:
+                l1
         elif self.forget == 4:
             l1 = jnp.zeros_like(l1)
             label = jnp.arange(self.fat)
@@ -2673,7 +2793,10 @@ class DiffusionBridgeNetwork(nn.Module):
             l1 = mask*l1
         elif self.forget == 6:
             _, temp_rng = jax.random.split(rng)
-            T += 0.4*jax.random.beta(temp_rng, 1,5)
+            if training:
+                T += 0.4*jax.random.beta(temp_rng, 1, 5)
+            else:
+                T += 0.4*(1/6)  # mean of beta distribution
             l1 = l1/T
         return l1
 
@@ -2689,7 +2812,7 @@ class DiffusionBridgeNetwork(nn.Module):
         elif self.fat and len(l1.shape) == 3:
             z1 = rearrange(z1, "m b h w d -> b h w (m d)")
             l1 = rearrange(l1, "m b d -> b (m d)")
-        l1 = self.set_logit(rng, l1)
+        l1 = self.set_logit(rng, l1, **kwargs)
         l_t, t, mu_t, sigma_t, _ = self.forward(rng, l0, l1)
         if self.mimo_cond:
             _l_t = rearrange(l_t, "b (n d) -> n b d", n=self.fat)
@@ -2870,7 +2993,7 @@ class DiffusionBridgeNetwork(nn.Module):
         elif self.fat and len(lB.shape) == 3:
             zB = rearrange(zB, "m b h w d -> b h w (m d)")
             _lB = rearrange(_lB, "m b d -> b (m d)")
-        _lB = self.set_logit(rng, _lB)
+        _lB = self.set_logit(rng, _lB, training=False)
         lC = sampler(
             partial(self.score, training=False), rng, _lB, zB)
         if self.print_inter:
@@ -2908,6 +3031,117 @@ class DiffusionBridgeNetwork(nn.Module):
         z0eps = z_t - _sigma_t*eps
         logits0eps = self.corrected_classify(z0eps, cls_params, **kwargs)
         return (eps, z_t, t, mu_t, sigma_t), logits0eps
+
+
+class DiffusionBridgeNetwork(nn.Module):
+    base_net: nn.Module
+    score_net: Sequence[nn.Module]
+    cls_net: Sequence[nn.Module]
+    crt_net: Sequence[nn.Module]
+    dsb_stats: Any
+    z_dsb_stats: Any
+    fat: int
+    joint: bool
+    forget: int = 0
+    temp: float = 1.
+    start_temp: float = 1.
+    print_inter: bool = False
+    mimo_cond: bool = False
+    multi_mixup: bool = False
+    continuous: bool = False
+    rand_temp: bool = False
+    centering: bool = False
+
+    def setup(self):
+        self.base = self.base_net()
+        self.score = self.score_net()
+        if self.cls_net is not None:
+            self.cls = self.cls_net()
+        if self.crt_net is not None:
+            self.crt = self.crt_net()
+
+    def encode(self, x, params_dict=None, **kwargs):
+        # x: BxHxWxC
+        if params_dict is not None:
+            out = self.base.apply(params_dict, x, **kwargs)
+        out = self.base(x, **kwargs)
+        return out
+
+    def correct(self, z, **kwargs):
+        if self.crt_net is None:
+            return z
+        return self.crt(z)
+
+    def classify(self, z, params_dict=None, **kwargs):
+        def _classify(cls, _z):
+            if params_dict is not None:
+                return cls.apply(params_dict, _z, **kwargs)
+            return cls(_z, **kwargs)
+        out = _classify(self.cls, z)
+        return out
+
+    def __call__(self, *args, **kwargs):
+        return self.conditional_dbn(*args, **kwargs)
+
+    def set_logit(self, rng, l1, training=True, **kwargs):
+        T = self.start_temp
+        _, temp_rng = jax.random.split(rng)
+        if training:
+            T += 0.4*jax.random.beta(temp_rng, 1, 5)
+        else:
+            T += 0.4*(1/6)  # mean of beta distribution
+        l1 = l1/T
+        return l1
+
+    def conditional_dbn(self, rng, l0, x1, base_params=None, cls_params=None, **kwargs):
+        z1 = self.encode(x1, base_params, **kwargs)
+        l1 = self.classify(z1, cls_params, **kwargs)
+        l1 = self.set_logit(rng, l1, **kwargs)
+        l_t, t, mu_t, sigma_t, _ = self.forward(rng, l0, l1)
+        eps = self.score(l_t, z1, t, **kwargs)
+        _sigma_t = expand_to_broadcast(sigma_t, l_t, axis=1)
+        l0eps = l_t - _sigma_t*eps
+        l0eps = l0eps[None, ...]
+        return (eps, l_t, t, mu_t, sigma_t), l0eps
+
+    def forward(self, rng, x0, x1, _ts=None, dsb_stats=None):
+        if dsb_stats is None:
+            dsb_stats = self.dsb_stats
+
+        n_T = dsb_stats["n_T"]
+        _sigma_weight_t = dsb_stats["sigma_weight_t"]
+        _sigma_t = dsb_stats["sigma_t"]
+        _bigsigma_t = dsb_stats["bigsigma_t"]
+
+        t_rng, n_rng = jax.random.split(rng, 2)
+
+        if _ts is None:
+            _ts = jax.random.randint(t_rng, (x0.shape[0],), 1, n_T)  # (B,)
+        sigma_weight_t = _sigma_weight_t[_ts]  # (B,)
+        sigma_weight_t = expand_to_broadcast(sigma_weight_t, x0, axis=1)
+        sigma_t = _sigma_t[_ts]
+        mu_t = (sigma_weight_t*x0+(1-sigma_weight_t)*x1)
+        bigsigma_t = _bigsigma_t[_ts]  # (B,)
+        bigsigma_t = expand_to_broadcast(bigsigma_t, mu_t, axis=1)
+
+        # q(X_t|X_0,X_1) = N(X_t;mu_t,bigsigma_t)
+        noise = jax.random.normal(n_rng, mu_t.shape)  # (B, d)
+        x_t = mu_t + noise*jnp.sqrt(bigsigma_t)
+        t = _ts/n_T
+        return x_t, t, mu_t, sigma_t, _ts
+
+    def sample(self, *args, **kwargs):
+        return self.conditional_sample(*args, **kwargs)
+
+    def conditional_sample(self, rng, sampler, x):
+        zB = self.encode(x, training=False)
+        lB = self.classify(zB, training=False)
+        _lB = lB
+        _lB = self.set_logit(rng, _lB, training=False)
+        lC = sampler(
+            partial(self.score, training=False), rng, _lB, zB)
+        lC = lC[None, ...]
+        return lC, lB
 
 
 class DoubleDSB(nn.Module):

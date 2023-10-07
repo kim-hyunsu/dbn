@@ -1,0 +1,7 @@
+method: naive_ed
+checkpoints:
+  - ./checkpoints/naive_ed/t200/230922/0
+  - ./checkpoints/naive_ed/t200/230922/1
+  - ./checkpoints/naive_ed/t200/230922/2
+  - ./checkpoints/naive_ed/t200/230922/3
+  - ./checkpoints/naive_ed/t200/230922/4

@@ -1,0 +1,11 @@
+method: dbn-r2
+ensemble: 1
+checkpoints:
+  t235:
+    - ./checkpoints/dbn/c10/t235/230927/v118_step1ens5/0
+    - ./checkpoints/dbn/c10/t235/230927/v118_step1ens5/1
+    - ./checkpoints/dbn/c10/t235/230927/v118_step1ens5/2
+target_checkpoints:
+  - ./checkpoints/frn_sd2_be
+  - ./checkpoints/frn_sd3_be
+  - ./checkpoints/frn_sd5_be

@@ -209,6 +209,8 @@ def build_dataloaders(config):
     if config.data_name == 'ImageNet1k_x64':
         trn_images, val_images = trn_images, tst_images
         trn_labels, val_labels = trn_labels, tst_labels
+        # trn_images, val_images = trn_images[:123116], trn_images[123116:]
+        # trn_labels, val_labels = trn_labels[:123116], trn_labels[123116:]
         image_shape = (1, 64, 64, 3)
         num_classes = 1000
 

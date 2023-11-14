@@ -1,0 +1,17 @@
+data_name: ImageNet1k_x64
+model_depth: 34
+model_width: 1
+model_planes: 64
+model_blocks: 3,4,6,3
+first_conv: [7,2,3]
+first_pool: [3,2,1]
+model_style: FRN-Swish
+model_name: FlaxResNet
+optim_bs: 256
+optim_ne: 100
+optim_lr: 0.1
+warmup_factor: 0.01
+warmup_steps: 5
+optim_weight_decay: 0.0001
+optim: sgd
+model_nobias: True

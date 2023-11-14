@@ -58,7 +58,9 @@ def launch(config, print_fn):
             num_planes=config.model_planes,
             num_blocks=tuple(
                 int(b) for b in config.model_blocks.split(",")
-            ) if config.model_blocks is not None else None
+            ) if config.model_blocks is not None else None,
+            first_conv=config.first_conv,
+            first_pool=config.first_pool
         )
         _base = partial(
             FlaxResNetBase,
@@ -68,7 +70,10 @@ def launch(config, print_fn):
             pixel_mean=defaults.PIXEL_MEAN,
             pixel_std=defaults.PIXEL_STD,
             num_classes=dataloaders['num_classes'],
-            out=config.shared_level)
+            out=config.shared_level,
+            first_conv=config.first_conv,
+            first_pool=config.first_pool
+            )
 
     if config.model_style == 'BN-ReLU':
         model = _ResNet()
@@ -77,7 +82,7 @@ def launch(config, print_fn):
         model = _ResNet(
             conv=partial(
                 flax.linen.Conv,
-                use_bias=True,
+                use_bias=not config.model_nobias,
                 kernel_init=jax.nn.initializers.he_normal(),
                 bias_init=jax.nn.initializers.zeros),
             norm=FilterResponseNorm,
@@ -85,7 +90,7 @@ def launch(config, print_fn):
         base = _base(
             conv=partial(
                 flax.linen.Conv,
-                use_bias=True,
+                use_bias=not config.model_nobias,
                 kernel_init=jax.nn.initializers.he_normal(),
                 bias_init=jax.nn.initializers.zeros),
             norm=FilterResponseNorm,
@@ -321,9 +326,11 @@ def launch(config, print_fn):
                 target = target*(1-alpha) + alpha/n_cls
             predictions = jax.nn.log_softmax(logits, axis=-1)
             loss = -jnp.sum(target * predictions, axis=-1)      # [B,]
+            count = jnp.sum(batch['marker'])
             loss = jnp.sum(
                 jnp.where(batch['marker'], loss, jnp.zeros_like(loss))
-            ) / jnp.sum(batch['marker'])
+            )
+            loss = jnp.where(count!=0, loss/count, loss)
             if config.ens_dist == "":
                 pass
             elif config.ens_dist == "naive":
@@ -660,6 +667,9 @@ def main():
 
     parser.add_argument("--model_planes", default=16, type=int)
     parser.add_argument("--model_blocks", default=None, type=str)
+    parser.add_argument('--model_nobias', action="store_true")
+    parser.add_argument('--first_conv', nargs='+', type=int)
+    parser.add_argument('--first_pool', nargs='+', type=int)
     parser.add_argument('--optim_ne', default=200, type=int,
                         help='the number of training epochs (default: 200)')
     parser.add_argument('--optim_lr', default=0.005, type=float,

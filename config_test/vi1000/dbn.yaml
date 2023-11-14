@@ -1,0 +1,7 @@
+method: dbn
+ensemble: 2
+checkpoints:
+  t23:
+    - ./checkpoints/dbn/vi1000/t23/231113/v1115/0
+  t25:
+    - ./checkpoints/dbn/vi1000/t25/231113/v1115/0

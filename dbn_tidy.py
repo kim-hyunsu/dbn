@@ -1,7 +1,6 @@
 from builtins import NotImplementedError
 import os
 import orbax
-from copy import deepcopy
 from easydict import EasyDict
 
 
@@ -31,7 +30,7 @@ from giung2.metrics import evaluate_acc, evaluate_nll
 from giung2.models.layers import FilterResponseNorm
 from models.resnet import FlaxResNet, FlaxResNetBase
 from utils import evaluate_top2acc, evaluate_topNacc, get_single_batch
-from models.resnet import FlaxResNetClassifier, FlaxResNetClassifier2, FlaxResNetClassifier3, FlaxResNetClassifier4
+from models.resnet import FlaxResNetClassifier3
 from models.bridge import CorrectionModel, FeatureUnet, LatentFeatureUnet, dsb_schedules, MLP
 from models.i2sb import DiffusionBridgeNetwork, TinyUNetModel, UNetModel, MidUNetModel, DiffusionClassifier, ClsUnet
 from collections import OrderedDict
@@ -41,7 +40,7 @@ from utils import WandbLogger, pixelize, normalize_logits, unnormalize_logits
 from utils import model_list, logit_dir_list, feature_dir_list, feature2_dir_list, feature3_dir_list
 from utils import get_info_in_dir, jprint, expand_to_broadcast, FeatureBank, get_probs, get_logprobs
 from utils import batch_mul, batch_add, get_ens_logits, get_avg_logits
-from utils import load_ckpt
+from utils import load_ckpt, get_config
 from tqdm import tqdm
 from functools import partial
 import defaults_sgd
@@ -68,7 +67,9 @@ def get_resnet(config, head=False):
             num_planes=config.model_planes,
             num_blocks=tuple(
                 int(b) for b in config.model_blocks.split(",")
-            ) if config.model_blocks is not None else None
+            ) if config.model_blocks is not None else None,
+            first_conv=config.first_conv,
+            first_pool=config.first_pool
         )
 
     if config.model_style == 'BN-ReLU':
@@ -78,7 +79,7 @@ def get_resnet(config, head=False):
             _ResNet,
             conv=partial(
                 flax.linen.Conv,
-                use_bias=True,
+                use_bias=not config.model_nobias,
                 kernel_init=jax.nn.initializers.he_normal(),
                 bias_init=jax.nn.initializers.zeros),
             norm=FilterResponseNorm,
@@ -114,6 +115,17 @@ def load_teacher(ckpt_dir):
     batch_stats = ckpt.get("batch_stats")
     config = ckpt["config"]
     return params, batch_stats, config
+
+def load_saved(ckpt_dir):
+    ckpt = checkpoints.restore_checkpoint(
+        ckpt_dir=ckpt_dir,
+        target=None
+    )
+    params = ckpt["params"]
+    batch_stats = ckpt.get("batch_stats")
+    config = ckpt["config"]
+    tx_saved = ckpt.get("state") is not None
+    return params, batch_stats, config, tx_saved
 
 
 def get_model_list(config):
@@ -151,7 +163,9 @@ def get_classifier(config):
             int(b) for b in config.model_blocks.split(",")
         ) if config.model_blocks is not None else None,
         feature_name=feature_name,
-        mimo=1
+        mimo=1,
+        first_conv=config.first_conv,
+        first_pool=config.first_pool
     )
     if config.model_style == "BN-ReLU":
         classifier = classifier
@@ -160,7 +174,7 @@ def get_classifier(config):
             classifier,
             conv=partial(
                 flax.linen.Conv,
-                use_bias=True,
+                use_bias=not config.model_nobias,
                 kernel_init=jax.nn.initializers.he_normal(),
                 bias_init=jax.nn.initializers.zeros
             ),
@@ -519,8 +533,6 @@ def dsb_sample_cont(score, rng, x0, y0=None, config=None, dsb_stats=None, z_dsb_
 
 
 def launch(config, print_fn):
-    rng = jax.random.PRNGKey(config.seed)
-
     # ------------------------------------------------------------------------
     # load teacher for distillation
     # ------------------------------------------------------------------------
@@ -541,14 +553,27 @@ def launch(config, print_fn):
                 continue
             setattr(config, k, teacher_config[k])
         config.T = 1
-        if config.optim_ne > 100:
-            config.optim_ne = 50
         config.optim_lr = 0.1*teacher_config["optim_lr"]
         teacher_dsb_stats = dsb_schedules(
             teacher_config["beta1"], teacher_config["beta2"],
             teacher_config["T"], teacher_config["linear_noise"]
         )
+    if config.resume:
+        def props(cls):   
+            return [i for i in cls.__dict__.keys() if i[:1] != '_']
+        print(f"Loading checkpoint {config.resume}")
+        saved_params, saved_batch_stats, saved_config, tx_saved = load_saved(
+            config.resume)
+        last_epoch_idx = config.last_epoch_idx
+        resume = config.resume
+        _config = get_config(saved_config)
+        for k in props(_config):
+            v = getattr(_config, k)
+            setattr(config, k, v)
+        config.last_epoch_idx = last_epoch_idx
+        config.resume = resume
 
+    rng = jax.random.PRNGKey(config.seed)
     model_dtype = jnp.float32
     config.dtype = model_dtype
     config.image_stats = dict(
@@ -585,10 +610,16 @@ def launch(config, print_fn):
     config.x_dim = x_dim
     if "TinyImageNet" in config.data_name:
         zdim = (64, 64, 64)
+        print(f"zdim {zdim}")
+    elif "ImageNet" in config.data_name:
+        zdim = (64, 64, 64)
+        print(f"zdim {zdim}")
     elif "CIFAR100" in config.data_name:
         zdim = (32, 32, 64)
+        print(f"zdim {zdim}")
     elif "CIFAR10" in config.data_name:
         zdim = (32, 32, 32)
+        print(f"zdim {zdim}")
     else:
         print("Calculating statistics of feature z...")
         (
@@ -648,6 +679,12 @@ def launch(config, print_fn):
         variables["params"] = teacher_params
         if variables.get("batch_stats") is not None:
             variables["batch_stats"] = teacher_batch_stats
+        variables = freeze(variables)
+    if config.resume:
+        variables = variables.unfreeze()
+        variables["params"] = saved_params
+        if variables.get("batch_stats") is not None:
+            variables["batch_stats"] = saved_batch_stats
         variables = freeze(variables)
 
     # ------------------------------------------------------------------------
@@ -713,6 +750,26 @@ def launch(config, print_fn):
         batch_stats=variables.get("batch_stats"),
         rng=state_rng
     )
+    if config.resume:
+        last_epochs = config.last_epoch_idx + 1
+        saved_iteration = config.trn_steps_per_epoch * last_epochs
+        state = state.replace(step=saved_iteration)
+        if tx_saved:
+            print("Load saved optimizer")
+            _ckpt = dict(
+                params=state.params,
+                batch_stats=state.batch_stats,
+                config=dict(),
+                state=state
+            )
+            ckpt = checkpoints.restore_checkpoint(
+                ckpt_dir=config.resume,
+                target=_ckpt
+            )
+            state = state.replace(tx=ckpt["state"].tx)
+            del _ckpt
+            del ckpt
+
 
     # ------------------------------------------------------------------------
     # define sampler and metrics
@@ -1126,33 +1183,36 @@ def launch(config, print_fn):
         del summarized[f"{key}/count"]
         return summarized
 
-    for epoch_idx in tqdm(range(config.optim_ne)):
+    for epoch_idx in tqdm(range(config.last_epoch_idx, config.optim_ne)):
         epoch_rng = jax.random.fold_in(sub_rng, epoch_idx)
         train_rng, valid_rng, test_rng = jax.random.split(epoch_rng, 3)
 
+        valid_only_cond =(config.last_epoch_idx > 0 and epoch_idx==config.last_epoch_idx) 
         # ------------------------------------------------------------------------
         # train by getting features from each resnet
         # ------------------------------------------------------------------------
-        train_loader = dataloaders["dataloader"](rng=epoch_rng)
-        train_loader = jax_utils.prefetch_to_device(train_loader, size=2)
-        train_metrics = []
-        print_bin = (float("inf"), None)
-        for batch_idx, batch in enumerate(train_loader):
-            batch_rng = jax.random.fold_in(train_rng, batch_idx)
-            state = state.replace(rng=jax_utils.replicate(batch_rng))
-            if config.mixup_alpha > 0:
-                batch = step_mixup(state, batch)
-            batch = step_label(state, batch)
-            state, metrics = step_train(state, batch)
-            train_metrics.append(metrics)
+        if not valid_only_cond:
+            train_loader = dataloaders["dataloader"](rng=epoch_rng)
+            train_loader = jax_utils.prefetch_to_device(train_loader, size=2)
+            train_metrics = []
+            print_bin = (float("inf"), None)
+            for batch_idx, batch in enumerate(train_loader):
+                batch_rng = jax.random.fold_in(train_rng, batch_idx)
+                state = state.replace(rng=jax_utils.replicate(batch_rng))
+                if config.mixup_alpha > 0:
+                    batch = step_mixup(state, batch)
+                batch = step_label(state, batch)
+                state, metrics = step_train(state, batch)
+                train_metrics.append(metrics)
 
-        train_summarized = summarize_metrics(train_metrics, "trn")
-        train_summary.update(train_summarized)
-        wl.log(train_summary)
+            train_summarized = summarize_metrics(train_metrics, "trn")
+            train_summary.update(train_summarized)
+            train_summary["trn/lr"] = scheduler(jax_utils.unreplicate(state.step))
+            wl.log(train_summary)
 
-        if state.batch_stats is not None:
-            state = state.replace(
-                batch_stats=cross_replica_mean(state.batch_stats))
+            if state.batch_stats is not None:
+                state = state.replace(
+                    batch_stats=cross_replica_mean(state.batch_stats))
 
         # ------------------------------------------------------------------------
         # valid by getting features from each resnet
@@ -1178,6 +1238,9 @@ def launch(config, print_fn):
         # ------------------------------------------------------------------------
         criteria = valid_summarized[f"val/acc1"]
         if best_acc < criteria:
+            if valid_only_cond:
+                best_acc = criteria
+                continue
             test_loader = dataloaders["tst_loader"](rng=None)
             test_loader = jax_utils.prefetch_to_device(test_loader, size=2)
             test_metrics = []
@@ -1195,7 +1258,6 @@ def launch(config, print_fn):
             wl.log(test_summary)
             best_acc = criteria
             if config.save:
-                assert not config.nowandb
                 save_path = config.save
                 save_state = jax_utils.unreplicate(state)
                 if getattr(config, "dtype", None) is not None:
@@ -1203,7 +1265,8 @@ def launch(config, print_fn):
                 ckpt = dict(
                     params=save_state.ema_params,
                     batch_stats=save_state.batch_stats,
-                    config=vars(config)
+                    config=vars(config),
+                    state=save_state
                 )
                 orbax_checkpointer = orbax.checkpoint.PyTreeCheckpointer()
                 checkpoints.save_checkpoint(
@@ -1239,6 +1302,9 @@ def main():
 
     parser.add_argument("--model_planes", default=16, type=int)
     parser.add_argument("--model_blocks", default=None, type=str)
+    parser.add_argument("--model_nobias", action="store_true")
+    parser.add_argument('--first_conv', nargs='+', type=int)
+    parser.add_argument('--first_pool', nargs='+', type=int)
     # ---------------------------------------------------------------------------------------
     # optimizer
     # ---------------------------------------------------------------------------------------
@@ -1257,6 +1323,8 @@ def main():
     parser.add_argument('--start_cls', default=-1, type=int)
     parser.add_argument('--cls_optim', default="adam", type=str)
     parser.add_argument('--start_base', default=999999999999, type=int)
+    parser.add_argument('--resume', default=None, type=str)
+    parser.add_argument('--last_epoch_idx', default=0, type=int)
     # ---------------------------------------------------------------------------------------
     # training
     # ---------------------------------------------------------------------------------------

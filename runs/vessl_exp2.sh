@@ -1,6 +1,8 @@
 echo 0
-python naive_ed.py \
-    --config config_naive_ed/c10_frnrelu_t9.yaml \
-    --save ./checkpoints/naive_ed/t2357911131517/230929/1 \
-    --seed 9916
+python dbn_tidy.py \
+    --config config_dsb/t200_frnrelu_AtoABC_ensemble.yaml \
+    --save ./checkpoints/dbn/t200/t235/231113/v1110/5 \
+    --beta2 0.005 \
+    --beta1 0.005 \
+    --seed 68265
 echo 1

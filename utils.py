@@ -292,6 +292,66 @@ def model_list(data_name, model_style, shared_head=False, tag=""):
                 "./checkpoints/frn200_sd15_be",
                 "./checkpoints/frn200_sd17_be",
             ]
+    elif data_name == "ImageNet1k_x64" and model_style == "FRN-Swish":
+        if tag == "AtoABC":
+            return [
+                "./checkpoints/frn1000_sd2_be",
+                "./checkpoints/frn1000_sd3_be",
+                "./checkpoints/frn1000_sd5_be",
+                "./checkpoints/frn1000_sd7_be",
+                "./checkpoints/frn1000_sd9_be",
+                "./checkpoints/frn1000_sd11_be",
+                "./checkpoints/frn1000_sd13_be",
+                "./checkpoints/frn1000_sd15_be",
+                "./checkpoints/frn1000_sd17_be",
+                "./checkpoints/frn1000_sd19_be",
+            ]
+        elif tag == "AtoABC2":
+            return [
+                "./checkpoints/frn1000_sd2_be",
+                "./checkpoints/frn1000_sd7_be",
+                "./checkpoints/frn1000_sd9_be",
+            ]
+        elif tag == "AtoABC3":
+            return [
+                "./checkpoints/frn1000_sd2_be",
+                "./checkpoints/frn1000_sd11_be",
+                "./checkpoints/frn1000_sd13_be",
+            ]
+        elif tag == "vAtoABC":
+            return [
+                "./checkpoints/frnv1000_sd2_tpu",
+                "./checkpoints/frnv1000_sd3_tpu",
+                "./checkpoints/frnv1000_sd5_tpu",
+            ]
+        elif tag == "vAtoABC2":
+            return [
+                "./checkpoints/frnv1000_sd2_tpu",
+                "./checkpoints/frnv1000_sd7_tpu",
+                "./checkpoints/frnv1000_sd9_tpu",
+            ]
+        elif tag == "vAtoABC3":
+            return [
+                "./checkpoints/frnv1000_sd2_tpu",
+                "./checkpoints/frnv1000_sd11_tpu",
+                "./checkpoints/frnv1000_sd13_tpu",
+            ]
+        elif tag == "vAtoCAB":
+            return [
+                "./checkpoints/frnv1000_sd5_tpu",
+                "./checkpoints/frnv1000_sd2_tpu",
+                "./checkpoints/frnv1000_sd3_tpu",
+            ]
+        elif tag == "vAtoAB":
+            return [
+                "./checkpoints/frnv1000_sd2_tpu",
+                "./checkpoints/frnv1000_sd3_tpu",
+            ]
+        elif tag == "vAtoAB2":
+            return [
+                "./checkpoints/frnv1000_sd2_tpu",
+                "./checkpoints/frnv1000_sd5_tpu",
+            ]
     elif data_name == "CIFAR10_x32" and model_style == "FRN-Swish":
         if tag == "bezier":
             return [
@@ -962,6 +1022,8 @@ def get_config(ckpt_config):
             config.num_classes = 100
         elif config.data_name == "TinyImageNet200_x64":
             config.num_classes = 200
+        elif config.data_name == "ImageNet1k_x64":
+            config.num_classes = 1000
     if getattr(config, "image_stats", None) is None:
         config.image_stats = dict(
             m=jnp.array(defaults_sgd.PIXEL_MEAN),
@@ -976,6 +1038,26 @@ def get_config(ckpt_config):
         elif config.data_name == "TinyImageNet200_x64" and config.model_style == "FRN-Swish":
             config.model_planes = 64
             config.model_blocks = "3,4,6,3"
+        elif config.data_name == "ImageNet1k_x64" and config.model_style == "FRN-Swish":
+            config.model_planes = 64
+            config.model_blocks = "3,4,6,3"
+    if getattr(config, "first_conv", None) is None:
+        if config.data_name == "CIFAR10_x32" and config.model_style == "FRN-Swish":
+            config.first_conv = None
+            config.first_pool = None
+            config.model_nobias = False
+        elif config.data_name == "CIFAR100_x32" and config.model_style == "FRN-Swish":
+            config.first_conv = None
+            config.first_pool = None
+            config.model_nobias = False
+        elif config.data_name == "TinyImageNet200_x64" and config.model_style == "FRN-Swish":
+            config.first_conv = None
+            config.first_pool = None
+            config.model_nobias = False
+        elif config.data_name == "ImageNet1k_x64" and config.model_style == "FRN-Swish":
+            config.first_conv = None
+            config.first_pool = None
+            config.model_nobias = True
     if getattr(config, "dsb_continuous", None) is None:
         config.dsb_continuous = False
     if getattr(config, "centering", None) is None:

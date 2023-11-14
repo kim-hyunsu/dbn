@@ -2,7 +2,6 @@ from builtins import getattr, isinstance
 from collections import OrderedDict
 from sklearn.metrics import r2_score
 import argparse
-from re import I
 import jax
 import jaxlib
 import jax.numpy as jnp
@@ -19,7 +18,7 @@ from tabulate import tabulate
 from cls_plot import dbn_plot
 from data.build import build_dataloaders
 import sys
-from dbn import build_dbn, pdict, dsb_sample, get_resnet
+from dbn_tidy import build_dbn, pdict, dsb_sample, get_resnet
 from einops import rearrange
 from giung2.metrics import evaluate_acc, evaluate_nll
 from utils import load_ckpt, jprint
@@ -223,6 +222,7 @@ def launch(args):
     @jax.jit
     def test_ens_dbn(state, batch):
         sum_probs = []
+        log_probs = []
         for m in range(args.ensemble):
             steps = config.T
             drop_rng, score_rng = jax.random.split(state["rng"])
@@ -239,18 +239,32 @@ def launch(args):
                 score_rng, _dsb_sample, batch["images"])
             logitsC = rearrange(logitsC, "n (t b) z -> t n b z", t=steps+1)
             logitsC = logitsC[-1]
+            ####
+            # logitsC = logitsC - logitsB/5
+            ####
             logprobsC = jax.nn.log_softmax(logitsC, axis=-1)
+            log_probs.append(logprobsC)
             probsC = jnp.exp(logprobsC)
             ens_probsC = jnp.mean(probsC, axis=0)
             sum_probs.append(ens_probsC)
             probsB = jax.nn.softmax(logitsB, axis=-1)
-        A = sum(sum_probs) / len(sum_probs)
-        # J = args.ensemble
-        # A = 3*J/(2J+1)*A
-        # B = (args.ensemble-1)*probsB/(3*args.ensemble)
-        # C = 3*args.ensemble/(2*args.ensemble+1)
-        # v = A-B
-        # out = jnp.where(v == 0, 1e-8, v) * C
+            log_probsB = jax.nn.log_softmax(logitsB, axis=-1)
+        # A = sum(sum_probs) / len(sum_probs)
+
+        M = args.ensemble
+        N = config.ensemble_prediction
+        A = sum(sum_probs)
+        A -= 0.5*(M-1)*probsB/N
+        A *= N
+        A /= M*(N-1)+1
+        A = jnp.maximum(A, 1e-12)
+        A /= A.sum(-1, keepdims=True)
+
+        # A = (sum(sum_probs)+probsB) / (len(sum_probs)+1)
+
+        # A = sum(log_probs) / len(log_probs)
+        # A = jax.nn.softmax(A, axis=-1)[0]
+
         out = A
         return out
 

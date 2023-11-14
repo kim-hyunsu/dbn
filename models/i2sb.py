@@ -465,12 +465,18 @@ def timestep_embedding(timesteps, dim, max_period=10000):
     :param max_period: controls the minimum frequency of the embeddings.
     :return: an [N x dim] Tensor of positional embeddings.
     """
+    jprint("timesteps is nan", jnp.any(jnp.isnan(timesteps)),
+           "timesteps is inf", jnp.any(jnp.isinf(timesteps)))
     half = dim // 2
     freqs = jnp.exp(
         -math.log(max_period) * jnp.arange(0, half, dtype=jnp.float32) / half
     )
     args = timesteps[..., None] * freqs[None]
+    jprint("args is nan", jnp.any(jnp.isnan(args)),
+           "args is inf", jnp.any(jnp.isinf(args)))
     embedding = jnp.concatenate([jnp.cos(args), jnp.sin(args)], axis=-1)
+    jprint("embedding is nan", jnp.any(jnp.isnan(embedding)),
+           "embeding is inf", jnp.any(jnp.isinf(embedding)))
     if len(timesteps.shape) == 2:
         embedding = rearrange(embedding, "b n d -> b (n d)")
     if dim % 2:
@@ -1739,6 +1745,16 @@ class ClsUnet(nn.Module):
             return self._v1_1_9(p, x, t, **kwargs)
         elif self.version == "v1.1.10":
             return self._v1_1_10(p, x, t, **kwargs)
+        elif self.version == "v1.1.11":
+            return self._v1_1_11(p, x, t, **kwargs)
+        elif self.version == "v1.1.12":
+            return self._v1_1_12(p, x, t, **kwargs)
+        elif self.version == "v1.1.13":
+            return self._v1_1_13(p, x, t, **kwargs)
+        elif self.version == "v1.1.14":
+            return self._v1_1_14(p, x, t, **kwargs)
+        elif self.version == "v1.1.15":
+            return self._v1_1_15(p, x, t, **kwargs)
         else:
             raise NotImplementedError
 
@@ -2278,6 +2294,12 @@ class ClsUnet(nn.Module):
         return p
 
     def _v1_1_10(self, p, x, t, **kwargs):
+        jprint("input t is nan", jnp.any(jnp.isnan(t)),
+               "input t is inf", jnp.any(jnp.isinf(t)))
+        jprint("input p is nan", jnp.any(jnp.isnan(p)),
+               "input p is inf", jnp.any(jnp.isinf(p)))
+        jprint("input x is nan", jnp.any(jnp.isnan(x)),
+               "input x is inf", jnp.any(jnp.isinf(x)))
         cfgs = [
             # t, c, n, s
             [1,  64, 1, 1],
@@ -2285,6 +2307,72 @@ class ClsUnet(nn.Module):
             [4,  128, 3, 2],
             [4,  192, 4, 1],
             [4,  256, 3, 2],
+        ]
+        norm_kwargs = to_norm_kwargs(self.norm, kwargs)
+        in_c = _divisible(x.shape[-1], 8)
+
+        t_dim = in_c//4  # 32
+        jprint("t_dim", t_dim)
+        t = timestep_embedding(t, t_dim)
+        t = self.fc(features=in_c//2)(t)
+        t = self.silu(t)
+        jprint("t is nan", jnp.any(jnp.isnan(t)),
+               "t is inf", jnp.any(jnp.isinf(t)))
+
+        p = LogitEncoder()(p)
+        p = p[:, None, None, :]
+        p = jnp.tile(p, reps=[1, x.shape[1], x.shape[2], 1])
+        jprint("p is nan", jnp.any(jnp.isnan(p)),
+               "p is inf", jnp.any(jnp.isinf(p)))
+
+        _x = x
+        x = self.conv(
+            features=in_c,
+            kernel_size=(3, 3),
+            strides=(1, 1),
+            padding="SAME"
+        )(x)
+        # print(f"{x.shape[1]*x.shape[2]*3**2*_x.shape[-1]*x.shape[-1]}")
+        x = self.norm(**norm_kwargs)(x)
+        x = self.relu6(x)
+        x = jnp.concatenate([x, p], axis=-1)
+        in_c = x.shape[-1]
+        for e, c, n, s in cfgs:
+            out_c = _divisible(c*self.width_multi, 2)
+            _t = self.fc(features=in_c)(t)
+            _t = _t[:, None, None, :]
+            for i in range(n):
+                if i == 0:
+                    x += _t
+                x = InvertedResidual(
+                    in_ch=in_c,
+                    ch=out_c,
+                    st=s if i == 0 else 1,
+                    expand=e
+                )(x, **kwargs)
+                in_c = out_c
+        out_c = _divisible(c*self.width_multi, 2)
+        _x = x
+        x = Conv1x1(ch=out_c)(x, **kwargs)
+        jprint("x is nan", jnp.any(jnp.isnan(x)),
+               "x is inf", jnp.any(jnp.isinf(x)))
+        # print(f"{x.shape[1]*x.shape[2]*_x.shape[-1]*x.shape[-1]}")
+        p = jnp.mean(x, axis=(1, 2))
+        p = self.fc(features=self.p_dim*self.num_input)(p)
+        jprint("last p is nan", jnp.any(jnp.isnan(p)),
+               "last p is inf", jnp.any(jnp.isinf(p)))
+        return p
+
+    def _v1_1_11(self, p, x, t, **kwargs):
+        cfgs = [
+            # t, c, n, s
+            [1,  64, 1, 1],
+            [4,  96, 2, 2],
+            [4,  128, 3, 2],
+            [4,  192, 4, 1],
+            [4,  256, 3, 2],
+            [4,  512, 1, 1],
+            [4,  1024, 1, 1],
         ]
         norm_kwargs = to_norm_kwargs(self.norm, kwargs)
         in_c = _divisible(x.shape[-1], 8)
@@ -2332,6 +2420,294 @@ class ClsUnet(nn.Module):
         p = self.fc(features=self.p_dim*self.num_input)(p)
         return p
 
+    def _v1_1_12(self, p, x, t, **kwargs):
+        cfgs = [
+            # t, c, n, s
+            [1,  64, 1, 1],
+            [4,  96, 2, 2],
+            [4,  128, 3, 2],
+            [4,  192, 4, 1],
+            [4,  256, 3, 2],
+            [4,  384, 1, 1],
+        ]
+        norm_kwargs = to_norm_kwargs(self.norm, kwargs)
+        in_c = _divisible(x.shape[-1], 8)
+
+        t_dim = in_c//4  # 32
+        t = timestep_embedding(t, t_dim)
+        t = self.fc(features=in_c//2)(t)
+        t = self.silu(t)
+
+        p = LogitEncoder()(p)
+        p = p[:, None, None, :]
+        p = jnp.tile(p, reps=[1, x.shape[1], x.shape[2], 1])
+
+        _x = x
+        x = self.conv(
+            features=in_c,
+            kernel_size=(3, 3),
+            strides=(1, 1),
+            padding="SAME"
+        )(x)
+        # print(f"{x.shape[1]*x.shape[2]*3**2*_x.shape[-1]*x.shape[-1]}")
+        x = self.norm(**norm_kwargs)(x)
+        x = self.relu6(x)
+        x = jnp.concatenate([x, p], axis=-1)
+        in_c = x.shape[-1]
+        for e, c, n, s in cfgs:
+            out_c = _divisible(c*self.width_multi, 2)
+            _t = self.fc(features=in_c)(t)
+            _t = _t[:, None, None, :]
+            for i in range(n):
+                if i == 0:
+                    x += _t
+                x = InvertedResidual(
+                    in_ch=in_c,
+                    ch=out_c,
+                    st=s if i == 0 else 1,
+                    expand=e
+                )(x, **kwargs)
+                in_c = out_c
+        _x = x
+        x = Conv1x1(ch=1024)(x, **kwargs)
+        # print(f"{x.shape[1]*x.shape[2]*_x.shape[-1]*x.shape[-1]}")
+        p = jnp.mean(x, axis=(1, 2))
+        p = self.fc(features=self.p_dim*self.num_input)(p)
+        return p
+
+    def _v1_1_13(self, p, x, t, **kwargs):
+        cfgs = [
+            # t, c, n, s
+            [6,  64, 3, 2],
+            [6,  96, 3, 2],
+            [6,  160, 3, 1],
+            [6,  320, 3, 2],
+            [6,  640, 1, 1]
+        ]
+        norm_kwargs = to_norm_kwargs(self.norm, kwargs)
+        in_c = _divisible(x.shape[-1], 8)
+
+        t_dim = in_c//4  # 32
+        t = timestep_embedding(t, t_dim)
+        t = self.fc(features=in_c//2)(t)
+        t = self.silu(t)
+
+        p = LogitEncoder()(p)
+        p = p[:, None, None, :]
+        p = jnp.tile(p, reps=[1, x.shape[1], x.shape[2], 1])
+
+        _x = x
+        x = self.conv(
+            features=in_c,
+            kernel_size=(3, 3),
+            strides=(1, 1),
+            padding="SAME"
+        )(x)
+        # print(f"{x.shape[1]*x.shape[2]*3**2*_x.shape[-1]*x.shape[-1]}")
+        x = self.norm(**norm_kwargs)(x)
+        x = self.relu6(x)
+        x = jnp.concatenate([x, p], axis=-1)
+        in_c = x.shape[-1]
+        for e, c, n, s in cfgs:
+            out_c = _divisible(c*self.width_multi, 2)
+            _t = self.fc(features=in_c)(t)
+            _t = _t[:, None, None, :]
+            for i in range(n):
+                if i == 0:
+                    x += _t
+                x = InvertedResidual(
+                    in_ch=in_c,
+                    ch=out_c,
+                    st=s if i == 0 else 1,
+                    expand=e
+                )(x, **kwargs)
+                in_c = out_c
+        _x = x
+        x = Conv1x1(ch=1280)(x, **kwargs)
+        # print(f"{x.shape[1]*x.shape[2]*_x.shape[-1]*x.shape[-1]}")
+        p = jnp.mean(x, axis=(1, 2))
+        p = self.fc(features=self.p_dim*self.num_input)(p)
+        return p
+
+    def _v1_1_13(self, p, x, t, **kwargs):
+        cfgs = [
+            # t, c, n, s
+            [6,  64, 3, 2],
+            [6,  96, 3, 2],
+            [6,  160, 3, 1],
+            [6,  320, 3, 2],
+            [6,  640, 1, 1]
+        ]
+        norm_kwargs = to_norm_kwargs(self.norm, kwargs)
+        in_c = _divisible(x.shape[-1], 8)
+
+        t_dim = in_c//4  # 32
+        t = timestep_embedding(t, t_dim)
+        t = self.fc(features=in_c//2)(t)
+        t = self.silu(t)
+
+        p = LogitEncoder()(p)
+        p = p[:, None, None, :]
+        p = jnp.tile(p, reps=[1, x.shape[1], x.shape[2], 1])
+
+        _x = x
+        x = self.conv(
+            features=in_c,
+            kernel_size=(3, 3),
+            strides=(1, 1),
+            padding="SAME"
+        )(x)
+        # print(f"{x.shape[1]*x.shape[2]*3**2*_x.shape[-1]*x.shape[-1]}")
+        x = self.norm(**norm_kwargs)(x)
+        x = self.relu6(x)
+        x = jnp.concatenate([x, p], axis=-1)
+        in_c = x.shape[-1]
+        for e, c, n, s in cfgs:
+            out_c = _divisible(c*self.width_multi, 2)
+            _t = self.fc(features=in_c)(t)
+            _t = _t[:, None, None, :]
+            for i in range(n):
+                if i == 0:
+                    x += _t
+                x = InvertedResidual(
+                    in_ch=in_c,
+                    ch=out_c,
+                    st=s if i == 0 else 1,
+                    expand=e
+                )(x, **kwargs)
+                in_c = out_c
+        _x = x
+        x = Conv1x1(ch=1280)(x, **kwargs)
+        # print(f"{x.shape[1]*x.shape[2]*_x.shape[-1]*x.shape[-1]}")
+        p = jnp.mean(x, axis=(1, 2))
+        p = self.fc(features=self.p_dim*self.num_input)(p)
+        return p
+
+    def _v1_1_14(self, p, x, t, **kwargs):
+        cfgs = [
+            # t, c, n, s
+            [1,  64, 1, 1],
+            [4,  96, 2, 2],
+            [4,  128, 3, 2],
+            [4,  192, 3, 1],
+            [4,  256, 2, 2],
+            [4,  512, 1, 2],
+            [4,  768, 1, 1],
+        ]
+        norm_kwargs = to_norm_kwargs(self.norm, kwargs)
+        in_c = _divisible(x.shape[-1], 8)
+
+        t_dim = in_c//4  # 32
+        t = timestep_embedding(t, t_dim)
+        t = self.fc(features=in_c//2)(t)
+        t = self.silu(t)
+
+        p = LogitEncoder()(p)
+        p = p[:, None, None, :]
+        p = jnp.tile(p, reps=[1, x.shape[1], x.shape[2], 1])
+
+        _x = x
+        x = self.conv(
+            features=in_c,
+            kernel_size=(3, 3),
+            strides=(1, 1),
+            padding="SAME"
+        )(x)
+        # print(f"{x.shape[1]*x.shape[2]*3**2*_x.shape[-1]*x.shape[-1]}")
+        x = self.norm(**norm_kwargs)(x)
+        x = self.relu6(x)
+        x = jnp.concatenate([x, p], axis=-1)
+        in_c = x.shape[-1]
+        for e, c, n, s in cfgs:
+            out_c = _divisible(c*self.width_multi, 2)
+            _t = self.fc(features=in_c)(t)
+            _t = _t[:, None, None, :]
+            for i in range(n):
+                if i == 0:
+                    x += _t
+                x = InvertedResidual(
+                    in_ch=in_c,
+                    ch=out_c,
+                    st=s if i == 0 else 1,
+                    expand=e
+                )(x, **kwargs)
+                in_c = out_c
+        _x = x
+        x = Conv1x1(ch=1280)(x, **kwargs)
+        # print(f"{x.shape[1]*x.shape[2]*_x.shape[-1]*x.shape[-1]}")
+        p = jnp.mean(x, axis=(1, 2))
+        p = self.fc(features=self.p_dim*self.num_input)(p)
+        return p
+
+    def _v1_1_15(self, p, x, t, **kwargs):
+        jprint("input t is nan", jnp.any(jnp.isnan(t)),
+               "input t is inf", jnp.any(jnp.isinf(t)))
+        jprint("input p is nan", jnp.any(jnp.isnan(p)),
+               "input p is inf", jnp.any(jnp.isinf(p)))
+        jprint("input x is nan", jnp.any(jnp.isnan(x)),
+               "input x is inf", jnp.any(jnp.isinf(x)))
+        cfgs = [
+            # t, c, n, s
+            [1,  64, 1, 1],
+            [4,  96, 2, 2],
+            [4,  160, 3, 2],
+            [4,  320, 2, 2],
+            [4,  640, 1, 2],
+        ]
+        norm_kwargs = to_norm_kwargs(self.norm, kwargs)
+        in_c = _divisible(x.shape[-1], 8)
+
+        t_dim = in_c//4  # 32
+        jprint("t_dim", t_dim)
+        t = timestep_embedding(t, t_dim)
+        t = self.fc(features=in_c//2)(t)
+        t = self.silu(t)
+        jprint("t is nan", jnp.any(jnp.isnan(t)),
+               "t is inf", jnp.any(jnp.isinf(t)))
+
+        p = LogitEncoder()(p)
+        p = p[:, None, None, :]
+        p = jnp.tile(p, reps=[1, x.shape[1], x.shape[2], 1])
+        jprint("p is nan", jnp.any(jnp.isnan(p)),
+               "p is inf", jnp.any(jnp.isinf(p)))
+
+        _x = x
+        x = self.conv(
+            features=in_c,
+            kernel_size=(3, 3),
+            strides=(1, 1),
+            padding="SAME"
+        )(x)
+        # print(f"{x.shape[1]*x.shape[2]*3**2*_x.shape[-1]*x.shape[-1]}")
+        x = self.norm(**norm_kwargs)(x)
+        x = self.relu6(x)
+        x = jnp.concatenate([x, p], axis=-1)
+        in_c = x.shape[-1]
+        for e, c, n, s in cfgs:
+            out_c = _divisible(c*self.width_multi, 2)
+            _t = self.fc(features=in_c)(t)
+            _t = _t[:, None, None, :]
+            for i in range(n):
+                if i == 0:
+                    x += _t
+                x = InvertedResidual(
+                    in_ch=in_c,
+                    ch=out_c,
+                    st=s if i == 0 else 1,
+                    expand=e
+                )(x, **kwargs)
+                in_c = out_c
+        out_c = _divisible(c*self.width_multi, 2)
+        _x = x
+        x = Conv1x1(ch=1024)(x, **kwargs)
+        jprint("x is nan", jnp.any(jnp.isnan(x)),
+               "x is inf", jnp.any(jnp.isinf(x)))
+        # print(f"{x.shape[1]*x.shape[2]*_x.shape[-1]*x.shape[-1]}")
+        p = jnp.mean(x, axis=(1, 2))
+        p = self.fc(features=self.p_dim*self.num_input)(p)
+        jprint("last p is nan", jnp.any(jnp.isnan(p)),
+               "last p is inf", jnp.any(jnp.isinf(p)))
+        return p
 
 def _divisible(v, divisor, min_value=None):
     if min_value is None:
@@ -2802,7 +3178,11 @@ class DiffusionBridgeNetworkDep(nn.Module):
 
     def conditional_dbn(self, rng, l0, x1, base_params=None, cls_params=None, **kwargs):
         z1 = self.encode(x1, base_params, **kwargs)
+        jprint("z1 is nan", jnp.any(jnp.isnan(z1)),
+               "z1 is inf", jnp.any(jnp.isinf(z1)))
         l1 = self.classify(z1, cls_params, **kwargs)/self.temp
+        jprint("l1 is nan", jnp.any(jnp.isnan(l1)),
+               "l1 is inf", jnp.any(jnp.isinf(l1)))
         if self.fat and len(l1.shape) == 2:
             reps = [1]*len(l1.shape[:-1]) + [self.fat]
             l1 = jnp.tile(l1, reps)
@@ -2813,7 +3193,11 @@ class DiffusionBridgeNetworkDep(nn.Module):
             z1 = rearrange(z1, "m b h w d -> b h w (m d)")
             l1 = rearrange(l1, "m b d -> b (m d)")
         l1 = self.set_logit(rng, l1, **kwargs)
+        jprint("l1(set_logit) is nan", jnp.any(jnp.isnan(l1)),
+               "l1(set_logit) is inf", jnp.any(jnp.isinf(l1)))
         l_t, t, mu_t, sigma_t, _ = self.forward(rng, l0, l1)
+        jprint("l_t is nan", jnp.any(jnp.isnan(l_t)),
+               "l_t is inf", jnp.any(jnp.isinf(l_t)))
         if self.mimo_cond:
             _l_t = rearrange(l_t, "b (n d) -> n b d", n=self.fat)
             _z1 = rearrange(z1, "b h w (n d) -> n b h w d", n=self.fat)
@@ -2834,6 +3218,8 @@ class DiffusionBridgeNetworkDep(nn.Module):
             eps = rearrange(_eps, "n b d -> b (n d)", n=self.fat)
         else:
             eps = self.score(l_t, z1, t, **kwargs)
+        jprint("eps is nan", jnp.any(jnp.isnan(eps)),
+               "eps is inf", jnp.any(jnp.isinf(eps)))
         _sigma_t = expand_to_broadcast(sigma_t, l_t, axis=1)
         l0eps = l_t - _sigma_t*eps
         if self.fat:

@@ -1,0 +1,11 @@
+method: dbn
+ensemble: 2
+checkpoints:
+  t235:
+    - ./checkpoints/dbn/ui1000/t235/231024/v1110/0
+    - ./checkpoints/dbn/ui1000/t235/231024/v1110/1
+    - ./checkpoints/dbn/ui1000/t235/231024/v1110/2
+  t279:
+    - ./checkpoints/dbn/ui1000/t279/231024/v1110/0
+    - ./checkpoints/dbn/ui1000/t279/231024/v1110/1
+    - ./checkpoints/dbn/ui1000/t279/231024/v1110/2

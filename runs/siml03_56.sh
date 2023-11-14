@@ -1,15 +1,7 @@
 echo 0
-taskset -c 72-95 python dbn.py \
-    --config config_dsb/c10_frnrelu_AtoABC_ensemble.yaml \
-    --save ./checkpoints/dbn/c10/t21113/v118 \
-    --tag AtoABC3 \
-    --seed 786871
+taskset -c 0-47 python dbn_tidy.py \
+    --config config_dsb/t200_frnrelu_AtoABC_ensemble.yaml \
+    --save ./checkpoints/dbn/t200/t235/231113/v1110/1 \
+    --lr 0.0005 \
+    --seed 68265
 echo 1
-taskset -c 72-95 python dbn.py \
-    --config config_dsb/c10_frnrelu_AtoABC_ensemble.yaml \
-    --distill ./checkpoints/dbn/c10/t21113/v118/prime-lake-1060 \
-    --distill_alpha 0.5 \
-    --save ./checkpoints/dbn/c10/t21113dist/v118 \
-    --tag AtoABC3 \
-    --seed 3188656917
-echo 2

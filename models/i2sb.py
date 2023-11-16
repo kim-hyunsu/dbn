@@ -465,18 +465,12 @@ def timestep_embedding(timesteps, dim, max_period=10000):
     :param max_period: controls the minimum frequency of the embeddings.
     :return: an [N x dim] Tensor of positional embeddings.
     """
-    jprint("timesteps is nan", jnp.any(jnp.isnan(timesteps)),
-           "timesteps is inf", jnp.any(jnp.isinf(timesteps)))
     half = dim // 2
     freqs = jnp.exp(
         -math.log(max_period) * jnp.arange(0, half, dtype=jnp.float32) / half
     )
     args = timesteps[..., None] * freqs[None]
-    jprint("args is nan", jnp.any(jnp.isnan(args)),
-           "args is inf", jnp.any(jnp.isinf(args)))
     embedding = jnp.concatenate([jnp.cos(args), jnp.sin(args)], axis=-1)
-    jprint("embedding is nan", jnp.any(jnp.isnan(embedding)),
-           "embeding is inf", jnp.any(jnp.isinf(embedding)))
     if len(timesteps.shape) == 2:
         embedding = rearrange(embedding, "b n d -> b (n d)")
     if dim % 2:
@@ -3455,6 +3449,9 @@ class DiffusionBridgeNetwork(nn.Module):
         return self.conditional_dbn(*args, **kwargs)
 
     def set_logit(self, rng, l1, training=True, **kwargs):
+        if self.forget == -1: # rebuttal
+            l1 = jax.random.normal(rng, l1.shape)
+            return l1
         T = self.start_temp
         _, temp_rng = jax.random.split(rng)
         if training:
@@ -3546,3 +3543,102 @@ class DoubleDSB(nn.Module):
 
     def __call__(self, rng, z0, z1, **kwargs):
         pass
+
+
+class RectifiedFlowBridgeNetwork(nn.Module):
+    base_net: nn.Module
+    score_net: Sequence[nn.Module]
+    cls_net: Sequence[nn.Module]
+    crt_net: Sequence[nn.Module]
+    dsb_stats: Any
+    z_dsb_stats: Any
+    fat: int
+    joint: bool
+    forget: int = 0
+    temp: float = 1.
+    start_temp: float = 1.
+    print_inter: bool = False
+    mimo_cond: bool = False
+    multi_mixup: bool = False
+    continuous: bool = False
+    rand_temp: bool = False
+    centering: bool = False
+    rf_eps: float = None
+
+    def setup(self):
+        self.base = self.base_net()
+        self.score = self.score_net()
+        if self.cls_net is not None:
+            self.cls = self.cls_net()
+        if self.crt_net is not None:
+            self.crt = self.crt_net()
+
+    def encode(self, x, params_dict=None, **kwargs):
+        # x: BxHxWxC
+        if params_dict is not None:
+            out = self.base.apply(params_dict, x, **kwargs)
+        out = self.base(x, **kwargs)
+        return out
+
+    def correct(self, z, **kwargs):
+        if self.crt_net is None:
+            return z
+        return self.crt(z)
+
+    def classify(self, z, params_dict=None, **kwargs):
+        def _classify(cls, _z):
+            if params_dict is not None:
+                return cls.apply(params_dict, _z, **kwargs)
+            return cls(_z, **kwargs)
+        out = _classify(self.cls, z)
+        return out
+
+    def __call__(self, *args, **kwargs):
+        return self.conditional_dbn(*args, **kwargs)
+
+    def set_logit(self, rng, l1, training=True, **kwargs):
+        if self.forget == -1: # rebuttal
+            l1 = jax.random.normal(rng, l1.shape)
+            return l1
+        T = self.start_temp
+        _, temp_rng = jax.random.split(rng)
+        if training:
+            T += 0.4*jax.random.beta(temp_rng, 1, 5)
+        else:
+            T += 0.4*(1/6)  # mean of beta distribution
+        l1 = l1/T
+        return l1
+
+    def conditional_dbn(self, rng, l0, x1, base_params=None, cls_params=None, **kwargs):
+        z1 = self.encode(x1, base_params, **kwargs)
+        l1 = self.classify(z1, cls_params, **kwargs)
+        l1 = self.set_logit(rng, l1, **kwargs)
+        l_t, t, _, _, _ = self.forward(rng, l0, l1)
+        eps = self.score(l_t, z1, t, **kwargs)
+        return (eps, l_t, t, None, None), None
+
+    def forward(self, rng, x0, x1, _ts=None, dsb_stats=None):
+        if dsb_stats is None:
+            dsb_stats = self.dsb_stats
+
+        t_rng, n_rng = jax.random.split(rng, 2)
+
+        if _ts is None:
+            _ts = jax.random.uniform(
+                t_rng, (x0.shape[0],), minval=self.rf_eps, maxval=1.)  # (B,)
+        x_t = batch_mul((1-_ts), x0) + batch_mul(_ts, x1)
+
+        return x_t, _ts, x_t, None, _ts
+
+    def sample(self, *args, **kwargs):
+        return self.conditional_sample(*args, **kwargs)
+
+    def conditional_sample(self, rng, sampler, x):
+        zB = self.encode(x, training=False)
+        lB = self.classify(zB, training=False)
+        _lB = lB
+        _lB = self.set_logit(rng, _lB, training=False)
+        lC = sampler(
+            partial(self.score, training=False), rng, _lB, zB)
+        lC = lC[None, ...]
+        return lC, lB

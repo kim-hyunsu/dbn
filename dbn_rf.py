@@ -4,7 +4,7 @@ import orbax
 from easydict import EasyDict
 
 
-from typing import Any, Tuple
+from typing import Any
 
 import flax
 from flax.training import train_state, common_utils, checkpoints
@@ -25,27 +25,23 @@ import wandb
 import defaults_dsb as defaults
 from tabulate import tabulate
 import sys
-from data.build import build_dataloaders, _build_dataloader, _build_featureloader
+from data.build import build_dataloaders 
 from giung2.metrics import evaluate_acc, evaluate_nll
 from giung2.models.layers import FilterResponseNorm
 from models.resnet import FlaxResNet, FlaxResNetBase
-from utils import evaluate_top2acc, evaluate_topNacc, get_single_batch
 from models.resnet import FlaxResNetClassifier3
-from models.bridge import CorrectionModel, FeatureUnet, LatentFeatureUnet, dsb_schedules, MLP
-from models.i2sb import DiffusionBridgeNetwork, TinyUNetModel, UNetModel, MidUNetModel, DiffusionClassifier, ClsUnet
+from models.bridge import dsb_schedules 
+from models.i2sb import RectifiedFlowBridgeNetwork, ClsUnet
 from collections import OrderedDict
-from PIL import Image
 from tqdm import tqdm
-from utils import WandbLogger, pixelize, normalize_logits, unnormalize_logits
-from utils import model_list, logit_dir_list, feature_dir_list, feature2_dir_list, feature3_dir_list
-from utils import get_info_in_dir, jprint, expand_to_broadcast, FeatureBank, get_probs, get_logprobs
-from utils import batch_mul, batch_add, get_ens_logits, get_avg_logits
-from utils import load_ckpt, get_config
+from utils import WandbLogger
+from utils import model_list
+from utils import batch_mul
+from utils import get_config
 from tqdm import tqdm
 from functools import partial
 import defaults_sgd
 from einops import rearrange
-from flax import traverse_util
 
 
 class TrainState(train_state.TrainState):
@@ -426,7 +422,7 @@ def build_dbn(config):
         config.beta1, config.beta2, config.T, linear_noise=config.linear_noise, continuous=config.dsb_continuous)
     score_net = get_scorenet(config)
     crt_net = None
-    dbn = DiffusionBridgeNetwork(
+    dbn = RectifiedFlowBridgeNetwork(
         base_net=base_net,
         score_net=score_net,
         cls_net=cls_net,
@@ -442,42 +438,34 @@ def build_dbn(config):
         start_temp=config.start_temp,
         multi_mixup=False,
         continuous=False,
-        centering=False
+        centering=False,
+        rf_eps=config.rf_eps
     )
     return dbn, (dsb_stats, None)
 
 
-def dsb_sample(score, rng, x0, y0=None, config=None, dsb_stats=None, z_dsb_stats=None, steps=None):
+def rf_sample(score, rng, x0, y0=None, config=None, dsb_stats=None, z_dsb_stats=None, steps=None):
     shape = x0.shape
     batch_size = shape[0]
-    _sigma_t = dsb_stats["sigma_t"]
-    _alpos_weight_t = dsb_stats["alpos_weight_t"]
-    _sigma_t_square = dsb_stats["sigma_t_square"]
-    n_T = dsb_stats["n_T"]
-    _t = jnp.array([1/n_T])
-    _t = jnp.tile(_t, [batch_size])
-    std_arr = jnp.sqrt(_alpos_weight_t*_sigma_t_square)
-    h_arr = jax.random.normal(rng, (len(_sigma_t), *shape))
-    h_arr = h_arr.at[0].set(0)
+    n_T = config.T
+    rf_eps = config.rf_eps
+    timesteps = jnp.linspace(rf_eps, 1., n_T)
+    timesteps = jnp.concatenate([jnp.array([0]), timesteps], axis=0)
 
     @jax.jit
     def body_fn(n, val):
+        """
+            n in [0, self.n_T - 1]
+        """
         x_n = val
-        idx = n_T - n
-        t_n = idx * _t
+        current_t = jnp.array([timesteps[n_T - n]])
+        next_t = jnp.array([timesteps[n_T - n - 1]])
+        current_t = jnp.tile(current_t, [batch_size])
+        next_t = jnp.tile(next_t, [batch_size])
 
-        h = h_arr[idx]  # (B, d)
-        if config.mimo_cond:
-            t_n = jnp.tile(t_n[:, None], reps=[1, config.fat])
-        eps = score(x_n, y0, t=t_n)
+        eps = score(x_n, y0, t=current_t)
 
-        sigma_t = _sigma_t[idx]
-        alpos_weight_t = _alpos_weight_t[idx]
-        std = std_arr[idx]
-
-        x_0_eps = x_n - sigma_t*eps
-        mean = alpos_weight_t*x_0_eps + (1-alpos_weight_t)*x_n
-        x_n = mean + std * h  # (B, d)
+        x_n = x_n + batch_mul(next_t - current_t, eps)
 
         return x_n
 
@@ -879,14 +867,14 @@ def launch(config, print_fn):
             rngs_dict = dict(dropout=drop_rng)
             model_bd = dbn.bind(params_dict, rngs=rngs_dict)
             teacher_steps = teacher_config["T"]
-            _dsb_sample = partial(
-                dsb_sample,
+            _rf_sample = partial(
+                rf_sample,
                 config=EasyDict(teacher_config),
                 dsb_stats=teacher_dsb_stats,
                 z_dsb_stats=None,
                 steps=teacher_steps)
             logitsC, _ = model_bd.sample(
-                score_rng, _dsb_sample, batch["images"])
+                score_rng, _rf_sample, batch["images"])
             logitsC = rearrange(
                 logitsC, "n (t b) z -> t b (n z)", t=teacher_steps+1)
             batch["logitsC"] = logitsC[-1]
@@ -920,14 +908,13 @@ def launch(config, print_fn):
             epsilon, l_t, t, mu_t, sigma_t
         ), logits0eps = output[0] if train else output
 
-        _sigma_t = expand_to_broadcast(sigma_t, l_t, axis=1)
-        diff = (l_t-_logitsA) / _sigma_t
+        diff = (l_t-_logitsA)
         score_loss = mse_loss(epsilon, diff)
         if batch.get("logitsC") is not None:
             logitsC = batch["logitsC"]
             a = config.distill_alpha
             score_loss = (
-                a*mse_loss(epsilon, (l_t-logitsC)/_sigma_t) + (1-a)*score_loss
+                a*mse_loss(epsilon, (l_t-logitsC)) + (1-a)*score_loss
             )
         score_loss = reduce_mean(score_loss, batch["marker"])
         total_loss = config.gamma*score_loss
@@ -1024,11 +1011,11 @@ def launch(config, print_fn):
             batch_stats=state.batch_stats)
         rngs_dict = dict(dropout=drop_rng)
         model_bd = dbn.bind(params_dict, rngs=rngs_dict)
-        _dsb_sample = partial(
-            dsb_sample,
+        _rf_sample = partial(
+            rf_sample,
             config=config, dsb_stats=dsb_stats, z_dsb_stats=z_dsb_stats, steps=steps)
         logitsC, _zC = model_bd.sample(
-            score_rng, _dsb_sample, batch["images"])
+            score_rng, _rf_sample, batch["images"])
         logitsC = rearrange(logitsC, "n (t b) z -> t n b z", t=steps+1)
         logitsB = logitsC[0][0]
         logitsC = logitsC[-1][0]
@@ -1397,6 +1384,8 @@ def main():
     parser.add_argument("--distill_alpha", default=1, type=float)
     # Gaussian prior (rebuttal)
     parser.add_argument("--gaussian_prior", action="store_true")
+    # Rectified Flow (rebuttal)
+    parser.add_argument("--rf_eps", default=1e-3, type=float)
     # ---------------------------------------------------------------------------------------
     # networks
     # ---------------------------------------------------------------------------------------

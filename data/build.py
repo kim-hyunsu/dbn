@@ -124,7 +124,7 @@ def _set_augmentation(name, image_size):
             image_processing.ToTensorTransform()])))
 
 
-def build_dataloaders(config):
+def build_dataloaders(config, corrupted=False):
     """
     Args:
         config.data_root (str) : root directory containing datasets (e.g., ./data/).
@@ -135,6 +135,59 @@ def build_dataloaders(config):
     Return:
         dataloaders (dict) : it contains dataloader, trn_loader, val_loader, and tst_loader.
     """
+    
+    if corrupted:
+        # Valid
+        trn_images = np.load(os.path.join(
+            config.data_root, f'{config.data_name}/train_images.npy'))
+        trn_labels = np.load(os.path.join(
+            config.data_root, f'{config.data_name}/train_labels.npy'))
+        val_images = trn_images[40960:]
+        val_labels = trn_labels[40960:]
+
+        # OOD
+        props = ["brightness","fog","glass_blur", "motion_blur","snow",
+            "contrast","frost","impulse_noise","pixelate","spatter",
+            "defocus_blur","gaussian_blur","jpeg_compression","saturate","speckle_noise",
+            "elastic_transform","gaussian_noise","shot_noise","zoom_blur"]
+        assert not "labels" in props
+        all_tst_images = []
+        for p in props:
+            tst_images = np.load(os.path.join(
+                config.data_root, f'{config.data_name}_C/{p}.npy'))[:10000]
+            all_tst_images.append(tst_images)
+        all_tst_images = np.concatenate(all_tst_images, axis=0)
+        print("#testset", all_tst_images.shape[0])
+        tst_labels = np.load(os.path.join(
+            config.data_root, f'{config.data_name}_C/labels.npy'))[:10000]
+        all_tst_labels = np.tile(tst_labels, reps=len(props))
+        image_shape = (1, 32, 32, 3)
+        num_classes = 10
+
+        # Dataloader
+        dataloaders = dict()
+        val_transform = jax.jit(jax.vmap(image_processing.ToTensorTransform()))
+        dataloaders['val_loader'] = partial(
+            _build_dataloader,
+            images=val_images,
+            labels=val_labels,
+            batch_size=config.optim_bs,
+            shuffle=False,
+            transform=val_transform)
+        dataloaders['tst_loader'] = partial(
+            _build_dataloader,
+            images=all_tst_images,
+            labels=all_tst_labels,
+            batch_size=config.optim_bs,
+            shuffle=False,
+            transform=val_transform)
+        dataloaders['tst_steps_per_epoch'] = math.ceil(
+            len(all_tst_images) / config.optim_bs)
+        dataloaders['image_shape'] = image_shape
+        dataloaders['num_classes'] = num_classes
+
+        return dataloaders
+
     trn_images = np.load(os.path.join(
         config.data_root, f'{config.data_name}/train_images.npy'))
     trn_labels = np.load(os.path.join(

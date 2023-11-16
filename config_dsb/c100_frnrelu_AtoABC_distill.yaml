@@ -23,7 +23,7 @@ crt: 1
 cls_from_scratch: False
 mixup_alpha: 0.4
 forget: 6
-linear_nose: True
+linear_noise: True
 start_temp: 2
 ensemble_prediction: 3
 dsc: True

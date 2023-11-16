@@ -1,0 +1,7 @@
+method: dbn
+ensemble: 2
+checkpoints:
+  t357:
+    - ./checkpoints/dbn/t200/t235dist/231113/v1110/6
+  t3913:
+    - ./checkpoints/dbn/t200/t21113dist/231114/v1110/0

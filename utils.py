@@ -693,9 +693,11 @@ def jprint_fn(*args):
 
 
 jprint = lambda *args: ...
+flprint = lambda *args,**kwargs: ...
 if debug:
     print("**** DEBUG MODE ****")
     jprint = jprint_fn
+    flprint = print
 else:
     print("**** DEBUG MODE OFF ****")
 

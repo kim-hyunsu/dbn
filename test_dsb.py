@@ -20,9 +20,50 @@ from data.build import build_dataloaders
 import sys
 from dbn_tidy import build_dbn, pdict, dsb_sample, get_resnet
 from einops import rearrange
-from giung2.metrics import evaluate_acc, evaluate_nll
+from giung2.metrics import evaluate_acc, evaluate_nll, get_optimal_temperature
 from utils import load_ckpt, jprint
 
+def _onehot(labels, num_classes, on_value=1.0, off_value=0.0):
+    x = (labels[..., None] == jnp.arange(num_classes).reshape((1,) * labels.ndim + (-1,)))
+    x = jax.lax.select(x, jnp.full(x.shape, on_value), jnp.full(x.shape, off_value))
+    return x.astype(jnp.float32)
+
+def _evaluate_nll_3rank(confidences, true_labels, log_input=True, eps=1e-8, reduction="mean"):
+    log_confidences = confidences if log_input else jnp.log(confidences + eps)
+    true_target = _onehot(true_labels, num_classes=log_confidences.shape[-1])
+    if true_target.shape == log_confidences.shape:
+        pass
+    elif len(true_target.shape) == len(log_confidences.shape)-1:
+        true_target = jnp.expand_dims(true_target, axis=1)
+    else:
+        raise NotImplementedError
+    raw_results = -jnp.sum(jnp.where(true_target, true_target * log_confidences, 0.0), axis=-1)
+    if reduction == "none":
+        return raw_results
+    elif reduction == "mean":
+        return jnp.mean(raw_results)
+    elif reduction == "sum":
+        return jnp.sum(raw_results)
+    else:
+        raise NotImplementedError(f'Unknown reduction=\"{reduction}\"')
+
+def _evaluate_acc_3rank(confidences, true_labels, log_input=True, eps=1e-8, reduction="mean"):
+    pred_labels = jnp.argmax(confidences, axis=-1)
+    if true_labels.shape == confidences.shape:
+        pass
+    elif len(true_labels.shape) == len(confidences.shape)-2:
+        true_labels = jnp.expand_dims(true_labels, axis=1)
+    else:
+        raise NotImplementedError
+    raw_results = jnp.equal(pred_labels, true_labels)
+    if reduction == "none":
+        return raw_results
+    elif reduction == "mean":
+        return jnp.mean(raw_results)
+    elif reduction == "sum":
+        return jnp.sum(raw_results)
+    else:
+        raise NotImplementedError(f'Unknown reduction=\"{reduction}\"')
 
 def launch(args):
     rng = jax.random.PRNGKey(args.seed)
@@ -30,7 +71,7 @@ def launch(args):
     # load checkpoint and configuration
     # ------------------------------------------------------------------------------------------------------------
     rn_config = None
-    if "plot" in args.method:
+    if "plot" in args.method or "inter" in args.method:
         checkpoint_list = args.checkpoints
         params, batch_stats, config = load_ckpt(args.checkpoint)
         _, _, rn_config = load_ckpt(checkpoint_list[0])
@@ -61,15 +102,17 @@ def launch(args):
     elif args.method in ["naive_ed", "proxy_end2", "de"]:
         print("Building ResNet...")
         resnet = get_resnet(config, head=True)()
-    elif args.method == "dbn-plot" or args.method == "dbn-r2":
+    elif args.method in ["dbn-plot","dbn-r2","dbn-inter"]:
         print("Building DBN and ResNet...")
         dbn, (dsb_stats, z_dsb_stats) = build_dbn(config)
         resnet = get_resnet(rn_config, head=True)()
+    else:
+        raise Exception("Invalid method")
 
     # ------------------------------------------------------------------------------------------------------------
     # load dataset
     # ------------------------------------------------------------------------------------------------------------
-    dataloaders = build_dataloaders(config)
+    dataloaders = build_dataloaders(config, corrupted=args.corrupted)
     if getattr(args, "mean", None) is None:
         args.mean = jnp.zeros((dataloaders["num_classes"],))
     else:
@@ -249,16 +292,16 @@ def launch(args):
             sum_probs.append(ens_probsC)
             probsB = jax.nn.softmax(logitsB, axis=-1)
             log_probsB = jax.nn.log_softmax(logitsB, axis=-1)
-        # A = sum(sum_probs) / len(sum_probs)
+        A = sum(sum_probs) / len(sum_probs)
 
-        M = args.ensemble
-        N = config.ensemble_prediction
-        A = sum(sum_probs)
-        A -= 0.5*(M-1)*probsB/N
-        A *= N
-        A /= M*(N-1)+1
-        A = jnp.maximum(A, 1e-12)
-        A /= A.sum(-1, keepdims=True)
+        # M = args.ensemble
+        # N = config.ensemble_prediction
+        # A = sum(sum_probs)
+        # A -= 0.5*(M-1)*probsB/N
+        # A *= N
+        # A /= M*(N-1)+1
+        # A = jnp.maximum(A, 1e-12)
+        # A /= A.sum(-1, keepdims=True)
 
         # A = (sum(sum_probs)+probsB) / (len(sum_probs)+1)
 
@@ -312,7 +355,17 @@ def launch(args):
         return sum_probs/args.ensemble
 
     @partial(jax.pmap, axis_name="batch")
-    def step_test(state, batch):
+    def step_sample(state, batch):
+        if args.method in ["dbn", "dbn-r2"]:
+            ens_probsC = test_ens_dbn(state, batch)
+        elif args.method in ["naive_ed", "proxy_end2"]:
+            ens_probsC = test_naive_ed(state, batch)
+        elif args.method == "de":
+            ens_probsC = test_de(state, batch)
+        return ens_probsC
+
+    @partial(jax.pmap, axis_name="batch")
+    def step_test(state, batch, optimal_temp):
         def R2score(y, y_hat):
             # y: (B, d)
             y_bar = args.mean[None, :]
@@ -358,6 +411,17 @@ def launch(args):
         ece = evaluate_ece(
             ens_probsC, labels, marker, log_input=False, reduction="none")
 
+        cal_ens_probsC = jax.nn.softmax(
+            jnp.log(ens_probsC)/optimal_temp, axis=-1)
+        cnll = evaluate_nll(
+            cal_ens_probsC, labels, log_input=False, reduction="none")
+        cbs = evaluate_bs(
+            cal_ens_probsC, labels, log_input=False, reduction="none")
+        cnll = reduce_sum(cnll, marker)
+        cbs = reduce_sum(cbs, marker)
+        cece = evaluate_ece(
+            cal_ens_probsC, labels, marker, log_input=False, reduction="none")
+
         count = jnp.sum(marker)
 
         metrics = OrderedDict({
@@ -365,6 +429,9 @@ def launch(args):
             "nll": nll,
             "bs": bs,
             "ece": ece,
+            "cnll": cnll,
+            "cbs": cbs,
+            "cece": cece,
             "count": count
         })
         metrics = jax.lax.psum(metrics, axis_name="batch")
@@ -394,6 +461,7 @@ def launch(args):
         logitsC = rearrange(logitsC, "n (t b) z -> (n b) t z", t=steps+1)
         probsC = jax.nn.softmax(logitsC, axis=-1)
         return probsC
+    
     # ------------------------------------------------------------------------------------------------------------
     # test model
     # ------------------------------------------------------------------------------------------------------------
@@ -471,13 +539,34 @@ def launch(args):
                 params=jax_utils.replicate(params_list),
                 batch_stats=jax_utils.replicate(stats_list)
             )
+            # get temperature
+            valid_loader = dataloaders["val_loader"](rng=None)
+            valid_loader = jax_utils.prefetch_to_device(valid_loader, size=2)
+            all_samples = []
+            all_labels = []
+            for batch_idx, batch in enumerate(tqdm(valid_loader)):
+                batch_rng = jax.random.fold_in(sub_rng, batch_idx)
+                state["rng"] = jax_utils.replicate(batch_rng)
+                samples = step_sample(state, batch)
+                assert len(samples.shape) == 3
+                assert len(batch["labels"].shape) == 2
+                samples = samples.reshape(-1, samples.shape[-1])
+                labels = batch["labels"].reshape(-1)
+                marker = batch["marker"].reshape(-1)
+                all_samples.append(samples[marker])
+                all_labels.append(labels[marker])
+            all_samples = jnp.concatenate(all_samples, axis=0)
+            all_labels = jnp.concatenate(all_labels, axis=0)
+            optimal_temp = get_optimal_temperature(all_samples, all_labels, log_input=False)
+            optimal_temp = jax_utils.replicate(optimal_temp)
+            # test
             test_loader = dataloaders["tst_loader"](rng=None)
             test_loader = jax_utils.prefetch_to_device(test_loader, size=2)
             test_metrics = []
             for batch_idx, batch in enumerate(tqdm(test_loader)):
                 batch_rng = jax.random.fold_in(sub_rng, batch_idx)
                 state["rng"] = jax_utils.replicate(batch_rng)
-                metrics = step_test(state, batch)
+                metrics = step_test(state, batch, optimal_temp)
                 test_metrics.append(metrics)
             del state
             test_metrics = common_utils.get_metrics(test_metrics)
@@ -547,6 +636,27 @@ def launch(args):
                 params=jax_utils.replicate(params_list),
                 batch_stats=jax_utils.replicate(stats_list)
             )
+            # get temperature
+            valid_loader = dataloaders["val_loader"](rng=None)
+            valid_loader = jax_utils.prefetch_to_device(valid_loader, size=2)
+            all_samples = []
+            all_labels = []
+            for batch_idx, batch in enumerate(tqdm(valid_loader)):
+                batch_rng = jax.random.fold_in(sub_rng, batch_idx)
+                state["rng"] = jax_utils.replicate(batch_rng)
+                samples = step_sample(state, batch)
+                assert len(samples.shape) == 3
+                assert len(batch["labels"].shape) == 2
+                samples = samples.reshape(-1, samples.shape[-1])
+                labels = batch["labels"].reshape(-1)
+                marker = batch["marker"].reshape(-1)
+                all_samples.append(samples[marker])
+                all_labels.append(labels[marker])
+            all_samples = jnp.concatenate(all_samples, axis=0)
+            all_labels = jnp.concatenate(all_labels, axis=0)
+            optimal_temp = get_optimal_temperature(all_samples, all_labels, log_input=False)
+            optimal_temp = jax_utils.replicate(optimal_temp)
+            # test
             test_loader = dataloaders["tst_loader"](rng=None)
             test_loader = jax_utils.prefetch_to_device(test_loader, size=2)
             test_metrics = []
@@ -555,7 +665,7 @@ def launch(args):
                 state["rng"] = jax_utils.replicate(batch_rng)
                 if "r2" in args.method:
                     batch = get_target(target_state, batch)
-                metrics = step_test(state, batch)
+                metrics = step_test(state, batch, optimal_temp)
                 test_metrics.append(metrics)
             del state
             test_metrics = common_utils.get_metrics(test_metrics)
@@ -587,7 +697,8 @@ def launch(args):
             print("-------")
             print(f"{float(arr.mean()):.5f}")
             print(f"{float(arr.std()):.5f}")
-        print("R2", (total_metrics["SSE"][0]/total_metrics["SST"][0]).mean())
+        if "r2" in args.method:
+            print("R2", (total_metrics["SSE"][0]/total_metrics["SST"][0]).mean())
         if not ignore:
             arr = []
             for v in total_metrics.values():
@@ -678,12 +789,91 @@ def launch(args):
         dbn_plot(
             probs=obj["probs"], labels=obj["labels"], images=obj["images"])
 
+    def intermediate_dbn(checkpoint_list):
+        idx = 0
+        sub_rng = jax.random.fold_in(rng, idx)
+        comb = jax.random.choice(sub_rng, len(
+            checkpoint_list), shape=(args.ensemble,), replace=False)
+        params_list = []
+        stats_list = []
+        dir_list = []
+        # ensemble target
+        for m in range(args.ensemble):
+            params, batch_stats, _ = load_ckpt(checkpoint_list[comb[m]])
+            params_list.append(params)
+            stats_list.append(batch_stats)
+            dir_list.append(checkpoint_list[comb[m]].split("/")[-1])
+        state = dict(
+            params=jax_utils.replicate(params_list),
+            batch_stats=jax_utils.replicate(stats_list)
+        )
+        # DBN
+        params, batch_stats, _ = load_ckpt(args.checkpoint)
+        dbn_state = dict(
+            params=jax_utils.replicate(params),
+            batch_stats=jax_utils.replicate(batch_stats)
+        )
+        test_loader = dataloaders["tst_loader"](rng=None)
+        test_loader = jax_utils.prefetch_to_device(test_loader, size=2)
+
+        count = 0
+        nll_sum = 0
+        acc_sum = 0
+        # target_nll_sum = 0
+        for batch_idx, batch in enumerate(tqdm(test_loader)):
+            batch_rng = jax.random.fold_in(sub_rng, batch_idx)
+            dbn_state["rng"] = jax_utils.replicate(batch_rng)
+            state["rng"] = jax_utils.replicate(batch_rng)
+            target_probs = jax.pmap(test_de)(state, batch) # (p,128//p,10)
+            probs = get_sample(dbn_state, batch) # (p,128//p,6,10)
+            probs = jnp.concatenate([probs, target_probs[:,:,None,:]], axis=-2)
+            # shape_target_probs = target_probs.shape
+            shape_probs = probs.shape
+            # _target_probs = target_probs.reshape(-1, shape_target_probs[-1])
+            _probs = probs.reshape(-1, shape_probs[-2], shape_probs[-1])
+            assert len(batch["labels"].shape) == 2
+            labels = batch["labels"].reshape(-1)
+            marker = batch["marker"].reshape(-1,1)
+            count += jnp.sum(marker)
+            # target_nll = evaluate_nll_nrank(
+            #     _target_probs, labels,log_input=False, reduction="none")
+            # target_nll_sum += target_nll.sum(0)
+            nll = _evaluate_nll_3rank(
+                _probs, labels,log_input=False, reduction="none")
+            nll = jnp.where(
+                marker,
+                nll,
+                0
+            )
+            nll_sum += nll.sum(0)
+            acc = _evaluate_acc_3rank(
+                _probs, labels,log_input=False, reduction="none")
+            acc = jnp.where(
+                marker,
+                acc,
+                0
+            )
+            acc_sum += acc.sum(0)
+        nll_mean = nll_sum/count
+        acc_mean = acc_sum/count
+        # target_mean = target_nll_sum/count
+        print("nll")
+        for n in nll_mean:
+            print(f"{n:.4f}")
+        print("acc")
+        for n in acc_mean:
+            print(f"{n*100:.2f}")
+        # print(target_mean)
+
+
     if args.method in ["de"]:
         eval_de(checkpoint_list)
     elif args.method in ["dbn", "dbn-r2"]:
         eval_dbn(checkpoint_list)
     elif args.method == "dbn-plot":
         plot_dbn(checkpoint_list)
+    elif args.method == "dbn-inter":
+        intermediate_dbn(checkpoint_list)
     elif args.method in ["naive_ed", "proxy_end2"]:
         eval(params, batch_stats, checkpoint_list)
 
@@ -700,6 +890,7 @@ def main():
     parser.add_argument("--checkpoint", default=None, type=str)
     parser.add_argument("--seed", default=1242300, type=int)
     parser.add_argument("--method", default="dbn", type=str)
+    parser.add_argument("--corrupted", action="store_true")
     if args.config is not None:
         parser.set_defaults(**arg_defaults)
     args = parser.parse_args()

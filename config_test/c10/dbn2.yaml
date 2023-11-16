@@ -8,5 +8,6 @@ checkpoints:
   t279:
     - ./checkpoints/dbn/c10/t279dist/230927/v118/0
     - ./checkpoints/dbn/c10/t279dist/230927/v118/1
+    - ./checkpoints/dbn/c10/t279dist/230927/v118/2
 
 

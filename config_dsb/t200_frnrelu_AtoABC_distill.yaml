@@ -6,11 +6,12 @@ model_blocks: 3,4,6,3
 model_style: FRN-Swish
 model_name: FlaxResNet
 optim_bs: 128
-optim_ne: 20
-optim_lr: 0.00025
+optim_ne: 50
+optim_lr: 0.0005
 optim_weight_decay: 0
 beta: 0.5
-beta2: 0.0001
+beta1: 0.001
+beta2: 0.001
 droprate: 0
 ema_decay: 0.99995
 version: v1.1.10

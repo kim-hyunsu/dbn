@@ -12,7 +12,7 @@ import math
 import numpy as np
 from einops import rearrange
 
-from utils import expand_to_broadcast, jprint, batch_mul
+from utils import expand_to_broadcast, jprint, batch_mul, flprint
 from .bridge import Decoder as TinyDecoder, ResidualBlock
 
 # revised from https://github.com/NVlabs/I2SB
@@ -1474,7 +1474,7 @@ class InvertedResidual(nn.Module):
                 feature_group_count=hidden_dim,
                 use_bias=False
             )(x)
-            # print(f"{x.shape[1]*x.shape[2]*3**2*hidden_dim}")
+            flprint(f"{x.shape[1]*x.shape[2]*3**2*hidden_dim}")
             x = self.norm(**norm_kwargs)(x)
             x = self.relu6(x)
             _x = x
@@ -1485,7 +1485,7 @@ class InvertedResidual(nn.Module):
                 padding=0,
                 use_bias=False
             )(x)
-            # print(f"{x.shape[1]*x.shape[2]*_x.shape[-1]*x.shape[-1]}")
+            flprint(f"{x.shape[1]*x.shape[2]*_x.shape[-1]*x.shape[-1]}")
             x = self.norm(**norm_kwargs)(x)
         else:
             _x = x
@@ -1496,7 +1496,7 @@ class InvertedResidual(nn.Module):
                 padding=0,
                 use_bias=False
             )(x)
-            # print(f"{x.shape[1]*x.shape[2]*_x.shape[-1]*x.shape[-1]}")
+            flprint(f"{x.shape[1]*x.shape[2]*_x.shape[-1]*x.shape[-1]}")
             x = self.norm(**norm_kwargs)(x)
             x = self.relu6(x)
             _x = x
@@ -1508,7 +1508,7 @@ class InvertedResidual(nn.Module):
                 feature_group_count=hidden_dim,
                 use_bias=False
             )(x)
-            # print(f"{x.shape[1]*x.shape[2]*3**2*hidden_dim}")
+            flprint(f"{x.shape[1]*x.shape[2]*3**2*hidden_dim}")
             x = self.norm(**norm_kwargs)(x)
             x = self.relu6(x)
             _x = x
@@ -1519,7 +1519,7 @@ class InvertedResidual(nn.Module):
                 padding=0,
                 use_bias=False
             )(x)
-            # print(f"{x.shape[1]*x.shape[2]*_x.shape[-1]*x.shape[-1]}")
+            flprint(f"{x.shape[1]*x.shape[2]*_x.shape[-1]*x.shape[-1]}")
             x = self.norm(**norm_kwargs)(x)
         if identity:
             return residual + x
@@ -2294,12 +2294,6 @@ class ClsUnet(nn.Module):
         return p
 
     def _v1_1_10(self, p, x, t, **kwargs):
-        jprint("input t is nan", jnp.any(jnp.isnan(t)),
-               "input t is inf", jnp.any(jnp.isinf(t)))
-        jprint("input p is nan", jnp.any(jnp.isnan(p)),
-               "input p is inf", jnp.any(jnp.isinf(p)))
-        jprint("input x is nan", jnp.any(jnp.isnan(x)),
-               "input x is inf", jnp.any(jnp.isinf(x)))
         cfgs = [
             # t, c, n, s
             [1,  64, 1, 1],
@@ -2312,18 +2306,13 @@ class ClsUnet(nn.Module):
         in_c = _divisible(x.shape[-1], 8)
 
         t_dim = in_c//4  # 32
-        jprint("t_dim", t_dim)
         t = timestep_embedding(t, t_dim)
         t = self.fc(features=in_c//2)(t)
         t = self.silu(t)
-        jprint("t is nan", jnp.any(jnp.isnan(t)),
-               "t is inf", jnp.any(jnp.isinf(t)))
 
         p = LogitEncoder()(p)
         p = p[:, None, None, :]
         p = jnp.tile(p, reps=[1, x.shape[1], x.shape[2], 1])
-        jprint("p is nan", jnp.any(jnp.isnan(p)),
-               "p is inf", jnp.any(jnp.isinf(p)))
 
         _x = x
         x = self.conv(
@@ -2332,7 +2321,7 @@ class ClsUnet(nn.Module):
             strides=(1, 1),
             padding="SAME"
         )(x)
-        # print(f"{x.shape[1]*x.shape[2]*3**2*_x.shape[-1]*x.shape[-1]}")
+        flprint(f"{x.shape[1]*x.shape[2]*3**2*_x.shape[-1]*x.shape[-1]}")
         x = self.norm(**norm_kwargs)(x)
         x = self.relu6(x)
         x = jnp.concatenate([x, p], axis=-1)
@@ -2354,13 +2343,9 @@ class ClsUnet(nn.Module):
         out_c = _divisible(c*self.width_multi, 2)
         _x = x
         x = Conv1x1(ch=out_c)(x, **kwargs)
-        jprint("x is nan", jnp.any(jnp.isnan(x)),
-               "x is inf", jnp.any(jnp.isinf(x)))
-        # print(f"{x.shape[1]*x.shape[2]*_x.shape[-1]*x.shape[-1]}")
+        flprint(f"{x.shape[1]*x.shape[2]*_x.shape[-1]*x.shape[-1]}")
         p = jnp.mean(x, axis=(1, 2))
         p = self.fc(features=self.p_dim*self.num_input)(p)
-        jprint("last p is nan", jnp.any(jnp.isnan(p)),
-               "last p is inf", jnp.any(jnp.isinf(p)))
         return p
 
     def _v1_1_11(self, p, x, t, **kwargs):
@@ -2503,7 +2488,7 @@ class ClsUnet(nn.Module):
             strides=(1, 1),
             padding="SAME"
         )(x)
-        # print(f"{x.shape[1]*x.shape[2]*3**2*_x.shape[-1]*x.shape[-1]}")
+        flprint(f"{x.shape[1]*x.shape[2]*3**2*_x.shape[-1]*x.shape[-1]}")
         x = self.norm(**norm_kwargs)(x)
         x = self.relu6(x)
         x = jnp.concatenate([x, p], axis=-1)
@@ -2524,7 +2509,7 @@ class ClsUnet(nn.Module):
                 in_c = out_c
         _x = x
         x = Conv1x1(ch=1280)(x, **kwargs)
-        # print(f"{x.shape[1]*x.shape[2]*_x.shape[-1]*x.shape[-1]}")
+        flprint(f"{x.shape[1]*x.shape[2]*_x.shape[-1]*x.shape[-1]}")
         p = jnp.mean(x, axis=(1, 2))
         p = self.fc(features=self.p_dim*self.num_input)(p)
         return p
@@ -2557,7 +2542,7 @@ class ClsUnet(nn.Module):
             strides=(1, 1),
             padding="SAME"
         )(x)
-        # print(f"{x.shape[1]*x.shape[2]*3**2*_x.shape[-1]*x.shape[-1]}")
+        flprint(f"{x.shape[1]*x.shape[2]*3**2*_x.shape[-1]*x.shape[-1]}")
         x = self.norm(**norm_kwargs)(x)
         x = self.relu6(x)
         x = jnp.concatenate([x, p], axis=-1)
@@ -2578,7 +2563,7 @@ class ClsUnet(nn.Module):
                 in_c = out_c
         _x = x
         x = Conv1x1(ch=1280)(x, **kwargs)
-        # print(f"{x.shape[1]*x.shape[2]*_x.shape[-1]*x.shape[-1]}")
+        flprint(f"{x.shape[1]*x.shape[2]*_x.shape[-1]*x.shape[-1]}")
         p = jnp.mean(x, axis=(1, 2))
         p = self.fc(features=self.p_dim*self.num_input)(p)
         return p

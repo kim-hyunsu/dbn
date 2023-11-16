@@ -13,7 +13,8 @@ decay_steps: 250
 optim_lr: 0.0005
 optim_weight_decay: 0
 beta: 0.5
-beta2: 0.0001
+beta1: 0.005
+beta2: 0.005
 droprate: 0
 ema_decay: 0.99995
 version: v1.1.13

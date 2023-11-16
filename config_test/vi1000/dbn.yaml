@@ -1,7 +1,7 @@
 method: dbn
-ensemble: 2
-checkpoints:
-  t23:
-    - ./checkpoints/dbn/vi1000/t23/231113/v1115/0
-  t25:
-    - ./checkpoints/dbn/vi1000/t25/231113/v1115/0
+ensemble: 1
+checkpoints: # A ckpt using a different config should be located in a different tag
+  t279:
+    - ./checkpoints/dbn/vi1000/fancy-oath_50beta_100nedist
+  t235:
+    - ./checkpoints/dbn/vi1000/0dist

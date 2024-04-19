@@ -1,0 +1,7 @@
+method: dbn-inter
+ensemble: 3 # 3 resnet ensemble (teacher)
+checkpoint: ./checkpoints/dbn/c10/gaussian/1
+checkpoints:  # teacher
+  - ./checkpoints/frn_sd2_be
+  - ./checkpoints/frn_sd11_be
+  - ./checkpoints/frn_sd13_be

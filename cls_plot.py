@@ -16,6 +16,13 @@ plt.rcParams["pdf.fonttype"] = 42
 plt.rcParams["ps.fonttype"] = 42
 plt.rcParams["font.family"] = "serif"
 plt.rcParams["font.serif"] = ["Times New Roman"] + plt.rcParams["font.serif"]
+plt.rcParams["font.size"] = 16
+plt.rcParams["axes.titlesize"] = 16
+plt.rcParams["axes.labelsize"] = 16
+plt.rcParams["xtick.labelsize"] = 16
+plt.rcParams["ytick.labelsize"] = 14
+plt.rcParams["legend.fontsize"] = 16
+plt.rcParams["figure.titlesize"] = 16
 c1 = sns.color_palette("deep")[0]
 c2 = sns.color_palette("deep")[1]
 c3 = sns.color_palette("deep")[2]
@@ -68,15 +75,17 @@ def dbn_plot(probs, labels, images):
     idx_list = [0, 1]
     fig, ax = plt.subplots(ncols=4, nrows=nrows, figsize=(
         12, 1.6 * nrows + 0.3), squeeze=False)
-    fig.rc("font", size=15)
+    # fig.rc("font", size=15)
     ax[0, 0].set_title("Images")
     ax[0, 1].set_title("Source")
     ax[0, 2].set_title("Diffusion Steps")
     ax[0, 3].set_title("Target")
 
     for j in range(1, 4):
-        ax[nrows - 1, j].set_xticks(np.arange(10),
-                                    labels=c10_label_names, rotation=50)
+        ax[nrows - 1, j].set_xticks(
+            np.arange(10),
+            labels=c10_label_names,
+            rotation=50)
 
     for i in range(nrows):
         idx = idx_list[i]
@@ -84,7 +93,7 @@ def dbn_plot(probs, labels, images):
         ax[i, 0].set_xticks([])
         ax[i, 0].set_yticks([])
         ax[i, 0].set_ylabel(c10_label_names[labels[idx]])
-        ax[i, 1].set_ylabel("$Confidences$")
+        ax[i, 1].set_ylabel("Conf.")
         ax[i, 1].yaxis.set_major_formatter(FormatStrFormatter("%.1f"))
         ax[i, 2].yaxis.set_major_formatter(NullFormatter())
         ax[i, 3].yaxis.set_major_formatter(NullFormatter())
@@ -103,7 +112,7 @@ def dbn_plot(probs, labels, images):
                 ax[i, j].set_xticks(np.arange(10), labels=[""] * 10)
             ax[i, j].set_xlim(-0.5, 9.5)
             ax[i, j].set_ylim(0, 1)
-            ax[i, j].tick_params(axis="y", labelsize=8)
+            ax[i, j].tick_params(axis="y", labelsize=12)
 
     handles, names = ax[0, 2].get_legend_handles_labels()
 

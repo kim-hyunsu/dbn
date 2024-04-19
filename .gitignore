@@ -6,6 +6,7 @@ cifar/
 cifar
 data/CIFAR*
 data/T*
+data/I*
 deprecated/
 /deprecated
 deprecated

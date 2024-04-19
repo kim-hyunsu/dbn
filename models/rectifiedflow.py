@@ -3398,157 +3398,6 @@ class DiffusionBridgeNetworkDep(nn.Module):
         return (eps, z_t, t, mu_t, sigma_t), logits0eps
 
 
-class DiffusionBridgeNetwork(nn.Module):
-    base_net: nn.Module
-    score_net: Sequence[nn.Module]
-    cls_net: Sequence[nn.Module]
-    crt_net: Sequence[nn.Module]
-    dsb_stats: Any
-    z_dsb_stats: Any
-    fat: int
-    joint: bool
-    forget: int = 0
-    temp: float = 1.
-    start_temp: float = 1.
-    print_inter: bool = False
-    mimo_cond: bool = False
-    multi_mixup: bool = False
-    continuous: bool = False
-    rand_temp: bool = False
-    centering: bool = False
-
-    def setup(self):
-        self.base = self.base_net()
-        self.score = self.score_net()
-        if self.cls_net is not None:
-            self.cls = self.cls_net()
-        if self.crt_net is not None:
-            self.crt = self.crt_net()
-
-    def encode(self, x, params_dict=None, **kwargs):
-        # x: BxHxWxC
-        if params_dict is not None:
-            out = self.base.apply(params_dict, x, **kwargs)
-        out = self.base(x, **kwargs)
-        return out
-
-    def correct(self, z, **kwargs):
-        if self.crt_net is None:
-            return z
-        return self.crt(z)
-
-    def classify(self, z, params_dict=None, **kwargs):
-        def _classify(cls, _z):
-            if params_dict is not None:
-                return cls.apply(params_dict, _z, **kwargs)
-            return cls(_z, **kwargs)
-        out = _classify(self.cls, z)
-        return out
-
-    def __call__(self, *args, **kwargs):
-        return self.conditional_dbn(*args, **kwargs)
-
-    def set_logit(self, rng, l1, training=True, **kwargs):
-        if self.forget == -1: # rebuttal
-            l1 = jax.random.normal(rng, l1.shape)
-            return l1
-        elif self.forget == -2: # rebuttal
-            return l1
-        elif self.forget == -3: # rebuttal
-            return l1/self.start_temp
-        T = self.start_temp
-        _, temp_rng = jax.random.split(rng)
-        if training:
-            T += 0.4*jax.random.beta(temp_rng, 1, 5)
-        else:
-            T += 0.4*(1/6)  # mean of beta distribution
-        l1 = l1/T
-        return l1
-
-    def conditional_dbn(self, rng, l0, x1, base_params=None, cls_params=None, **kwargs):
-        z1 = self.encode(x1, base_params, **kwargs)
-        l1 = self.classify(z1, cls_params, **kwargs)
-        l1 = self.set_logit(rng, l1, **kwargs)
-        l_t, t, mu_t, sigma_t, _ = self.forward(rng, l0, l1)
-        eps = self.score(l_t, z1, t, **kwargs)
-        _sigma_t = expand_to_broadcast(sigma_t, l_t, axis=1)
-        l0eps = l_t - _sigma_t*eps
-        l0eps = l0eps[None, ...]
-        return (eps, l_t, t, mu_t, sigma_t), l0eps
-
-    def forward(self, rng, x0, x1, _ts=None, dsb_stats=None):
-        if dsb_stats is None:
-            dsb_stats = self.dsb_stats
-
-        n_T = dsb_stats["n_T"]
-        _sigma_weight_t = dsb_stats["sigma_weight_t"]
-        _sigma_t = dsb_stats["sigma_t"]
-        _bigsigma_t = dsb_stats["bigsigma_t"]
-
-        t_rng, n_rng = jax.random.split(rng, 2)
-
-        if _ts is None:
-            _ts = jax.random.randint(t_rng, (x0.shape[0],), 1, n_T)  # (B,)
-        sigma_weight_t = _sigma_weight_t[_ts]  # (B,)
-        sigma_weight_t = expand_to_broadcast(sigma_weight_t, x0, axis=1)
-        sigma_t = _sigma_t[_ts]
-        mu_t = (sigma_weight_t*x0+(1-sigma_weight_t)*x1)
-        bigsigma_t = _bigsigma_t[_ts]  # (B,)
-        bigsigma_t = expand_to_broadcast(bigsigma_t, mu_t, axis=1)
-
-        # q(X_t|X_0,X_1) = N(X_t;mu_t,bigsigma_t)
-        noise = jax.random.normal(n_rng, mu_t.shape)  # (B, d)
-        x_t = mu_t + noise*jnp.sqrt(bigsigma_t)
-        t = _ts/n_T
-        return x_t, t, mu_t, sigma_t, _ts
-
-    def sample(self, *args, **kwargs):
-        return self.conditional_sample(*args, **kwargs)
-
-    def conditional_sample(self, rng, sampler, x):
-        zB = self.encode(x, training=False)
-        lB = self.classify(zB, training=False)
-        _lB = lB
-        _lB = self.set_logit(rng, _lB, training=False)
-        lC = sampler(
-            partial(self.score, training=False), rng, _lB, zB)
-        lC = lC[None, ...]
-        return lC, lB
-
-
-class DoubleDSB(nn.Module):
-    score_net1: nn.Module
-    score_net2: nn.Module
-    cls_net1: nn.Module
-    cls_net2: nn.Module
-    crt_net1: nn.Module
-    crt_net2: nn.Module
-    dsb_state: dict
-
-    def setup(self):
-        self.score1 = self.score_net1()
-        self.score2 = self.score_net2()
-        self.cls1 = self.cls_net1()
-        self.cls2 = self.cls_net2()
-        self.crt1 = self.crt_net1()
-        self.crt2 = self.crt_net2()
-
-    def correct(self, z_list, **kwargs):
-        assert isinstance(z_list, list)
-        z1 = self.crt1(z_list[0], **kwargs)
-        z2 = self.crt2(z_list[1], **kwargs)
-
-        return [z1, z2]
-
-    def classify(self, z_list, **kwargs):
-        assert isinstance(z_list, list)
-        p1 = self.cls1(z_list[0], **kwargs)
-        p2 = self.cls2(z_list[1], **kwargs)
-
-    def __call__(self, rng, z0, z1, **kwargs):
-        pass
-
-
 class RectifiedFlowBridgeNetwork(nn.Module):
     base_net: nn.Module
     score_net: Sequence[nn.Module]
@@ -3646,3 +3495,36 @@ class RectifiedFlowBridgeNetwork(nn.Module):
             partial(self.score, training=False), rng, _lB, zB)
         lC = lC[None, ...]
         return lC, lB
+
+
+class DoubleDSB(nn.Module):
+    score_net1: nn.Module
+    score_net2: nn.Module
+    cls_net1: nn.Module
+    cls_net2: nn.Module
+    crt_net1: nn.Module
+    crt_net2: nn.Module
+    dsb_state: dict
+
+    def setup(self):
+        self.score1 = self.score_net1()
+        self.score2 = self.score_net2()
+        self.cls1 = self.cls_net1()
+        self.cls2 = self.cls_net2()
+        self.crt1 = self.crt_net1()
+        self.crt2 = self.crt_net2()
+
+    def correct(self, z_list, **kwargs):
+        assert isinstance(z_list, list)
+        z1 = self.crt1(z_list[0], **kwargs)
+        z2 = self.crt2(z_list[1], **kwargs)
+
+        return [z1, z2]
+
+    def classify(self, z_list, **kwargs):
+        assert isinstance(z_list, list)
+        p1 = self.cls1(z_list[0], **kwargs)
+        p2 = self.cls2(z_list[1], **kwargs)
+
+    def __call__(self, rng, z0, z1, **kwargs):
+        pass

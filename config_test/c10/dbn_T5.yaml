@@ -1,0 +1,7 @@
+method: dbn
+ensemble: 1
+checkpoints:
+  t235:
+    - ./checkpoints/dbn/c10/t235/231111/v118_5step/0
+    - ./checkpoints/dbn/c10/t235/231111/v118_5step/1
+    - ./checkpoints/dbn/c10/t235/231111/v118_5step/2

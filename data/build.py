@@ -248,8 +248,10 @@ def build_dataloaders(config, corrupted=False):
 
     if config.data_name == 'TinyImageNet200_x64':
         # 81920 / 18080 / 10000
-        trn_images, val_images = trn_images[:81920], trn_images[81920:]
-        trn_labels, val_labels = trn_labels[:81920], trn_labels[81920:]
+        trn_images, val_images = trn_images[:90000], trn_images[90000:]
+        trn_labels, val_labels = trn_labels[:90000], trn_labels[90000:]
+        # trn_images, val_images = trn_images[:81920], trn_images[81920:]
+        # trn_labels, val_labels = trn_labels[:81920], trn_labels[81920:]
         image_shape = (1, 64, 64, 3)
         num_classes = 200
 

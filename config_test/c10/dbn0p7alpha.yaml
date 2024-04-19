@@ -1,0 +1,6 @@
+method: dbn
+ensemble: 1
+checkpoints:
+  t235:
+    - ./checkpoints/dbn/c10/inputperturbation0p7new/0
+    - ./checkpoints/dbn/c10/inputperturbation0p7new/1

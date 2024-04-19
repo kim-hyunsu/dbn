@@ -1,8 +1,6 @@
 echo 0
-python dbn_tidy.py \
-    --config config_dsb/t200_frnrelu_AtoABC_ensemble.yaml \
-    --save ./checkpoints/dbn/t200/t235/231113/v1110/5 \
-    --beta2 0.005 \
-    --beta1 0.005 \
-    --seed 68265
+python dbn_inputperturbation.py \
+    --config config_dsb/c10_frnrelu_AtoABC_InputPerturbation.yaml \
+    --save ./checkpoints/dbn/c10/inputperturbation0p9new/1 \
+    --mixup_alpha 0.9
 echo 1

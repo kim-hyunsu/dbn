@@ -1,0 +1,39 @@
+[2023-06-12 17:19:10] Environments:
+------------  --------------------------------------------------------------------------
+sys.platform  linux
+Python        3.9.16 (main, Jan 11 2023, 16:05:54) [GCC 11.2.0]
+JAX           0.4.3 @/mnt/home/hyunsu/.conda/envs/dsb/lib/python3.9/site-packages/jax
+jaxlib        0.4.3 @/mnt/home/hyunsu/.conda/envs/dsb/lib/python3.9/site-packages/jaxlib
+Flax          0.6.5 @/mnt/home/hyunsu/.conda/envs/dsb/lib/python3.9/site-packages/flax
+Optax         0.1.4 @/mnt/home/hyunsu/.conda/envs/dsb/lib/python3.9/site-packages/optax
+------------  --------------------------------------------------------------------------
+
+[2023-06-12 17:19:10] Command line arguments:
+- args.data_root          : ./data/
+- args.data_name          : CIFAR10_x32
+- args.data_augmentation  : standard
+- args.data_proportional  : 1.0
+- args.model_depth        : 32
+- args.model_width        : 2
+- args.model_style        : FRN-Swish
+- args.model_name         : FlaxResNet
+- args.optim_bs           : 256
+- args.optim_ne           : 200
+- args.optim_lr           : 0.1
+- args.optim_momentum     : 0.9
+- args.optim_weight_decay : 0.001
+- args.save               : /mnt/gsai/hyunsu/dsb-bnn/checkpoints/frn_sd3_be
+- args.seed               : 3
+- args.precision          : fp32
+- args.optim              : sgd
+- args.nowandb            : False
+- args.shared_head        : 
+- args.label_smooth       : 0
+- args.config             : config_sgd/c10_frnrelu_sgd.yaml
+- args.bezier             : False
+- args.theta0             : 
+- args.theta1             : 
+
+[2023-06-12 17:19:10] Multiple local devices are detected:
+[StreamExecutorGpuDevice(id=0, process_index=0, slice_index=0), StreamExecutorGpuDevice(id=1, process_index=0, slice_index=0)]
+

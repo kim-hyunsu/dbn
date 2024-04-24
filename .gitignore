@@ -1,12 +1,14 @@
 __pycache__
 .vscode
 checkpoints/*
+!checkpoints/frn_sd2_be
+!checkpoints/frn_sd3_be
+!checkpoints/frn_sd5_be
 cifar/
 /cifar
 cifar
-data/CIFAR*
-data/T*
-data/I*
+data/*
+!data/build.py
 deprecated/
 /deprecated
 deprecated

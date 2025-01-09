@@ -1,5 +1,5 @@
 pip install flax==0.6.5
-pip install orbax==0.1.1
+# pip install orbax==0.1.1
 pip install tabulate
 pip install tqdm
 pip install wandb==0.13.10
@@ -11,5 +11,3 @@ pip install seaborn
 pip install jax==0.4.3 -f https://storage.googleapis.com/jax-releases/jax_cuda_releases.html
 pip install jaxlib==0.4.3+cuda11.cudnn82 -f https://storage.googleapis.com/jax-releases/jax_cuda_releases.html
 # pip install jax[tpu]==0.4.3 -f https://storage.googleapis.com/jax-releases/libtpu_releases.html
-pip install optax==0.1.4
-pip install chex==0.1.6
